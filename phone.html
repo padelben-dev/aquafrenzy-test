@@ -41,13 +41,23 @@
 <button id="copy">Copy device info</button>
 
 <script>
-const BUILD = 44;                      // bump every build, matches the ?v= counter
+const BUILD = 46;                      // bump every build, matches the ?v= counter
+// This launcher is a web-only convenience — it has no reason to exist inside a native
+// wrapper build, but it mirrors the game's own BUILD_FLAGS.dev gate anyway so the two
+// dev-only rows (DEBUG / MUSIC AUDITION) disappear together with the flags they link
+// to. Flip both this and the game's BUILD_FLAGS.dev to false for a release build.
+const BUILD_FLAGS = { dev: true, platform: 'web' };
 document.getElementById('bv').textContent = '?v=' + BUILD;
 // &b= self-busts even if Safari cached this launcher page itself (RoofHorde v32 lesson)
 document.getElementById('a1').href = `aquafrenzy_web_game.html?v=${BUILD}&b=${Date.now()}`;
 document.getElementById('a2').href = `aquafrenzy_web_game.html?v=${BUILD}&fps=1&b=${Date.now()}`;
-document.getElementById('a3').href = `aquafrenzy_web_game.html?v=${BUILD}&debug=1&b=${Date.now()}`;
-document.getElementById('a4').href = `aquafrenzy_web_game.html?v=${BUILD}&audition=1&b=${Date.now()}`;
+if (BUILD_FLAGS.dev) {
+  document.getElementById('a3').href = `aquafrenzy_web_game.html?v=${BUILD}&debug=1&b=${Date.now()}`;
+  document.getElementById('a4').href = `aquafrenzy_web_game.html?v=${BUILD}&audition=1&b=${Date.now()}`;
+} else {
+  document.getElementById('a3').remove();
+  document.getElementById('a4').remove();
+}
 
 const rows = [];
 const add = (k, v) => rows.push([k, v]);

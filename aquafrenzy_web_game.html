@@ -17,6 +17,9 @@ html,body{
   overscroll-behavior:none;
   touch-action:none;-webkit-tap-highlight-color:transparent;
   -webkit-user-select:none;user-select:none;
+  /* native-1: long-press callout (iOS's "copy/share" popup) and drag-to-select/
+     drag-to-copy, off globally — a webview has no chrome to dismiss them into. */
+  -webkit-touch-callout:none;-webkit-user-drag:none;
   font-family:'Trebuchet MS','Segoe UI',system-ui,sans-serif;
 }
 /* Overlays are inset:0 — they must resolve against the dvh-sized body, not the ICB,
@@ -84,6 +87,7 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
 }
 .btn:active{transform:translateY(3px);box-shadow:0 1px 0 #a8620a}
 .btn.secondary{background:linear-gradient(#7fd4ff,#3a9fd8);color:#04263a;box-shadow:0 4px 0 #1d6795,0 8px 20px rgba(0,0,0,.45)}
+.btn.secondary.danger{background:linear-gradient(#ff9d9d,#d84a4a);color:#3a0808;box-shadow:0 4px 0 #7a1d1d,0 8px 20px rgba(0,0,0,.45)}
 
 /* ============ PET REVEAL CARD ============ */
 .petCard{
@@ -557,12 +561,14 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
   <div class="subtitle hidden" id="menuStreak" style="color:#ffb45a;font-weight:800"></div>
   <button class="btn" id="playBtn">PLAY</button>
   <button class="btn secondary" id="pediaBtn" style="padding:10px 22px;min-height:0;font-size:15px">AQUAPEDIA</button>
-  <button class="btn secondary" id="resetBtn" style="padding:10px 22px;min-height:0;font-size:14px">RESET PROGRESS</button>
 </div>
 
 <div class="overlay hidden" id="settingsScreen">
   <div class="title" style="font-size:clamp(20px,5.5vw,32px)">SETTINGS</div>
   <div id="settingsSliders" style="width:min(320px,86vw);display:flex;flex-direction:column;gap:18px;margin:10px 0"></div>
+  <!-- Two-step confirm: first tap arms (label + copy change), second tap within
+       RESET_ARM_MS actually wipes. Any other action re-disarms it (see JS). -->
+  <button class="btn secondary" id="resetBtn" style="padding:10px 22px;min-height:0;font-size:14px">RESET PROGRESS</button>
   <button class="btn secondary" id="settingsBack" style="padding:10px 22px;min-height:0;font-size:14px">BACK</button>
 </div>
 
@@ -678,6 +684,13 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
   <button class="btn secondary" id="quitNo">KEEP PLAYING</button>
 </div>
 
+<!-- App-lifecycle resume gate (native-1): shown after the app comes back from the
+     background mid-run instead of resuming a live fight instantly. A tap (anywhere)
+     hands control back. -->
+<div class="overlay hidden" id="resumeOverlay" role="button" aria-label="Tap to continue" style="cursor:pointer;background:rgba(6,10,20,.86);z-index:50">
+  <div class="title" style="font-size:clamp(22px,6vw,40px)">TAP TO CONTINUE</div>
+</div>
+
 <div class="overlay" id="rotate">
   <div class="rotateIcon">📱</div>
   <div class="title" style="font-size:clamp(20px,5.5vw,34px)">ROTATE YOUR PHONE</div>
@@ -698,9 +711,51 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
 
 // ============ QUERY FLAGS ============
 const QS = new URLSearchParams(location.search);
-const SHOW_FPS = QS.get('fps') === '1';
-const SHOW_DBG = QS.get('debug') === '1';
-const GAME_BUILD = 44;
+// ============ BUILD FLAGS (native-wrap plumbing, Phase native-1) ============
+// `dev` gates every dev-only surface (?debug=1, ?audition=1) so a release build can
+// flip one constant and lose both, regardless of what's in the URL. `platform` lets
+// anything web-specific (the phone.html launcher hints, a future portal ad provider)
+// branch without sniffing the UA. Both default for today's dev build; a Capacitor
+// wrapper build swaps them at build time (or via a tiny bootstrap shim) — nothing
+// else in this file should be edited to ship native.
+const BUILD_FLAGS = { dev: true, platform: 'web' };
+const SHOW_FPS = BUILD_FLAGS.dev && QS.get('fps') === '1';
+const SHOW_DBG = BUILD_FLAGS.dev && QS.get('debug') === '1';
+const GAME_BUILD = 46;
+
+// ============ BOOT AUDIT — network guard (native-1) ============
+// This file is zero-external-asset by project convention (no <script src>, no img/
+// audio src, no fetch anywhere in the game code) — a webview wrapper has no business
+// ever seeing a network request come out of it. Installed as the very first thing on
+// the page so it catches literally anything, including a future accidental import.
+// The actual pass/fail line prints once the DOM is ready (see runBootAudit below);
+// this object is just the live counters it reads.
+const __bootNet = { calls: 0, log: [] };
+(function installNetworkGuard() {
+  try {
+    const _fetch = window.fetch ? window.fetch.bind(window) : null;
+    if (_fetch) {
+      window.fetch = function (...args) {
+        __bootNet.calls++; __bootNet.log.push(['fetch', String(args[0])]);
+        console.error('[boot-audit] unexpected fetch() call', args);
+        return _fetch(...args);
+      };
+    }
+    const OrigXHR = window.XMLHttpRequest;
+    if (OrigXHR) {
+      window.XMLHttpRequest = function (...a) {
+        const xhr = new OrigXHR(...a);
+        const open = xhr.open;
+        xhr.open = function (method, url, ...rest) {
+          __bootNet.calls++; __bootNet.log.push(['xhr', String(url)]);
+          console.error('[boot-audit] unexpected XHR to', url);
+          return open.call(xhr, method, url, ...rest);
+        };
+        return xhr;
+      };
+    }
+  } catch (e) { /* instrumentation itself must never break boot */ }
+})();
 
 // ============ MATH HELPERS ============
 const TAU = Math.PI * 2;
@@ -1860,6 +1915,27 @@ MusicV2.renderTrackWav = async function renderTrackWav(tankIndex, intensity = 0.
 };
 // ===MUSIC_V2_END===
 
+// ============ HAPTICS FACADE (native-wrap plumbing) ============
+// No-ops on web by design — there is nothing to call. A native wrapper replaces the
+// three methods below (or the body of _fire) with a real Taptic/Vibration call;
+// nothing else in the file needs to change. Reads Save.data.haptics so the Settings
+// toggle (added below) has something to flip; that flag has no effect on web today
+// beyond gating this no-op, same as it will once a real implementation lands.
+const Haptics = {
+  light()  { this._fire('light'); },
+  medium() { this._fire('medium'); },
+  heavy()  { this._fire('heavy'); },
+  _fire(strength) {
+    if (!Save.data || Save.data.haptics === false) return;
+    if (BUILD_FLAGS.platform !== 'web') {
+      // TODO(native): route to the platform haptics API, e.g. Capacitor's
+      // @capacitor/haptics ImpactStyle.Light/Medium/Heavy for these three strengths.
+    }
+    // web: intentionally nothing. (navigator.vibrate exists on some Android Chrome
+    // builds, but it is a buzz, not a haptic, and out of scope for this pass.)
+  },
+};
+
 // ============ CONFIG / BALANCE ============
 // Sources for every documented number are in docs/aquafrenzy_docs_mechanics-spec.md.
 // Values marked TUNE are undocumented in every source and are set by feel.
@@ -2155,10 +2231,10 @@ const PETS = [
   { id:'rattle',  name:'Rattle the Skeleton',      desc:'Drops a $35 gold coin every 6 seconds. He is already dead, so he never needs feeding.' },
   { id:'clatter', name:'Clatter the Fiddler Crab', desc:'Hits aliens hard, but only ones that come near the bottom of the tank.' },
   { id:'lull',    name:'Lull the Siren',           desc:'Sings, and every grown sunfin drops three coins at once.' },
-  { id:'gunther', name:'Gunther the Whale',        desc:'Hides all of your baby and medium sunfins in his mouth during an alien attack.' },
+  { id:'gunther', name:'Gunther the Whale',        desc:'Hides all of your baby and medium sunfins in his mouth during an alien attack. You cannot feed them in there.' },
   { id:'plod',    name:'Plod the Turtle',          desc:'Everything that falls in your tank falls at half speed.' },
   { id:'widget',  name:'Widget the Automaton',     desc:'Drops a bomb every 18 seconds. Worth $150 if you tap it — and it kills any fish it touches.' },
-  { id:'beacon',  name:'Beacon the Angler',        desc:'Lures every sunfin to him during an attack and hides in the corner furthest from the aliens.' },
+  { id:'beacon',  name:'Beacon the Angler',        desc:'Lures every sunfin to him during an attack \u2014 they will leave their food to come \u2014 and hides in the corner furthest from the aliens.' },
   { id:'echo',    name:'Echo the Porpoise',        desc:'Unlocks every shop slot early, shows alien health bars, and flags fish before they starve.' },
   { id:'nettle',  name:'Nettle the Hermit Crab',   desc:'Snaps at any fish near the floor, pushing them back up where the coins fall slower.' },
   { id:'kite',    name:'Kite the Manta',           desc:'Bounces falling money back up before it reaches the floor.' },
@@ -2303,6 +2379,31 @@ const THEMES = [
     sandTop:'#3c4258', sandBot:'#181c2a', shaft:false },
 ];
 
+// ============ STORAGE FACADE (native-wrap plumbing) ============
+// Every localStorage read/write in the file goes through this. Today's backend IS
+// localStorage, synchronous, same as before — `getSync`/`setSync`/`removeSync` are
+// what Save/RunSave actually call, because both are used from synchronous call
+// sites (boot load, a mid-frame snapshot, a settings slider's oninput) that predate
+// this facade and would need a real restructure to go fully async, which is out of
+// scope for a plumbing-only pass. `get`/`set`/`remove` return Promises and are the
+// async-capable surface a native backend (e.g. Capacitor Preferences) is expected
+// to use; `useBackend()` lets a native bootstrap swap the implementation without
+// touching a single call site elsewhere in the file.
+const Storage = {
+  _backend: {
+    getSync(k)    { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    setSync(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+    removeSync(k) { try { localStorage.removeItem(k); } catch (e) {} },
+  },
+  useBackend(backend) { this._backend = backend; },
+  getSync(k)    { return this._backend.getSync(k); },
+  setSync(k, v) { return this._backend.setSync(k, v); },
+  removeSync(k) { return this._backend.removeSync(k); },
+  get(k)        { try { return Promise.resolve(this._backend.getSync(k)); } catch (e) { return Promise.resolve(null); } },
+  set(k, v)     { try { return Promise.resolve(this._backend.setSync(k, v)); } catch (e) { return Promise.resolve(); } },
+  remove(k)     { try { return Promise.resolve(this._backend.removeSync(k)); } catch (e) { return Promise.resolve(); } },
+};
+
 // ============ SAVE STATE ============
 const SAVE_KEY = 'aquaFrenzy.save.v1';
 const Save = {
@@ -2323,10 +2424,13 @@ const Save = {
           audio:{ music:0.8, sfx:1.0 },
           // `ads` (added 2026-09-07, Phase 6): mid-ad gate counters + lifetime totals.
           // winsSinceMid starts AT the threshold on purpose so the first eligible win fires.
-          ads:{ lastMidTs:0, winsSinceMid:2, totals:{ mid:0, rew:0, dismissed:0 } } },
+          ads:{ lastMidTs:0, winsSinceMid:2, totals:{ mid:0, rew:0, dismissed:0 } },
+          // `haptics` (added native-1): on/off toggle for the Haptics facade; the
+          // facade itself no-ops on web regardless, this just persists the setting.
+          haptics:true },
   load() {
     try {
-      const raw = localStorage.getItem(SAVE_KEY);
+      const raw = Storage.getSync(SAVE_KEY);
       if (raw) { const d = JSON.parse(raw); if (d && d.version === 1) Object.assign(this.data, d); }
     } catch (e) { /* corrupt save -> defaults */ }
     if (!this.data.best) this.data.best = {};
@@ -2338,6 +2442,7 @@ const Save = {
     if (!this.data.audio || typeof this.data.audio !== 'object') this.data.audio = { music:0.8, sfx:1.0 };
     if (typeof this.data.audio.music !== 'number') this.data.audio.music = 0.8;
     if (typeof this.data.audio.sfx   !== 'number') this.data.audio.sfx   = 1.0;
+    if (typeof this.data.haptics !== 'boolean') this.data.haptics = true;
     // Ads defaults for a v1 save written before Phase 6 (additive, no version bump).
     if (!this.data.ads || typeof this.data.ads !== 'object') this.data.ads = {};
     const ad = this.data.ads;
@@ -2350,8 +2455,20 @@ const Save = {
     for (let i = 0; i < PETS.length; i++)
       if (this.data.pets.includes(PETS[i].id)) this.data.stars[i] = (this.data.stars[i] || 0) | 1;
   },
-  write() { try { localStorage.setItem(SAVE_KEY, JSON.stringify(this.data)); } catch (e) {} },
-  wipe()  { try { localStorage.removeItem(SAVE_KEY); } catch (e) {} },
+  // Debounced: at most one physical write per 2s (native-1 — a webview flash write
+  // is not free the way a desktop browser's is). Anything mid-window is coalesced
+  // into the next timer fire; flush() forces it immediately and is called from the
+  // app-lifecycle hooks below so nothing is ever lost to a background/kill.
+  _writeTimer: null,
+  write() {
+    if (this._writeTimer) return;
+    this._writeTimer = setTimeout(() => { this._writeTimer = null; this.flush(); }, 2000);
+  },
+  flush() {
+    if (this._writeTimer) { clearTimeout(this._writeTimer); this._writeTimer = null; }
+    Storage.setSync(SAVE_KEY, JSON.stringify(this.data));
+  },
+  wipe()  { if (this._writeTimer) { clearTimeout(this._writeTimer); this._writeTimer = null; } Storage.removeSync(SAVE_KEY); },
 };
 Save.load();
 
@@ -4714,6 +4831,7 @@ const Shop = {
         break;
       case 'egg':
         Game.eggPieces++;
+        Haptics.medium();
         Game.eggDiscount = 0;      // a rewarded discount covers ONE piece; the next is full price
         Game.eggAnim = 1;          // the HUD meter's newest egg pops
         Sfx.play('uiEggPlaced');
@@ -4909,6 +5027,50 @@ const PET_BEHAVIOR = {
                                               move: 'bandPatrol', moveSpeed: 20, bandMin: 0.2,
                                               bandMax: 0.8, bandY: 0.45, bobRate: 0.5, bobAmp: 0.08,
                                               loop: 'petCinderCrackle' } },
+
+  // ================= Phase 5B: the rows that needed nothing new =================
+  // Every row below is params only — no bucket gained a branch, a knob or a host hook
+  // for any of them. The pets that could not clear that bar are in the 5B report.
+
+  // producer — "Drops a $35 gold coin every 6 seconds. He is already dead, so he never
+  // needs feeding." FLAT: $35 is still $35 in tank 7, so he fades on his own.
+  rattle:   { bucket: 'producer',   params: { interval: 6, what: 'coin', coinType: 'gold' } },
+  // defender — "Hits aliens hard, but only ones that come near the bottom of the tank."
+  // The zone IS the weakness: anything that stays high is still the player's problem.
+  // FLAT damage, like Quill — an early-game hitter by design.
+  clatter:  { bucket: 'defender',   params: { damage: 3, interval: 1.4, reach: 40,
+                                              speed: 74, zone: 'floor' } },
+  // controller — "Hides all of your baby and medium sunfins in his mouth during an alien
+  // attack." stages [0,1] is "baby and medium"; the grown earners stay exposed, `cap` is
+  // the mouth, and nothing in there can be fed — shelter costs feeding time.
+  gunther:  { bucket: 'controller', params: { effect: 'hide', when: 'invasion',
+                                              kinds: ['sunfin'], stages: [0, 1], cap: 8,
+                                              mouthY: 6, move: 'drift' } },
+  // controller — "Lures every sunfin to him during an attack." force:true is the whole
+  // pet: his light outranks food and prey. That is also his downside, and his card now
+  // says so, because a stated trade-off is not a bug.
+  beacon:   { bucket: 'controller', params: { effect: 'herd', when: 'invasion', force: true,
+                                              kinds: ['sunfin'], litRate: 0.5, litGate: 0.5,
+                                              move: 'fleeCorner', moveSpeed: 70 } },
+  // controller — "Snaps at any fish near the floor, pushing them back up." Two fish per
+  // snap on a 1.2s interval: a whole school on the sand still needs the player.
+  nettle:   { bucket: 'controller', params: { effect: 'push', when: 'always', zone: 'floor',
+                                              zoneH: 90, range: 400, lift: 90, count: 2,
+                                              interval: 1.2, move: 'floorPatrol', moveSpeed: 30 } },
+  // controller — "Blinds one alien with ink each attack." duration:'attack' means until
+  // that alien leaves the tank; `count` per attack is the weakness. The status overlay is
+  // what makes it legible — a blinded alien looks blinded for as long as it is.
+  sable:    { bucket: 'controller', params: { effect: 'blind', when: 'invasion', count: 1,
+                                              duration: 'attack', move: 'drift' } },
+  // controller — "Aliens arrive rattled and swim slower for their first ten seconds."
+  // PROPORTIONAL: a multiplier on whatever that tank's aliens already swim at.
+  growler:  { bucket: 'controller', params: { effect: 'slow', when: 'alienSpawn',
+                                              mult: 0.5, duration: 10, move: 'bandPatrol',
+                                              moveSpeed: 18, bandY: 0.55, bandMin: 0.15,
+                                              bandMax: 0.85 } },
+  // producer — "Every 30 seconds it falls off, and your skimmers may have it." A star coin
+  // is exactly that: $40, and the one coin a Star Skimmer eats. FLAT.
+  lumen:    { bucket: 'producer',   params: { interval: 30, what: 'coin', coinType: 'star' } },
 };
 
 // Continuous audio beds keyed by loop id — the same split as PET_ART: an asset table,
@@ -5544,6 +5706,250 @@ const PET_ART = {
     g.beginPath(); g.arc(s * 0.45, -s * 0.12, s * 0.12, 0, TAU); g.fill();
     g.restore();
   },
+
+  // ---- Phase 5B art. Each silhouette has to survive 380px, where S is about 0.31, so
+  // every one uses the house `Math.max(S, 0.85)` floor and leans on ONE shape a fish or
+  // an alien never has: a ribcage, one huge claw, a spout, a lure on a stalk, a spiral
+  // shell, eight arms, two tusks, a star. ----
+
+  // Skeleton fish: the ribcage is the tell — nothing alive in the tank is see-through.
+  rattle(g, p) {
+    const s = 15 * Math.max(S, 0.85);
+    g.save(); g.translate(p.x, p.y); g.scale(p.dir || 1, 1);
+    g.strokeStyle = '#e8e4d6'; g.lineWidth = Math.max(1.2, s * 0.10); g.lineCap = 'round';
+    g.beginPath(); g.moveTo(s * 0.35, 0); g.lineTo(-s * 0.95, 0); g.stroke();   // spine
+    for (let i = 0; i < 5; i++) {                                              // ribs
+      const x = s * (0.22 - i * 0.24), h = s * (0.52 - i * 0.06);
+      g.beginPath(); g.moveTo(x, -h); g.quadraticCurveTo(x - s * 0.12, 0, x, h); g.stroke();
+    }
+    g.fillStyle = '#f2eee0';                                                   // skull
+    g.beginPath(); g.ellipse(s * 0.68, -s * 0.04, s * 0.42, s * 0.34, 0, 0, TAU); g.fill();
+    g.fillStyle = '#1a1f28';
+    g.beginPath(); g.arc(s * 0.80, -s * 0.10, s * 0.11, 0, TAU); g.fill();     // eye socket
+    g.strokeStyle = '#cdc7b6'; g.lineWidth = Math.max(1, s * 0.07);
+    g.beginPath(); g.moveTo(s * 0.55, s * 0.16); g.lineTo(s * 0.95, s * 0.16); g.stroke();
+    g.strokeStyle = '#e8e4d6'; g.lineWidth = Math.max(1.2, s * 0.10);
+    g.beginPath(); g.moveTo(-s * 0.95, 0); g.lineTo(-s * 1.35, -s * 0.42);     // tail fan
+    g.moveTo(-s * 0.95, 0); g.lineTo(-s * 1.35, s * 0.42); g.stroke();
+    g.restore();
+  },
+  // Fiddler crab: ONE oversized claw, held up. Sits on the sand, so he reads in profile.
+  clatter(g, p) {
+    const s = 14 * Math.max(S, 0.85), jab = p.jab > 0 ? p.jab / 0.16 : 0;
+    g.save(); g.translate(p.x, p.y); g.scale(p.dir || 1, 1);
+    g.fillStyle = '#c9531f';
+    g.beginPath(); g.ellipse(0, 0, s * 0.92, s * 0.62, 0, 0, TAU); g.fill();
+    g.strokeStyle = '#8e3510'; g.lineWidth = Math.max(1, s * 0.10); g.lineCap = 'round';
+    for (let i = 0; i < 3; i++) {                                              // legs
+      const x = -s * (0.15 + i * 0.30);
+      g.beginPath(); g.moveTo(x, s * 0.35); g.lineTo(x - s * 0.22, s * 0.85); g.stroke();
+    }
+    g.fillStyle = '#f0e6dc';
+    g.beginPath(); g.arc(-s * 0.22, -s * 0.34, s * 0.16, 0, TAU);
+    g.arc(s * 0.20, -s * 0.34, s * 0.16, 0, TAU); g.fill();                    // eyestalks
+    g.fillStyle = '#1a1008';
+    g.beginPath(); g.arc(-s * 0.22, -s * 0.34, s * 0.08, 0, TAU);
+    g.arc(s * 0.20, -s * 0.34, s * 0.08, 0, TAU); g.fill();
+    g.save();                                                                   // the big claw
+    g.translate(s * 0.80, -s * 0.10); g.rotate(-0.35 - jab * 0.5);
+    g.fillStyle = '#e0651f';
+    g.beginPath(); g.ellipse(s * 0.40, 0, s * 0.52, s * 0.36, 0, 0, TAU); g.fill();
+    g.fillStyle = '#f28a3c';
+    g.beginPath(); g.moveTo(s * 0.55, -s * 0.10);
+    g.lineTo(s * 1.05, -s * 0.34 - jab * s * 0.18); g.lineTo(s * 0.62, s * 0.06); g.fill();
+    g.restore();
+    g.restore();
+  },
+  // Whale: mass plus a spout. The mouth opens while he is holding fish, and the shelter
+  // bubble the status overlay draws lands right on it.
+  gunther(g, p) {
+    const s = 20 * Math.max(S, 0.85), open = p.lit || 0;
+    g.save(); g.translate(p.x, p.y); g.scale(p.dir || 1, 1);
+    g.fillStyle = '#4a6f92';
+    g.beginPath(); g.ellipse(0, 0, s * 1.25, s * 0.72, 0, 0, TAU); g.fill();
+    g.fillStyle = '#8fb4d2';                                                   // pale belly
+    g.beginPath(); g.ellipse(0, s * 0.28, s * 1.05, s * 0.36, 0, 0, TAU); g.fill();
+    g.fillStyle = '#3a5a78';                                                   // fluke
+    g.beginPath(); g.moveTo(-s * 1.15, 0); g.lineTo(-s * 1.72, -s * 0.52);
+    g.lineTo(-s * 1.50, 0); g.lineTo(-s * 1.72, s * 0.52); g.fill();
+    g.fillStyle = '#213b52';                                                   // mouth line
+    g.beginPath();
+    g.moveTo(s * 1.22, s * 0.02);
+    g.quadraticCurveTo(s * 0.55, s * (0.34 + open * 0.22), s * 0.10, s * (0.16 + open * 0.16));
+    g.quadraticCurveTo(s * 0.60, s * 0.12, s * 1.22, s * 0.02); g.fill();
+    g.fillStyle = '#f2f8ff';
+    g.beginPath(); g.arc(s * 0.86, -s * 0.20, s * 0.13, 0, TAU); g.fill();
+    g.fillStyle = '#0d1a26';
+    g.beginPath(); g.arc(s * 0.88, -s * 0.20, s * 0.07, 0, TAU); g.fill();
+    g.globalAlpha = 0.45;                                                      // spout
+    g.strokeStyle = '#cfeaff'; g.lineWidth = Math.max(1.2, s * 0.09); g.lineCap = 'round';
+    for (let i = -1; i <= 1; i++) {
+      g.beginPath(); g.moveTo(-s * 0.10, -s * 0.70);
+      g.lineTo(-s * 0.10 + i * s * 0.26, -s * (1.10 + Math.abs(i) * -0.10)); g.stroke();
+    }
+    g.restore();
+  },
+  // Anglerfish: a huge underslung jaw and the lure out front on its stalk. The bulb is
+  // the pet — it brightens with p.lit, which is exactly when the herd is on.
+  beacon(g, p) {
+    const s = 16 * Math.max(S, 0.85), lit = p.lit || 0;
+    g.save(); g.translate(p.x, p.y);
+    if (lit > 0.03) {
+      const gg = g.createRadialGradient(s * 1.30 * (p.dir || 1), -s * 0.86, 2,
+                                        s * 1.30 * (p.dir || 1), -s * 0.86, s * 4.2);
+      gg.addColorStop(0, `rgba(255,206,120,${0.5 * lit})`);
+      gg.addColorStop(1, 'rgba(255,206,120,0)');
+      g.fillStyle = gg;
+      g.beginPath(); g.arc(s * 1.30 * (p.dir || 1), -s * 0.86, s * 4.2, 0, TAU); g.fill();
+    }
+    g.scale(p.dir || 1, 1);
+    g.fillStyle = '#3d2f4a';
+    g.beginPath(); g.ellipse(0, 0, s * 1.02, s * 0.80, 0, 0, TAU); g.fill();
+    g.fillStyle = '#2a2035';                                                   // jaw
+    g.beginPath(); g.moveTo(s * 0.95, s * 0.02);
+    g.quadraticCurveTo(s * 0.30, s * 0.92, -s * 0.35, s * 0.42); g.lineTo(s * 0.60, s * 0.30); g.fill();
+    g.fillStyle = '#f6f0ff';                                                   // teeth
+    for (let i = 0; i < 5; i++) {
+      const t = i / 4, x = s * (0.88 - t * 1.10), y = s * (0.14 + t * 0.34);
+      g.beginPath(); g.moveTo(x, y); g.lineTo(x - s * 0.08, y + s * 0.26);
+      g.lineTo(x + s * 0.08, y + s * 0.06); g.fill();
+    }
+    g.strokeStyle = '#6d5a3a'; g.lineWidth = Math.max(1.2, s * 0.09); g.lineCap = 'round';
+    g.beginPath(); g.moveTo(s * 0.45, -s * 0.62);
+    g.quadraticCurveTo(s * 1.20, -s * 1.40, s * 1.30, -s * 0.86); g.stroke();
+    g.fillStyle = lit > 0.03 ? `rgba(255,226,150,${0.45 + 0.55 * lit})` : '#6a5a38';
+    g.beginPath(); g.arc(s * 1.30, -s * 0.86, s * 0.24 * (1 + lit * 0.35), 0, TAU); g.fill();
+    g.fillStyle = '#e6dcf2';
+    g.beginPath(); g.arc(s * 0.42, -s * 0.18, s * 0.19, 0, TAU); g.fill();
+    g.fillStyle = '#0a0710';
+    g.beginPath(); g.arc(s * 0.47, -s * 0.18, s * 0.10, 0, TAU); g.fill();
+    g.restore();
+  },
+  // Hermit crab: the spiral shell does all the identifying work; claws snap on p.snap.
+  nettle(g, p) {
+    const s = 14 * Math.max(S, 0.85), snap = p.snap > 0 ? p.snap / 0.18 : 0;
+    g.save(); g.translate(p.x, p.y); g.scale(p.dir || 1, 1);
+    g.fillStyle = '#b8814a';                                                   // shell
+    g.beginPath(); g.arc(-s * 0.30, -s * 0.16, s * 0.86, 0, TAU); g.fill();
+    g.strokeStyle = '#7d5326'; g.lineWidth = Math.max(1, s * 0.10); g.lineCap = 'round';
+    g.beginPath();
+    for (let i = 0; i < 26; i++) {
+      const a = i * 0.42, rr = s * 0.10 + i * s * 0.030;
+      const x = -s * 0.30 + Math.cos(a) * rr, y = -s * 0.16 + Math.sin(a) * rr;
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    }
+    g.stroke();
+    g.fillStyle = '#d9713f';                                                   // body
+    g.beginPath(); g.ellipse(s * 0.62, s * 0.20, s * 0.44, s * 0.30, 0, 0, TAU); g.fill();
+    g.strokeStyle = '#a94d21'; g.lineWidth = Math.max(1, s * 0.11);
+    for (const sy of [-1, 1]) {                                                // claws
+      g.beginPath();
+      g.moveTo(s * 0.85, s * 0.16);
+      g.lineTo(s * 1.25, s * (0.16 + sy * (0.16 + snap * 0.22)));
+      g.stroke();
+    }
+    g.fillStyle = '#f0e6dc';
+    g.beginPath(); g.arc(s * 0.82, -s * 0.10, s * 0.13, 0, TAU); g.fill();
+    g.fillStyle = '#1a1008';
+    g.beginPath(); g.arc(s * 0.84, -s * 0.10, s * 0.07, 0, TAU); g.fill();
+    g.restore();
+  },
+  // Octopus: a domed mantle and four visible arms — no fish in the tank has arms. She
+  // trails ink while the attack is on (p.lit), which ties her to the mark she leaves.
+  sable(g, p) {
+    const s = 16 * Math.max(S, 0.85), lit = p.lit || 0;
+    g.save(); g.translate(p.x, p.y);
+    if (lit > 0.05) {
+      g.globalAlpha = 0.26 * lit; g.fillStyle = '#241c3a';
+      g.beginPath(); g.arc(-s * 0.9 * (p.dir || 1), s * 0.5, s * (1.1 + lit * 0.5), 0, TAU); g.fill();
+      g.globalAlpha = 1;
+    }
+    g.scale(p.dir || 1, 1);
+    g.strokeStyle = '#7a4f9e'; g.lineWidth = Math.max(1.4, s * 0.15); g.lineCap = 'round';
+    for (let i = 0; i < 4; i++) {                                              // arms
+      const t = i / 3, x0 = s * (-0.45 + t * 0.90);
+      g.beginPath(); g.moveTo(x0, s * 0.35);
+      g.quadraticCurveTo(x0 + Math.sin(p.pulse * 2 + i) * s * 0.34, s * 0.95,
+                         x0 + Math.sin(p.pulse * 2 + i) * s * 0.60, s * 1.32);
+      g.stroke();
+    }
+    g.fillStyle = '#8f5bb8';                                                   // mantle
+    g.beginPath(); g.ellipse(0, -s * 0.10, s * 0.82, s * 0.74, 0, 0, TAU); g.fill();
+    g.fillStyle = '#b98ad6';
+    g.beginPath(); g.ellipse(-s * 0.22, -s * 0.36, s * 0.30, s * 0.22, -0.5, 0, TAU); g.fill();
+    for (const sx of [-1, 1]) {                                                // eyes
+      g.fillStyle = '#f4ecff';
+      g.beginPath(); g.ellipse(sx * s * 0.32, -s * 0.06, s * 0.20, s * 0.15, 0, 0, TAU); g.fill();
+      g.fillStyle = '#170f22';
+      g.beginPath(); g.ellipse(sx * s * 0.34, -s * 0.06, s * 0.09, s * 0.11, 0, 0, TAU); g.fill();
+    }
+    g.restore();
+  },
+  // Walrus: two tusks and a whiskered muzzle. He puffs when the bellow lands (p.lit).
+  growler(g, p) {
+    const s = 18 * Math.max(S, 0.85), lit = p.lit || 0;
+    g.save(); g.translate(p.x, p.y); g.scale(p.dir || 1, 1);
+    g.fillStyle = '#8a6b56';
+    g.beginPath(); g.ellipse(0, 0, s * 1.12, s * 0.72, 0, 0, TAU); g.fill();
+    g.fillStyle = '#6d5241';                                                   // rear flipper
+    g.beginPath(); g.moveTo(-s * 1.02, s * 0.10); g.lineTo(-s * 1.62, -s * 0.30);
+    g.lineTo(-s * 1.50, s * 0.52); g.fill();
+    g.fillStyle = '#a4826a';                                                   // muzzle
+    g.beginPath(); g.ellipse(s * 0.82, s * 0.20, s * 0.44, s * 0.34, 0, 0, TAU); g.fill();
+    g.fillStyle = '#f4efe4';                                                   // tusks
+    for (const sx of [-1, 1]) {
+      g.beginPath();
+      g.moveTo(s * (0.82 + sx * 0.18), s * 0.36);
+      g.lineTo(s * (0.78 + sx * 0.22), s * 1.02);
+      g.lineTo(s * (0.94 + sx * 0.18), s * 0.40);
+      g.fill();
+    }
+    g.strokeStyle = '#d8cbb8'; g.lineWidth = Math.max(1, s * 0.05); g.lineCap = 'round';
+    for (let i = -1; i <= 1; i++) {                                            // whiskers
+      g.beginPath(); g.moveTo(s * 1.02, s * (0.14 + i * 0.09));
+      g.lineTo(s * (1.52 + lit * 0.10), s * (0.02 + i * 0.20)); g.stroke();
+    }
+    g.fillStyle = '#f2f0ea';
+    g.beginPath(); g.arc(s * 0.52, -s * 0.24, s * 0.14, 0, TAU); g.fill();
+    g.fillStyle = '#140f0a';
+    g.beginPath(); g.arc(s * 0.55, -s * 0.24, s * 0.075, 0, TAU); g.fill();
+    if (lit > 0.05) {                                                          // the bellow
+      g.globalAlpha = 0.35 * lit; g.strokeStyle = '#cfe6ff';
+      g.lineWidth = Math.max(1.2, s * 0.09);
+      for (let i = 1; i <= 2; i++) {
+        g.beginPath(); g.arc(s * 1.15, s * 0.20, s * (0.5 + i * 0.42), -0.9, 0.9); g.stroke();
+      }
+    }
+    g.restore();
+  },
+  // Lampeye: a small dark fish carrying one bright star on the brow — the star IS the pet,
+  // and it is the same shape as the coin she drops, so cause and effect read at a glance.
+  lumen(g, p) {
+    const s = 13 * Math.max(S, 0.85), tw = 0.75 + Math.sin(p.pulse * 3) * 0.25;
+    g.save(); g.translate(p.x, p.y);
+    g.globalAlpha = 0.22 * tw; g.fillStyle = '#ffe98a';
+    g.beginPath(); g.arc(s * 0.55 * (p.dir || 1), -s * 0.72, s * 1.5, 0, TAU); g.fill();
+    g.globalAlpha = 1;
+    g.scale(p.dir || 1, 1);
+    g.fillStyle = '#2b3550';
+    g.beginPath(); g.ellipse(0, 0, s * 0.95, s * 0.48, 0, 0, TAU); g.fill();
+    g.fillStyle = '#1d2438';
+    g.beginPath(); g.moveTo(-s * 0.86, 0); g.lineTo(-s * 1.32, -s * 0.40);
+    g.lineTo(-s * 1.32, s * 0.40); g.fill();
+    g.fillStyle = '#dfe9f2';
+    g.beginPath(); g.arc(s * 0.52, -s * 0.06, s * 0.22, 0, TAU); g.fill();
+    g.fillStyle = '#0a0e16';
+    g.beginPath(); g.arc(s * 0.56, -s * 0.06, s * 0.12, 0, TAU); g.fill();
+    g.fillStyle = `rgba(255,233,138,${0.6 + 0.4 * tw})`;                        // the star
+    g.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + i * Math.PI / 5, rr = s * (i % 2 ? 0.16 : 0.40);
+      const x = s * 0.55 + Math.cos(a) * rr, y = -s * 0.72 + Math.sin(a) * rr;
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    }
+    g.closePath(); g.fill();
+    g.restore();
+  },
   // ---- migrated from the bespoke table (5A-1), pixel-for-pixel ----
   dollop(g, p, q) {
       const s = 17 * S, sq = 1 + Math.sin(p.pulse * 3) * 0.12;   // bell pulse
@@ -5911,6 +6317,7 @@ const Game = {
       // One ascending note per NEWLY earned star (bits only ever accumulate, so a
       // replay that doesn't improve anything plays none of these).
       const newlyEarned = finalBits & ~prevBits;
+      if (newlyEarned) Haptics.light();   // one buzz covers 1-3 stars earned this win, not per star
       if (newlyEarned & 1) Sfx.play('uiStar1');
       if (newlyEarned & 2) Sfx.play('uiStar2');
       if (newlyEarned & 4) Sfx.play('uiStar3');
@@ -6031,17 +6438,31 @@ const RunSave = {
     };
   },
 
+  // Debounced the same way Save is (native-1): at most one physical write per 2s.
+  // frame() already only calls this every 5s, so in practice the debounce rarely
+  // even arms — it exists so a burst of manual write() calls (e.g. right before an
+  // app-lifecycle flush) can't turn into two writes 16ms apart.
+  _writeTimer: null,
   write() {
     if (Game.state !== 'play') return;
-    try { localStorage.setItem(RUN_KEY, JSON.stringify(this.snapshot())); } catch (e) {}
+    if (this._writeTimer) return;
+    this._writeTimer = setTimeout(() => { this._writeTimer = null; this.flush(); }, 2000);
   },
-  clear() { try { localStorage.removeItem(RUN_KEY); } catch (e) {} },
+  flush() {
+    if (this._writeTimer) { clearTimeout(this._writeTimer); this._writeTimer = null; }
+    if (Game.state !== 'play') return;
+    Storage.setSync(RUN_KEY, JSON.stringify(this.snapshot()));
+  },
+  clear() {
+    if (this._writeTimer) { clearTimeout(this._writeTimer); this._writeTimer = null; }
+    Storage.removeSync(RUN_KEY);
+  },
 
   // Validate before offering to resume. A daily snapshot from another calendar day is
   // dead — the seed has moved on — so it is discarded on sight, not shown.
   peek() {
     let s = null;
-    try { s = JSON.parse(localStorage.getItem(RUN_KEY)); } catch (e) {}
+    try { s = JSON.parse(Storage.getSync(RUN_KEY)); } catch (e) {}
     if (!s || s.v !== 1) return null;
     if (!(s.tank >= 0 && s.tank < LEVELS.length && s.level >= 0 && s.level < 5)) { this.clear(); return null; }
     if (s.dailyRun && s.dailyDate !== isoDate(dailyNow())) { this.clear(); return null; }
@@ -6113,8 +6534,12 @@ const RunSave = {
 
 // The tab going away is the moment that matters most — a phone locking, a switch to
 // another app. Both fire before an iOS/Android kill; the 5s tick is the safety net.
-document.addEventListener('visibilitychange', () => { if (document.hidden) RunSave.write(); });
-window.addEventListener('pagehide', () => RunSave.write());
+// flush() (not write()) — the debounced write() would delay this past the moment
+// the process can actually be killed. The full App-lifecycle handler further down
+// (visibilitychange/pagehide/blur -> App.onHide) also calls this; both are kept so
+// a run snapshot is never lost even if one listener fires without the other.
+document.addEventListener('visibilitychange', () => { if (document.hidden) RunSave.flush(); });
+window.addEventListener('pagehide', () => RunSave.flush());
 
 // ============ UPDATE: FOOD ============
 function updateFood(dt) {
@@ -6182,6 +6607,7 @@ function collectCoin(c) {
   Game.money += c.value;
   if (Game.stat) Game.stat.coins += c.value;
   c.alive = false;
+  Haptics.light();
   const st = COIN_STYLE[c.type];
   floatText(c.x, c.y - 10, (c.lucky ? 'LUCKY! +' : '+') + money(c.value), c.lucky ? '#fffbe6' : st.glow);
   puff(c.x, c.y, st.glow, 7, 90);
@@ -6265,7 +6691,7 @@ function updateFish(dt) {
     if (eatsFood) {
       f.hunger -= dt;
       if (f.hunger <= 0) {
-        f.dying = 1; Sfx.play('fishDeath');
+        f.dying = 1; Sfx.play('fishDeath'); Haptics.heavy();
         if (Game.stat) Game.stat.lost++;
         puff(f.x, f.y, '#7a9aa8', 10, 70);
         continue;
@@ -6442,7 +6868,7 @@ function applyElixir(f) {
     f.hunger = CFG.HUNGER_MAX;
     floatText(f.x, f.y - 26, 'WASTED', '#ff9d9d');
   } else {
-    f.dying = 1; Sfx.play('fishDeath');
+    f.dying = 1; Sfx.play('fishDeath'); Haptics.heavy();
     if (Game.stat) Game.stat.lost++;
     puff(f.x, f.y, '#ff5050', 14, 110);
     floatText(f.x, f.y - 26, 'TOO SMALL!', '#ff5050');
@@ -6557,6 +6983,7 @@ function hitAlien(a, dmg) {
 
 function killAlien(a) {
   a.dying = 1;
+  Haptics.medium();
   if (Game.stat) Game.stat.kills++;
   Sfx.play('alienDeath_' + a.kind);
   const col = ALIENS[a.kind].col;
@@ -8207,15 +8634,35 @@ $('playBtn').addEventListener('click', () => {
   openMap();
 });
 
+// RESET PROGRESS is a two-step confirm: tap once arms it (button relabels and turns
+// red-ish for RESET_ARM_MS), tap again inside that window actually wipes. Anything
+// else — leaving the window to elapse, or closing Settings — disarms it silently.
+const RESET_ARM_MS = 4000;
+let _resetArmed = false, _resetArmTimer = null;
+function disarmReset() {
+  _resetArmed = false;
+  if (_resetArmTimer) { clearTimeout(_resetArmTimer); _resetArmTimer = null; }
+  $('resetBtn').textContent = 'RESET PROGRESS';
+  $('resetBtn').classList.remove('danger');
+}
 $('resetBtn').addEventListener('click', () => {
+  if (!_resetArmed) {
+    _resetArmed = true;
+    $('resetBtn').textContent = 'TAP AGAIN TO CONFIRM';
+    $('resetBtn').classList.add('danger');
+    _resetArmTimer = setTimeout(disarmReset, RESET_ARM_MS);
+    return;
+  }
+  disarmReset();
   Save.wipe();
   Save.data = { version:1, tank:0, level:0, pets:[], best:{}, pediaSeen:[],
                 stars:{}, daily:{ last:'', streak:0, bestStreak:0 }, pet:'',
-                audio:{ music:0.8, sfx:1.0 },
+                audio:{ music:0.8, sfx:1.0 }, haptics:true,
                 ads:{ lastMidTs:0, winsSinceMid:CFG.ADS.WINS_PER_MID, totals:{ mid:0, rew:0, dismissed:0 } } };
   Snd.applyVolumes();
   updatePediaDots();
   updateStreakBadge();
+  buildVolumePanel('settingsSliders', true);   // haptics checkbox must reflect the fresh default
   $('resetBtn').textContent = 'PROGRESS RESET';
   setTimeout(() => { $('resetBtn').textContent = 'RESET PROGRESS'; }, 1400);
 });
@@ -8329,16 +8776,24 @@ function volRow(id, label, value) {
     <input type="range" id="${id}" min="0" max="100" value="${Math.round(value * 100)}" style="width:100%;accent-color:#f5a623">
   </div>`;
 }
-function buildVolumePanel(containerId) {
+// `includeHaptics`: only the Settings-screen panel gets the toggle — the QUIT-confirm
+// dialog reuses the same builder for MUSIC/SFX/MUTE only, unchanged from before.
+function buildVolumePanel(containerId, includeHaptics) {
   const el = $(containerId);
   if (!el) return;
   if (!Save.data.audio) Save.data.audio = { music: 0.8, sfx: 1.0 };
   const a = Save.data.audio;
   const mId = 'musicVol_' + containerId, sId = 'sfxVol_' + containerId, cId = 'muteChk_' + containerId;
+  const hId = 'hapticsChk_' + containerId;
   el.innerHTML = volRow(mId, 'MUSIC', a.music) + volRow(sId, 'SFX', a.sfx) +
     `<label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;justify-content:center;color:#fff">
        <input type="checkbox" id="${cId}" ${Music.on ? '' : 'checked'}> MUTE ALL
-     </label>`;
+     </label>` +
+    (includeHaptics
+      ? `<label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;justify-content:center;color:#fff">
+           <input type="checkbox" id="${hId}" ${Save.data.haptics === false ? '' : 'checked'}> HAPTICS
+         </label>`
+      : '');
   $(mId).oninput = e => { $(mId + 'Val').textContent = e.target.value; a.music = e.target.value / 100; Snd.applyVolumes(); Save.write(); };
   $(sId).oninput = e => { $(sId + 'Val').textContent = e.target.value; a.sfx = e.target.value / 100; Snd.applyVolumes(); Save.write(); };
   $(cId).onchange = e => {
@@ -8348,14 +8803,19 @@ function buildVolumePanel(containerId) {
     $('musicIco').textContent = on ? '🔊' : '🔇';
     $('musicBtn').classList.toggle('off', !on);
   };
+  if (includeHaptics) {
+    $(hId).onchange = e => { Save.data.haptics = e.target.checked; Save.write(); };
+  }
 }
 $('settingsBtn').addEventListener('click', () => {
   Snd.unlock();
-  buildVolumePanel('settingsSliders');
+  disarmReset();
+  buildVolumePanel('settingsSliders', true);
   $('startScreen').classList.add('hidden');
   $('settingsScreen').classList.remove('hidden');
 });
 $('settingsBack').addEventListener('click', () => {
+  disarmReset();
   $('settingsScreen').classList.add('hidden');
   $('startScreen').classList.remove('hidden');
 });
@@ -8407,7 +8867,7 @@ function quitToMenu() {
 
   Save.data = { version:1, tank:0, level:0, pets:[], best:{}, pediaSeen:[],
                 stars:{}, daily:{ last:'', streak:0, bestStreak:0 }, pet:'',
-                audio:{ music:0.8, sfx:1.0 },
+                audio:{ music:0.8, sfx:1.0 }, haptics:true,
                 ads:{ lastMidTs:0, winsSinceMid:CFG.ADS.WINS_PER_MID, totals:{ mid:0, rew:0, dismissed:0 } } };
   Save.load();
   Snd.applyVolumes();
@@ -8465,23 +8925,95 @@ const Demo = {
   },
 };
 
-// ============ VISIBILITY ============
+// ============ VISIBILITY / APP LIFECYCLE (native-1) ============
 // Backgrounding a tab throttles rAF to zero. dt is already clamped so no time debt is
 // replayed on return, but the audio graph must be released or iOS keeps the session open.
 // The sequencer's own setInterval is stopped explicitly too (not just left to no-op
 // against a suspended ctx) — restarted cleanly at the top of the CURRENT bar on
 // return rather than catching up through however long the tab was away.
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) {
+//
+// App wraps that existing audio-pause behaviour and adds the rest of the native-wrap
+// contract: pause the SIM (not just the audio) if a run was live, flush both save
+// keys immediately (not the debounced write()), and on return show a TAP TO CONTINUE
+// gate instead of resuming a fight the player wasn't looking at. Three sources feed
+// it — visibilitychange (primary, fires on tab-switch/backgrounding on every
+// platform), pagehide (covers navigations that don't always fire visibilitychange)
+// and blur (covers alt-tab / a native app switcher stealing focus without hiding the
+// webview). onHide() is safe to call more than once in a row from overlapping
+// sources — it only acts on the play->paused transition once.
+const App = {
+  wasPlaying: false,
+  onHide() {
     Music._pauseSequencer();
     if (Snd.ctx && Snd.ctx.state === 'running') Snd.ctx.suspend();
-  } else {
-    lastT = performance.now();
-    Snd.unlock();   // full re-unlock: iOS can hand back an 'interrupted' context
+    if (Game.state === 'play') {
+      this.wasPlaying = true;
+      Game.state = 'paused';   // render keeps running, the sim does not — same contract as the quit sheet
+      Ads.gameplayStop();
+    }
+    Save.flush();
+    RunSave.flush();
+  },
+  onShow() {
+    lastT = performance.now();   // do not replay the background time as one huge dt
+    Snd.unlock();                // full re-unlock: iOS can hand back an 'interrupted' context
     _trySetAudioSessionPlayback();
     Music._resumeSequencer();
-  }
-});
+    if (this.wasPlaying) {
+      this.wasPlaying = false;
+      $('resumeOverlay').classList.remove('hidden');
+    }
+  },
+  // The only way out of the resume gate. Mirrors quitNo's un-pause exactly.
+  resumeTap() {
+    if ($('resumeOverlay').classList.contains('hidden')) return;
+    $('resumeOverlay').classList.add('hidden');
+    Game.state = 'play';
+    Ads.gameplayStart();
+    lastT = performance.now();
+  },
+};
+document.addEventListener('visibilitychange', () => { if (document.hidden) App.onHide(); else App.onShow(); });
+window.addEventListener('pagehide', () => App.onHide());
+window.addEventListener('blur', () => App.onHide());
+$('resumeOverlay').addEventListener('click', () => App.resumeTap());
+
+// ---- Android hardware back button (native-1) ----
+// Capacitor's App plugin fires a `backButton` event with its own listener API; until
+// that wrapper exists this is wired to the browser's popstate so the exact mapping
+// below is testable on desktop/web today (window.__nav.onBack() drives it directly
+// in a headless check). One history entry is kept permanently armed so back always
+// has something to pop — on the web that means "menu" is a dead end here (nothing
+// left to go back to on this page), but a real Capacitor listener can instead call
+// `event.preventDefault()` to swallow it or not to let the OS exit, replacing only
+// the block below without touching the mapping logic itself.
+const Nav = {
+  onBack() {
+    if (!$('pediaScreen').classList.contains('hidden'))   { $('pediaBack').click();    return 'pedia->parent'; }
+    if (!$('levelScreen').classList.contains('hidden'))   { $('lvlBack').click();      return 'brief->map'; }
+    if (!$('resumeOverlay').classList.contains('hidden')) { App.resumeTap();           return 'resume->play'; }
+    if (!$('quitAsk').classList.contains('hidden'))       { $('quitNo').click();       return 'quitConfirm->play'; }
+    if (Game.state === 'play')                            { $('quitBtn').click();      return 'ingame->quitConfirm'; }
+    if (!$('mapScreen').classList.contains('hidden'))     { $('mapBack').click();      return 'map->menu'; }
+    if (!$('settingsScreen').classList.contains('hidden')){ $('settingsBack').click(); return 'settings->menu'; }
+    return 'menu->noop';   // menu (startScreen): nothing left to close, let the OS exit
+  },
+};
+window.addEventListener('popstate', () => { Nav.onBack(); history.pushState({ aq:1 }, '', location.href); });
+history.pushState({ aq:1 }, '', location.href);
+window.__nav = Nav;   // headless-check hook
+
+// ---- double-tap zoom / pinch-zoom guard (native-1) ----
+// `user-scalable=no` alone is ignored by some WebKit builds. Belt-and-braces: block
+// pinch (gesturestart, Safari-only event) and the two-taps-within-300ms double-tap
+// zoom (a fast-repeating touchend), without eating normal single taps/clicks.
+document.addEventListener('gesturestart', e => e.preventDefault());
+let _lastTapT = 0;
+document.addEventListener('touchend', e => {
+  const t = Date.now();
+  if (t - _lastTapT < 300) e.preventDefault();
+  _lastTapT = t;
+}, { passive: false });
 
 // ---- iOS audio unlock (Phase 17 hotfix) ----
 // Real iPhone 15 field report: still silent after the Phase 8 pass. Fixes, all
@@ -10118,7 +10650,12 @@ const Ads = {
   _pillOn: false, _toastT: 0,
 
   init() {
-    const want = (QS.get('ads') || '').toLowerCase();
+    // The URL-param mock provider is a web-testing convenience only — a native
+    // wrapper has no address bar for the player to type `?ads=mock` into, and its
+    // real provider will be registered directly (Ads.provider = NativeProvider)
+    // rather than selected here. Skip the URL sniff off web so a stray query string
+    // in a deep link can never light up the placeholder ad UI in the shipped app.
+    const want = BUILD_FLAGS.platform === 'web' ? (QS.get('ads') || '').toLowerCase() : '';
     if (want === 'mock') this.provider = MockProvider;
     else if (want === 'crazygames' || want === 'poki') {
       console.warn(`[ads] provider '${want}' is reserved but not wired yet — falling back to noop`);
@@ -10447,11 +10984,37 @@ window.__ads = {
   Ads, mock: MockProvider, placements: AD_PLACEMENTS,
 };
 
+// ============ BOOT AUDIT — report ============
+// Prints (and stores at window.__bootAuditReport) a single pass/fail line covering
+// everything a native webview wrap needs asserted at boot: the network guard above
+// caught zero calls, and nothing in the live DOM points at an external URL (an
+// http(s) src/href would mean an asset slipped in — this game is zero-external-
+// asset by convention). Run on a rAF tick rather than at parse time so it sees the
+// DOM exactly as the boot sequence above left it.
+function runBootAudit() {
+  const externalRefs = Array.from(document.querySelectorAll('[src],[href]'))
+    .map(el => el.getAttribute('src') || el.getAttribute('href'))
+    .filter(v => v && /^https?:\/\//i.test(v));
+  const report = {
+    build: GAME_BUILD,
+    platform: BUILD_FLAGS.platform,
+    dev: BUILD_FLAGS.dev,
+    zeroNetworkRuntime: __bootNet.calls === 0,
+    networkCalls: __bootNet.log.slice(),
+    zeroExternalRefs: externalRefs.length === 0,
+    externalRefs,
+  };
+  report.pass = report.zeroNetworkRuntime && report.zeroExternalRefs;
+  console.log(`[boot-audit] ${report.pass ? 'PASS' : 'FAIL'}`, report);
+  window.__bootAuditReport = report;
+  return report;
+}
+
 // ============ START ============
 Input.init();
 Dbg.init();
 Ads.init();
-if (QS.get('audition') === '1') initAudition();
+if (BUILD_FLAGS.dev && QS.get('audition') === '1') initAudition();
 resize();
 Demo.start();
 // Queues via _pendingPlay until the first real gesture unlocks the context (see
@@ -10459,4 +11022,5 @@ Demo.start();
 // taps anything, never silently dropped.
 if (Music.on) Music.play('menu', { crossfadeMs: 1500 });
 requestAnimationFrame(frame);
+requestAnimationFrame(runBootAudit);   // after the boot DOM/state settles, before the first real frame's work
 </script>
