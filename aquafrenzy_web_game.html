@@ -700,7 +700,7 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
 const QS = new URLSearchParams(location.search);
 const SHOW_FPS = QS.get('fps') === '1';
 const SHOW_DBG = QS.get('debug') === '1';
-const GAME_BUILD = 41;
+const GAME_BUILD = 44;
 
 // ============ MATH HELPERS ============
 const TAU = Math.PI * 2;
@@ -1514,6 +1514,352 @@ Object.assign(Music, {
   },
 });
 
+// ===MUSIC_V2_START===
+// ============ MUSIC_V2 (new procedural engine — additive, audition-only) ============
+// MUSIC_V1 = the `Music` object above (everything from "const Music = {}" through the
+// Object.assign block just closed), completely untouched by this block — kept alive
+// under an alias purely for A/B naming in the audition page. Nothing below is called
+// by gameplay; it is reached only from ?audition=1 and the offline QA renderer
+// (qa/render_music_v2.js), mirroring MUSIC_V1's own "not wired into gameplay yet"
+// state so this pass touches zero gameplay/economy code.
+const MUSIC_V1 = Music;
+
+const MusicV2 = {};
+
+// ---- seeded PRNG (mulberry32) — deterministic per tank, never Math.random() for
+// note selection, so a track sounds identical every time it plays. ----
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Per-tank musical identity — independent of MUSIC_V1's registered tracks by design
+// (V2 is a standalone engine, not a re-skin of V1's data).
+MusicV2.TANK_PARAMS = [
+  { bpm: 96,  root: 220.00, scale: [0, 2, 3, 5, 7, 8, 10] },
+  { bpm: 100, root: 233.08, scale: [0, 2, 3, 5, 7, 8, 10] },
+  { bpm: 104, root: 246.94, scale: [0, 2, 4, 7, 9] },
+  { bpm: 92,  root: 207.65, scale: [0, 3, 5, 7, 10] },
+  { bpm: 108, root: 261.63, scale: [0, 2, 4, 7, 9] },
+  { bpm: 88,  root: 196.00, scale: [0, 3, 5, 7, 10] },
+  { bpm: 112, root: 220.00, scale: [0, 2, 3, 5, 7, 8, 10] },
+];
+MusicV2.STEPS_PER_BAR = 16;
+MusicV2.BARS_PER_TRACK = 32;
+MusicV2.LAYER_NAMES = ['bass', 'pad', 'melody', 'perc'];
+
+function v2BarSig(bar) {
+  return bar.map(s => s ? `${s.deg},${s.oct},${s.len},${Math.round(s.vel * 100)}` : 'r').join('|');
+}
+
+// One 16-step bar for a layer. restProb is per-step probability on top of each
+// layer's own rhythmic bias; the overall >=30% rest requirement is verified against
+// the generated data in qa/render_music_v2.js rather than forced post-hoc here.
+function v2GenerateBar(rng, layerName, degrees, stepsPerBar, restProb) {
+  const bar = [];
+  for (let i = 0; i < stepsPerBar; i++) {
+    if (layerName === 'bass') {
+      const strong = (i % 4 === 0);
+      if (!strong && rng() < 0.55) { bar.push(null); continue; }
+      if (rng() < restProb * 0.6) { bar.push(null); continue; }
+      bar.push({ deg: degrees[0], oct: -1, len: strong ? 3 : 1, vel: 0.8 + rng() * 0.15 });
+    } else if (layerName === 'perc') {
+      if (rng() < restProb) { bar.push(null); continue; }
+      const kick = (i % 4 === 0);
+      bar.push({ deg: kick ? 'kick' : 'hat', oct: 0, len: 1, vel: kick ? 0.9 : 0.5 + rng() * 0.3 });
+    } else {
+      if (rng() < restProb) { bar.push(null); continue; }
+      const deg = degrees[Math.floor(rng() * degrees.length)];
+      const oct = layerName === 'pad' ? 0 : (rng() < 0.3 ? 1 : 0);
+      const len = layerName === 'pad' ? 4 : (rng() < 0.4 ? 2 : 1);
+      bar.push({ deg, oct, len, vel: 0.5 + rng() * 0.35 });
+    }
+  }
+  return bar;
+}
+
+// Deterministic edit to a bar so a 5th identical repeat never happens. Guarantees a
+// different signature — a real bug found during QA: picking a random replacement
+// degree from the scale can land on the SAME degree the note already had (small
+// scales are 5-7 notes wide), silently producing a byte-identical "perturbed" bar
+// and letting the repeat run straight through. Excludes the note's own current
+// degree from the replacement pool, and falls back to an unconditional first-step
+// rest/note flip (always different by construction) if every attempt still ties.
+function v2PerturbBar(bar, rng, degrees) {
+  const origSig = v2BarSig(bar);
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const b = bar.map(s => s ? { ...s } : null);
+    const idx = Math.floor(rng() * b.length);
+    if (b[idx]) {
+      if (rng() < 0.5) {
+        b[idx] = null;
+      } else if (typeof b[idx].deg === 'number') {
+        const alt = degrees.filter(d => d !== b[idx].deg);
+        if (alt.length) b[idx].deg = alt[Math.floor(rng() * alt.length)];
+        else b[idx] = null; // degenerate single-note scale: fall back to a rest
+      }
+    } else {
+      b[idx] = { deg: degrees[Math.floor(rng() * degrees.length)], oct: 0, len: 1, vel: 0.5 + rng() * 0.3 };
+    }
+    if (v2BarSig(b) !== origSig) return b;
+  }
+  const fallback = bar.map(s => s ? { ...s } : null);
+  fallback[0] = fallback[0] ? null : { deg: degrees[0], oct: 0, len: 1, vel: 0.6 };
+  return fallback;
+}
+
+// Layer rotation: every 16 bars a layer's active/silent block flips (texture change
+// across the 32-bar track). Returns the Set of bar indices where this layer sounds.
+function v2ActiveBarsForLayer(layerName) {
+  const schedule = { bass: [true, true], pad: [true, false], melody: [false, true], perc: [true, true] };
+  const blocks = schedule[layerName] || [true, true];
+  const set = new Set();
+  for (let bar = 0; bar < MusicV2.BARS_PER_TRACK; bar++) if (blocks[bar < 16 ? 0 : 1]) set.add(bar);
+  return set;
+}
+
+// 32 bars = A(8) B(8) A(8) B'(8, varied last quarter). No layer repeats an identical
+// bar more than 4 times consecutively (checked+fixed here, not just hoped for).
+function v2GenerateLayerBars(seed, layerName, degrees, activeBarSet) {
+  const rng = mulberry32(seed);
+  const stepsPerBar = MusicV2.STEPS_PER_BAR;
+  const restProb = 0.34;
+  const sectionBars = { A: null, B: null };
+  const bars = [];
+  let lastSig = null, repeatCount = 0;
+  for (let bar = 0; bar < MusicV2.BARS_PER_TRACK; bar++) {
+    let barData;
+    if (!activeBarSet.has(bar)) {
+      // Layer rotated out for this bar. A run of literal all-rest bars is still an
+      // "identical bar" by the letter of the no-more-than-4-in-a-row rule, so this
+      // is NOT exempted — every 5th bar in a rotated-out stretch gets one sparse
+      // ghost note via the same perturb function used for active content, instead
+      // of staying silent. Keeps the section audibly "dropped out" while never
+      // producing a literal 5th consecutive identical (all-null) bar.
+      barData = new Array(stepsPerBar).fill(null);
+    } else {
+      const sectionKey = bar < 8 ? 'A' : bar < 16 ? 'B' : bar < 24 ? 'A' : 'Bv';
+      if (sectionKey === 'A') {
+        if (!sectionBars.A) sectionBars.A = v2GenerateBar(rng, layerName, degrees, stepsPerBar, restProb);
+        barData = sectionBars.A;
+      } else if (sectionKey === 'B') {
+        if (!sectionBars.B) sectionBars.B = v2GenerateBar(rng, layerName, degrees, stepsPerBar, restProb);
+        barData = sectionBars.B;
+      } else {
+        const base = sectionBars.B || (sectionBars.B = v2GenerateBar(rng, layerName, degrees, stepsPerBar, restProb));
+        const tailLen = Math.floor(stepsPerBar * 0.25);
+        const tail = v2GenerateBar(rng, layerName, degrees, tailLen, restProb);
+        barData = base.slice(0, stepsPerBar - tailLen).concat(tail);
+      }
+    }
+    let sig = v2BarSig(barData);
+    if (sig === lastSig) repeatCount++; else repeatCount = 0;
+    if (repeatCount >= 4) { barData = v2PerturbBar(barData, rng, degrees); sig = v2BarSig(barData); repeatCount = 0; }
+    lastSig = sig;
+    bars.push(barData);
+  }
+  return bars;
+}
+
+// Pure data generator — no AudioContext, fully unit-testable under plain Node.
+MusicV2.generateTrackData = function generateTrackData(tankIndex) {
+  const p = MusicV2.TANK_PARAMS[tankIndex % MusicV2.TANK_PARAMS.length];
+  const seedBase = 1000 + tankIndex * 97;
+  const layers = {};
+  for (const name of MusicV2.LAYER_NAMES) {
+    const seed = seedBase + MusicV2.LAYER_NAMES.indexOf(name) * 13;
+    layers[name] = v2GenerateLayerBars(seed, name, p.scale, v2ActiveBarsForLayer(name));
+  }
+  return { tankIndex, bpm: p.bpm, root: p.root, scale: p.scale, stepsPerBar: MusicV2.STEPS_PER_BAR, bars: MusicV2.BARS_PER_TRACK, layers };
+};
+
+function v2DegToFreq(root, deg, oct) { return root * Math.pow(2, deg / 12) * Math.pow(2, oct); }
+
+// ---- MUSIC_V2 voices ----
+// Every melodic voice: 2 detuned (+-6 cents) oscillators -> lowpass (2-3kHz, Q~1-2)
+// -> highpass (80Hz, skipped for the bass layer) -> ADSR gain (attack>=8ms via
+// linearRamp, release>=200ms via setTargetAtTime — never a zero-length/hard-zero
+// click) -> dry bus + a scaled reverb-send bus.
+function makeV2ToneVoice({ cutoff = 2400, q = 1.4, attack = 0.012, release = 0.24, isBass = false } = {}) {
+  return function trigger(ctx, dryDest, reverbSend, freq, t, dur, vel = 1) {
+    const f = Math.max(20, freq);
+    const o1 = ctx.createOscillator(), o2 = ctx.createOscillator();
+    o1.type = 'sawtooth'; o2.type = 'sawtooth';
+    o1.frequency.setValueAtTime(f, t); o2.frequency.setValueAtTime(f, t);
+    o1.detune.setValueAtTime(-6, t); o2.detune.setValueAtTime(6, t);
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.setValueAtTime(Math.min(3000, Math.max(2000, cutoff)), t); lp.Q.value = Math.min(2, Math.max(1, q));
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass'; hp.frequency.value = isBass ? 20 : 80;
+    const g = ctx.createGain();
+    const peak = Math.max(0.001, vel * (isBass ? 0.55 : 0.35));
+    const atk = Math.max(0.008, attack), rel = Math.max(0.2, release);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(peak, t + atk);
+    const sustainLevel = peak * 0.7;
+    g.gain.setTargetAtTime(sustainLevel, t + atk, 0.05);
+    const relStart = Math.max(t + atk, t + dur);
+    g.gain.setValueAtTime(Math.max(0.0001, sustainLevel), relStart);
+    g.gain.setTargetAtTime(0.0001, relStart, rel / 3);
+    o1.connect(lp); o2.connect(lp); lp.connect(hp); hp.connect(g);
+    g.connect(dryDest);
+    const sendGain = ctx.createGain(); sendGain.gain.value = 0.15;
+    hp.connect(sendGain); sendGain.connect(reverbSend);
+    const stopAt = relStart + rel * 3 + 0.05;
+    o1.start(t); o2.start(t); o1.stop(stopAt); o2.stop(stopAt);
+    return { stopAt, kill() { try { g.gain.cancelScheduledValues(ctx.currentTime); g.gain.setTargetAtTime(0.0001, ctx.currentTime, 0.06); o1.stop(ctx.currentTime + 0.08); o2.stop(ctx.currentTime + 0.08); } catch (e) {} } };
+  };
+}
+
+function makeV2PercVoice() {
+  return function trigger(ctx, dryDest, reverbSend, kind, t, dur, vel = 1) {
+    const isKick = kind === 'kick';
+    const n = Math.max(1, Math.floor(ctx.sampleRate * 0.12));
+    const buf = ctx.createBuffer(1, n, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const src = ctx.createBufferSource(); src.buffer = buf;
+    const filt = ctx.createBiquadFilter();
+    filt.type = isKick ? 'lowpass' : 'highpass';
+    filt.frequency.value = isKick ? 900 : 5000; filt.Q.value = 1;
+    const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 80;
+    const g = ctx.createGain();
+    const peak = Math.max(0.001, vel * 0.5);
+    const atk = 0.008, rel = 0.22;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(peak, t + atk);
+    g.gain.setTargetAtTime(0.0001, t + atk, rel / 3);
+    src.connect(filt); filt.connect(hp); hp.connect(g); g.connect(dryDest);
+    const sendGain = ctx.createGain(); sendGain.gain.value = 0.1;
+    hp.connect(sendGain); sendGain.connect(reverbSend);
+    src.start(t);
+    const stopAt = t + atk + rel * 3 + 0.05;
+    return { stopAt, kill() { try { g.gain.cancelScheduledValues(ctx.currentTime); g.gain.setTargetAtTime(0.0001, ctx.currentTime, 0.05); } catch (e) {} } };
+  };
+}
+
+const V2_BASS_VOICE = makeV2ToneVoice({ cutoff: 2200, q: 1.2, isBass: true, attack: 0.01, release: 0.22 });
+const V2_PAD_VOICE  = makeV2ToneVoice({ cutoff: 2600, q: 1.6, isBass: false, attack: 0.05, release: 0.35 });
+const V2_MEL_VOICE  = makeV2ToneVoice({ cutoff: 3000, q: 1.8, isBass: false, attack: 0.012, release: 0.24 });
+const V2_PERC_VOICE = makeV2PercVoice();
+
+// Synthesized noise-decay impulse response for the shared music-only reverb (no
+// external IR asset). ~15% wet, mixed in after the dry bus, both feeding the same
+// duck + final 6kHz lowpass.
+function v2BuildReverbImpulse(ctx, durationSec = 2.0, decayPow = 3.2) {
+  const len = Math.max(1, Math.floor(ctx.sampleRate * durationSec));
+  const impulse = ctx.createBuffer(2, len, ctx.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const data = impulse.getChannelData(ch);
+    for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decayPow);
+  }
+  return impulse;
+}
+
+// Builds one MUSIC_V2 mix graph: bus -> {dry, reverb-send -> convolver} -> duck ->
+// 6kHz lowpass -> outDest. Bus gain target: a full-velocity mix should peak at
+// -16dB, not V1's -12dB. 0.1585 linear (-16dB for a single full-scale voice) was
+// the first-pass value, but measured renders (qa/render_music_v2.js, 60s @
+// intensity 0.5) peaked -11.7 to -14.0dB — several layers landing on the same
+// strong beat plus the reverb tail sum louder than a single-voice calibration
+// accounts for. Trimmed empirically from the worst measured case (tank7,
+// -11.69dB) with an extra -4.31dB (0.1585 * 0.6091 = 0.0966) so no tank's peak
+// exceeds -16dB; re-measured after the trim (see report) to confirm.
+MusicV2.setupGraph = function setupGraph(ctx, outDest) {
+  const bus = ctx.createGain(); bus.gain.value = 0.0966;
+  const reverbBus = ctx.createGain(); reverbBus.gain.value = 1;
+  const dryGain = ctx.createGain(); dryGain.gain.value = 1;
+  const convolver = ctx.createConvolver(); convolver.buffer = v2BuildReverbImpulse(ctx);
+  const wetGain = ctx.createGain(); wetGain.gain.value = 0.15;
+  const duck = ctx.createGain(); duck.gain.value = 1;
+  const lpFinal = ctx.createBiquadFilter(); lpFinal.type = 'lowpass'; lpFinal.frequency.value = 6000;
+  bus.connect(dryGain); dryGain.connect(duck);
+  bus.connect(reverbBus); reverbBus.connect(convolver); convolver.connect(wetGain); wetGain.connect(duck);
+  duck.connect(lpFinal); lpFinal.connect(outDest);
+  return { bus, reverbSend: reverbBus, duck, lpFinal };
+};
+
+// 4dB duck (not V1's 2dB) with a 200ms release, for coin/alien SFX triggers.
+// Audition-only (see file-level note) — never wired to the real SFX call sites.
+MusicV2.duck = function duckV2(graph, ctx, db = 4, releaseMs = 200) {
+  const floor = Math.pow(10, -db / 20);
+  const t = ctx.currentTime;
+  graph.duck.gain.cancelScheduledValues(t);
+  graph.duck.gain.setValueAtTime(graph.duck.gain.value, t);
+  graph.duck.gain.linearRampToValueAtTime(floor, t + 0.03);
+  graph.duck.gain.setValueAtTime(floor, t + 0.03);
+  graph.duck.gain.linearRampToValueAtTime(1, t + 0.03 + releaseMs / 1000);
+};
+
+// Schedules one full pass of a track's 32 bars against a graph, starting at ctx-time
+// `startAt`. Used by both live playback (audition) and the offline QA renderer.
+// Returns the track's total duration in seconds.
+MusicV2.scheduleTrack = function scheduleTrack(ctx, graph, data, startAt, intensityScale = 1) {
+  const secPerStep = (60 / data.bpm) * (4 / data.stepsPerBar);
+  for (const layerName of MusicV2.LAYER_NAMES) {
+    const bars = data.layers[layerName];
+    const voice = layerName === 'bass' ? V2_BASS_VOICE : layerName === 'pad' ? V2_PAD_VOICE
+      : layerName === 'melody' ? V2_MEL_VOICE : V2_PERC_VOICE;
+    let stepIdx = 0;
+    for (let bar = 0; bar < bars.length; bar++) {
+      for (let s = 0; s < bars[bar].length; s++) {
+        const note = bars[bar][s];
+        const t = startAt + stepIdx * secPerStep;
+        if (note) {
+          const dur = note.len * secPerStep * 0.92;
+          const vel = note.vel * intensityScale;
+          if (layerName === 'perc') voice(ctx, graph.bus, graph.reverbSend, note.deg, t, dur, vel);
+          else voice(ctx, graph.bus, graph.reverbSend, v2DegToFreq(data.root, note.deg, note.oct), t, dur, vel);
+        }
+        stepIdx++;
+      }
+    }
+  }
+  return secPerStep * data.stepsPerBar * data.bars;
+};
+
+// Live playback for the audition A/B toggle: one graph + one scheduled pass per
+// PLAY click, connected to Snd.musicBus so the level is directly comparable to V1.
+MusicV2._liveNodes = null;
+MusicV2.playLive = function playLive(tankIndex, intensity = 1) {
+  Snd.unlock();
+  MusicV2.stopLive();
+  const data = MusicV2.generateTrackData(tankIndex);
+  const graph = MusicV2.setupGraph(Snd.ctx, Snd.musicBus);
+  MusicV2.scheduleTrack(Snd.ctx, graph, data, Snd.ctx.currentTime + 0.05, intensity);
+  MusicV2._liveNodes = graph;
+};
+MusicV2.stopLive = function stopLive() {
+  if (!MusicV2._liveNodes) return;
+  try {
+    const t = Snd.ctx.currentTime;
+    MusicV2._liveNodes.duck.gain.cancelScheduledValues(t);
+    MusicV2._liveNodes.duck.gain.setTargetAtTime(0.0001, t, 0.15);
+    setTimeout(() => { try { MusicV2._liveNodes.duck.disconnect(); } catch (e) {} }, 600);
+  } catch (e) {}
+  MusicV2._liveNodes = null;
+};
+
+// Offline WAV render at a fixed intensity (used by the audition RENDER button and
+// mirrored by qa/render_music_v2.js for the QA pass). Renders exactly `durationSec`
+// seconds (default 60) regardless of the track's own natural loop length.
+MusicV2.renderTrackWav = async function renderTrackWav(tankIndex, intensity = 0.5, durationSec = 60) {
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (!OAC) return null;
+  const octx = new OAC(2, Math.ceil(durationSec * 44100), 44100);
+  const dest = octx.createGain(); dest.gain.value = 1; dest.connect(octx.destination);
+  const data = MusicV2.generateTrackData(tankIndex);
+  const graph = MusicV2.setupGraph(octx, dest);
+  MusicV2.scheduleTrack(octx, graph, data, 0.05, intensity);
+  const rendered = await octx.startRendering();
+  return audioBufferToWav(rendered);
+};
+// ===MUSIC_V2_END===
+
 // ============ CONFIG / BALANCE ============
 // Sources for every documented number are in docs/aquafrenzy_docs_mechanics-spec.md.
 // Values marked TUNE are undocumented in every source and are set by feel.
@@ -2151,7 +2497,11 @@ const Fishes = makePool(() => ({ kind:'sunfin', x:0, y:0, vx:0, vy:0, dir:1, sta
                                  // predator fish). Vesper revives the starved, never the eaten.
                                  eaten:false }));
 const Aliens = makePool(() => ({ kind:'mite', x:0, y:0, vx:0, vy:0, hp:0, maxHp:0, hpGhost:0, eaten:0,
-                                 grace:0, eatCd:0, phase:0, phaseT:0, hurt:0, dying:0, alive:false, wob:0 }));
+                                 grace:0, eatCd:0, phase:0, phaseT:0, hurt:0, dying:0, alive:false, wob:0,
+                                 // Phase 5A-2: seconds of "rattled" left on this alien, and
+                                 // what it started from, so the status ring can show how much
+                                 // is left. Per-run scratch; never saved, reset on spawn.
+                                 slowT:0, slowMax:0 }));
 const Shots  = makePool(() => ({ x:0, y:0, tx:0, ty:0, life:0, alive:false }));
 const Bits   = makePool(() => ({ x:0, y:0, vx:0, vy:0, life:0, max:0, col:'#fff', r:2,
                                  txt:null, ring:false, lw:2, alive:false }));
@@ -4478,248 +4828,20 @@ function spawnAlien(kind) {
   a.vy = 0;
   a.hp = a.maxHp = a.hpGhost = d.hp;
   a.eaten = 0; a.grace = CFG.ALIEN_GRACE; a.eatCd = 0; a.phase = 0; a.phaseT = 3;
-  a.hurt = 0; a.dying = 0; a.wob = rand(0, TAU);
+  a.hurt = 0; a.dying = 0; a.wob = rand(0, TAU); a.slowT = a.slowMax = 0;
   Sfx.play('alienSpawn_' + kind);
   if (kind === 'splitjaw') Sfx.play('splitjawSplit');
   Pet.emit('alienSpawn', a);
   return a;
 }
 
-// ============ PETS: BEHAVIOURS + RUNTIME ============
-// One active pet per run, chosen on the stage brief. Pets are data + hooks, not
-// classes: a behaviour is { init, update(p,dt), on:{event}, draw(g,p) } and a pet
-// without an entry here stays inert exactly as before. Pet.emit is a no-op with no
-// active pet, so the call sites scattered through the sim cost nothing.
-// Pets collect through the SAME collectCoin as the player — one money path, and the
-// watcher in frame() acknowledges pet income like any other.
-const PET_BEHAVIOURS = {
-  // Tuck crawls the sand toward coins lying on the floor and banks the ones the
-  // player left behind. His own pedia line is the balance rule: he hides (and stops
-  // collecting) the whole time aliens are in the tank.
-  tuck: {
-    init(p) { p.y = SAND_TOP - 10 * S; p.hiding = false; },
-    update(p, dt) {
-      const nowHiding = Game.invasion;
-      if (nowHiding && !p.hiding) { Sfx.stopLoop('petTuckScrape'); Sfx.play('petTuckClamp'); }
-      if (!nowHiding && p.hiding) Sfx.startLoop('petTuckScrape', () => sfxLoopCrackle(Snd.sfxBus, { rate: 4, hp: 900, lp: 2600, vel: 0.02 }));
-      p.hiding = nowHiding;
-      p.y = SAND_TOP - 10 * S;
-      if (p.hiding) return;
-      if (!Sfx.loops.petTuckScrape) Sfx.startLoop('petTuckScrape', () => sfxLoopCrackle(Snd.sfxBus, { rate: 4, hp: 900, lp: 2600, vel: 0.02 }));
-      let best = null, bd = Infinity;
-      for (const c of Coins.live) {
-        if (!c.alive || !c.rest) continue;
-        const d = Math.abs(c.x - p.x);
-        if (d < bd) { bd = d; best = c; }
-      }
-      if (!best) return;
-      const spd = 40 * S;
-      p.dir = best.x > p.x ? 1 : -1;
-      p.x = clamp(p.x + p.dir * Math.min(spd * dt, bd), 20, W - 20);
-      if (Math.abs(best.x - p.x) < 18 * S) collectCoin(best);
-    },
-    draw(g, p) {
-      // Floored at S=0.85: at a small phone's S (~0.70) Tuck drew at ~30x19px, easy to
-      // miss as "a pet" at arm's length. Movement (update()) is untouched — visual only.
-      const s = 16 * Math.max(S, 0.85), hide = p.hiding ? 1 : 0;
-      g.save(); g.translate(p.x, p.y); g.scale(p.dir || 1, 1);
-      // shell
-      const sg = g.createRadialGradient(-s * 0.2, -s * 0.5, s * 0.1, 0, -s * 0.4, s * 1.1);
-      sg.addColorStop(0, '#e8b46a'); sg.addColorStop(1, '#8a5a24');
-      g.fillStyle = sg;
-      g.beginPath(); g.arc(0, -s * 0.35, s * 0.85, 0, TAU); g.fill();
-      g.strokeStyle = 'rgba(70,40,10,.55)'; g.lineWidth = Math.max(1, s * 0.09);
-      g.beginPath(); g.arc(0, -s * 0.35, s * 0.52, -0.6, 2.6); g.stroke();
-      if (!hide) {
-        // body + eyestalks, tucked away while hiding
-        g.fillStyle = '#d9c98e';
-        g.beginPath(); g.ellipse(s * 0.35, s * 0.12, s * 0.95, s * 0.30, 0, 0, TAU); g.fill();
-        g.strokeStyle = '#d9c98e'; g.lineWidth = Math.max(1, s * 0.12); g.lineCap = 'round';
-        g.beginPath(); g.moveTo(s * 0.85, -s * 0.05); g.lineTo(s * 1.1, -s * 0.55);
-        g.moveTo(s * 1.05, 0); g.lineTo(s * 1.35, -s * 0.42); g.stroke();
-        g.fillStyle = '#241a10';
-        g.beginPath(); g.arc(s * 1.1, -s * 0.55, s * 0.10, 0, TAU);
-        g.arc(s * 1.35, -s * 0.42, s * 0.10, 0, TAU); g.fill();
-      }
-      g.restore();
-    },
-  },
-
-  // Dollop drifts to coins anywhere — but only ones older than the age gate, so the
-  // player keeps first claim on everything and the jellyfish takes the leftovers.
-  // AGE_GATE is the whole balance dial: raise it if the sims say he earns too much.
-  dollop: {
-    AGE_GATE: 1.5,
-    init(p) { p.y = TANK_TOP + TANK_H * 0.4; p.pulse = 0; },
-    update(p, dt) {
-      p.pulse += dt * 3;
-      let best = null, bd = Infinity;
-      for (const c of Coins.live) {
-        if (!c.alive || c.age < PET_BEHAVIOURS.dollop.AGE_GATE) continue;
-        const d = dist2(p.x, p.y, c.x, c.y);
-        if (d < bd) { bd = d; best = c; }
-      }
-      const spd = 60 * S;
-      if (best) {
-        const dx = best.x - p.x, dy = best.y - p.y, d = Math.hypot(dx, dy) || 1;
-        p.x += dx / d * spd * dt; p.y += dy / d * spd * dt;
-        if (d < 20 * S) { Sfx.play('petDollopBurble'); collectCoin(best); }
-      } else {
-        p.y += Math.sin(p.pulse * 0.5) * 12 * dt;   // idle bob
-      }
-      p.x = clamp(p.x, 20, W - 20);
-      p.y = clamp(p.y, TANK_TOP + 30 * S, SAND_TOP - 20 * S);
-    },
-    draw(g, p) {
-      const s = 17 * S, sq = 1 + Math.sin(p.pulse) * 0.12;   // bell pulse
-      g.save(); g.translate(p.x, p.y);
-      g.globalAlpha = 0.85;
-      g.strokeStyle = 'rgba(200,170,255,.6)'; g.lineWidth = Math.max(1, s * 0.10); g.lineCap = 'round';
-      for (let i = -2; i <= 2; i++) {
-        g.beginPath(); g.moveTo(i * s * 0.28, s * 0.25);
-        g.quadraticCurveTo(i * s * 0.34, s * 0.9, i * s * 0.28 + Math.sin(p.pulse + i) * s * 0.18, s * 1.35);
-        g.stroke();
-      }
-      const bg = g.createRadialGradient(0, -s * 0.2, s * 0.1, 0, 0, s * 1.1);
-      bg.addColorStop(0, '#f2e6ff'); bg.addColorStop(0.7, '#c9a6f2'); bg.addColorStop(1, 'rgba(160,110,220,.25)');
-      g.fillStyle = bg;
-      g.beginPath(); g.ellipse(0, 0, s / sq, s * 0.8 * sq, 0, Math.PI, 0);
-      g.quadraticCurveTo(s * 0.5 / sq, s * 0.45, 0, s * 0.4);
-      g.quadraticCurveTo(-s * 0.5 / sq, s * 0.45, -s / sq, 0);
-      g.fill();
-      g.restore(); g.globalAlpha = 1;
-    },
-  },
-
-  // Plod slows every falling thing to half speed — coins get more claim time, food
-  // takes longer to reach hungry mouths. Pet.fall is his whole mechanic; the body is
-  // just the visual anchor paddling along the floor.
-  plod: {
-    init(p) { p.y = SAND_TOP - 12 * S; p.dir = 1; Pet.fall = 0.5;
-      Sfx.startLoop('petPlodHum', () => sfxLoopTone(Snd.sfxBus, { freq: 65, amRate: 3, amDepth: 0.4, vel: 0.06, type: 'sine' })); },
-    update(p, dt) {
-      p.y = SAND_TOP - 12 * S;
-      p.x += p.dir * 14 * S * dt;
-      if (p.x < 40) { p.x = 40; p.dir = 1; }
-      if (p.x > W - 40) { p.x = W - 40; p.dir = -1; }
-    },
-    draw(g, p) {
-      const s = 18 * S;
-      g.save(); g.translate(p.x, p.y); g.scale(p.dir, 1);
-      g.fillStyle = '#6f9e5a';   // flippers
-      const kick = Math.sin(Game.time * 2.2) * s * 0.12;
-      g.beginPath(); g.ellipse(-s * 0.55, s * 0.30 + kick, s * 0.42, s * 0.16, -0.4, 0, TAU); g.fill();
-      g.beginPath(); g.ellipse(s * 0.45, s * 0.30 - kick, s * 0.42, s * 0.16, 0.4, 0, TAU); g.fill();
-      const shg = g.createRadialGradient(-s * 0.1, -s * 0.5, s * 0.1, 0, -s * 0.2, s * 1.2);
-      shg.addColorStop(0, '#8fae4f'); shg.addColorStop(1, '#4a6b2a');
-      g.fillStyle = shg;
-      g.beginPath(); g.ellipse(0, -s * 0.15, s * 0.95, s * 0.60, 0, Math.PI, 0); g.fill();
-      g.strokeStyle = 'rgba(30,50,15,.5)'; g.lineWidth = Math.max(1, s * 0.07);
-      g.beginPath(); g.moveTo(-s * 0.5, -s * 0.35); g.lineTo(s * 0.5, -s * 0.35);
-      g.moveTo(-s * 0.15, -s * 0.62); g.lineTo(-s * 0.15, -s * 0.15);
-      g.moveTo(s * 0.25, -s * 0.58); g.lineTo(s * 0.25, -s * 0.15); g.stroke();
-      g.fillStyle = '#9ec27a';   // head
-      g.beginPath(); g.arc(s * 0.95, -s * 0.10, s * 0.30, 0, TAU); g.fill();
-      g.fillStyle = '#1d2b12';
-      g.beginPath(); g.arc(s * 1.05, -s * 0.18, s * 0.07, 0, TAU); g.fill();
-      g.restore();
-    },
-  },
-
-  // Kite glides above the sand; money that reaches the floor bounces back up once
-  // for a second catch. The second landing rests as normal — one save per coin.
-  kite: {
-    init(p) { p.y = SAND_TOP - 55 * S; p.dir = 1; p.glide = 0; },
-    update(p, dt) {
-      p.glide += dt;
-      p.x += p.dir * 55 * S * dt;
-      if (p.x < 50) { p.x = 50; p.dir = 1; }
-      if (p.x > W - 50) { p.x = W - 50; p.dir = -1; }
-      p.y = SAND_TOP - (55 + Math.sin(p.glide * 1.4) * 14) * S;
-    },
-    on: {
-      // Fired from updateCoins the moment a coin would rest on the sand.
-      coinLand(p, c) {
-        if (c.bounced) return;
-        c.bounced = true;
-        c.rest = false;
-        c.vy = -TANK_H * 0.8;            // decays against gravity in updateCoins
-        puff(c.x, c.y, '#bfe8ff', 6, 70);
-        Sfx.play('petKiteBoing', { height: 0.7 });
-      },
-    },
-    draw(g, p) {
-      const s = 22 * S, flap = Math.sin(p.glide * 3) * 0.35;
-      g.save(); g.translate(p.x, p.y); g.scale(p.dir, 1);
-      const wg = g.createLinearGradient(0, -s, 0, s * 0.4);
-      wg.addColorStop(0, '#3d5a78'); wg.addColorStop(1, '#16283c');
-      g.fillStyle = wg;
-      g.beginPath();
-      g.moveTo(s * 0.9, 0);
-      g.quadraticCurveTo(0, -s * (0.9 + flap), -s * 1.3, -s * 0.15);   // far wing
-      g.quadraticCurveTo(-s * 0.5, s * 0.15, -s * 1.6, s * 0.25);      // tail root
-      g.quadraticCurveTo(0, s * (0.45 + flap * 0.4), s * 0.9, 0);      // near wing
-      g.fill();
-      g.strokeStyle = '#16283c'; g.lineWidth = Math.max(1, s * 0.08); g.lineCap = 'round';
-      g.beginPath(); g.moveTo(-s * 1.5, s * 0.22); g.lineTo(-s * 2.2, s * 0.05); g.stroke();
-      g.fillStyle = '#e8f2fa';   // belly flash + eye
-      g.beginPath(); g.ellipse(s * 0.25, s * 0.12, s * 0.42, s * 0.14, 0, 0, TAU); g.fill();
-      g.fillStyle = '#0a1420';
-      g.beginPath(); g.arc(s * 0.72, -s * 0.08, s * 0.07, 0, TAU); g.fill();
-      g.restore();
-    },
-  },
-
-  // Cinder drifts mid-tank; while aliens are in the water her lure lights and
-  // fish with nothing better to do gather in the glow (updateFish reads Pet.glow()).
-  // No money at all — a herded school is also one bite-radius, so it's a trade.
-  cinder: {
-    GLOW_R: 140,
-    init(p) { p.y = TANK_TOP + TANK_H * 0.45; p.dir = 1; p.lit = 0;
-      Sfx.startLoop('petCinderCrackle', () => sfxLoopCrackle(Snd.sfxBus, { rate: 3, hp: 1500, lp: 6000, vel: 0.025 })); },
-    update(p, dt) {
-      p.lit = approach(p.lit, Game.invasion ? 1 : 0, 0.08, dt);
-      if (Sfx.loops.petCinderCrackle) Sfx.loops.petCinderCrackle.setIntensity(1 + p.lit * 2);   // rises when the lure lights
-      p.x += p.dir * 20 * S * dt;
-      if (p.x < W * 0.2) { p.x = W * 0.2; p.dir = 1; }
-      if (p.x > W * 0.8) { p.x = W * 0.8; p.dir = -1; }
-      p.y = TANK_TOP + TANK_H * (0.45 + Math.sin(Game.time * 0.5) * 0.08);
-    },
-    draw(g, p) {
-      const s = 16 * S;
-      g.save(); g.translate(p.x, p.y);
-      if (p.lit > 0.03) {
-        const gr = PET_BEHAVIOURS.cinder.GLOW_R * S;
-        const gg = g.createRadialGradient(s * 1.1 * p.dir, -s * 0.9, 2, s * 1.1 * p.dir, -s * 0.9, gr);
-        gg.addColorStop(0, `rgba(255,220,140,${0.55 * p.lit})`);
-        gg.addColorStop(1, 'rgba(255,220,140,0)');
-        g.fillStyle = gg;
-        g.beginPath(); g.arc(s * 1.1 * p.dir, -s * 0.9, gr, 0, TAU); g.fill();
-      }
-      g.scale(p.dir, 1);
-      g.fillStyle = '#2a2f3d';   // deep-water body
-      g.beginPath(); g.ellipse(0, 0, s, s * 0.55, 0, 0, TAU); g.fill();
-      g.fillStyle = '#1a1e28';   // tail
-      g.beginPath(); g.moveTo(-s * 0.9, 0); g.lineTo(-s * 1.4, -s * 0.4); g.lineTo(-s * 1.4, s * 0.4); g.fill();
-      g.strokeStyle = '#c9a25a'; g.lineWidth = Math.max(1, s * 0.09); g.lineCap = 'round';
-      g.beginPath(); g.moveTo(s * 0.55, -s * 0.45); g.quadraticCurveTo(s * 0.9, -s * 1.1, s * 1.1, -s * 0.9); g.stroke();
-      g.fillStyle = p.lit > 0.03 ? `rgba(255,225,150,${0.4 + 0.6 * p.lit})` : '#6a5a38';
-      g.beginPath(); g.arc(s * 1.1, -s * 0.9, s * 0.18 * (1 + p.lit * 0.4), 0, TAU); g.fill();
-      g.fillStyle = '#dfe8f2';   // oversized lanternfish eye
-      g.beginPath(); g.arc(s * 0.5, -s * 0.08, s * 0.20, 0, TAU); g.fill();
-      g.fillStyle = '#0a0e16';
-      g.beginPath(); g.arc(s * 0.55, -s * 0.08, s * 0.10, 0, TAU); g.fill();
-      g.restore();
-    },
-  },
-};
 
 // ============ PET FRAMEWORK (Phase 5A) ============
 // ONE data table — PET_BEHAVIOR, keyed by pet id, every row exactly { bucket, params }.
-// Six buckets, each a SINGLE shared implementation in PET_BUCKETS. Adding a pet later
+// Seven buckets, each a SINGLE shared implementation in PET_BUCKETS. Adding a pet later
 // means adding a row here and a drawing in PET_ART; it must never mean new mechanic code.
-// PET_BEHAVIOURS above is the older bespoke table (one hand-written update/draw per pet);
-// the four pets still living there keep working untouched, and Pet prefers this table.
+// This is the ONLY pet table. The older bespoke table that preceded it (one hand-written
+// update and draw per pet) was migrated into these buckets in 5A-1 and deleted.
 //
 // Per-run only. Nothing here writes the save schema, Save.data.pets, the frontier,
 // LEVELS/THEMES/TANK_SHOP, prices, START_MONEY, the relief drip, or CFG.LUCK. Pet.update
@@ -4736,7 +4858,8 @@ const PET_BEHAVIOR = {
   // (restOnly) and stops dead during an attack. He never touches a coin still falling,
   // which is the player's window.
   tuck:     { bucket: 'collector', params: { speed: 40, reach: 18, floorOnly: true,
-                                             restOnly: true, hideInInvasion: true } },
+                                             restOnly: true, hideInInvasion: true, floorGap: 10,
+                                             loop: 'petTuckScrape', hideSfx: 'petTuckClamp' } },
   // feeder — "a level 2 pellet at nearby hungry fish every 3 seconds, never counts
   // against your food limit". ONE pellet, ONE fish, within reach: the tank's other
   // mouths are still the player's problem.
@@ -4749,51 +4872,252 @@ const PET_BEHAVIOR = {
   marigold: { bucket: 'producer',  params: { interval: 26, what: 'sunfin', cap: 60,
                                              pauseInInvasion: true } },
   // amplifier — "every grown sunfin drops three coins at once".
-  lull:     { bucket: 'amplifier', params: { stat: 'sunfinCoins', mult: 3 } },
+  lull:     { bucket: 'amplifier', params: { stat: 'sunfinCoins', mult: 3,
+                                             ring: 2.4, ringSfx: 'petLullChord' } },
   // utility — "swims to dead fish and revives them; cannot bring back anything eaten".
   // The cooldown is the weakness: she cannot paper over a player who stops feeding.
   vesper:   { bucket: 'utility',   params: { effect: 'revive', speed: 190, reach: 22,
                                              cooldown: 12 } },
+
+  // ---- migrated off the old bespoke table (5A-1); same constants, same feel ----
+  // collector — "drifts through the tank collecting coins. Faster than Tuck, and he
+  // never hides." No floor lock and no invasion pause; an age gate instead, so the
+  // player keeps first claim for 1.5s and the jellyfish takes the leftovers.
+  dollop:   { bucket: 'collector', params: { speed: 60, reach: 20, ageGate: 1.5,
+                                             move: 'drift', idleBob: 12, idleBobRate: 1.5,
+                                             sfx: 'petDollopBurble' } },
+  // amplifier — "everything that falls in your tank falls at half speed". Pet.fall is a
+  // getter over amp('fallSpeed'), so this row IS the mechanic and updateFood/updateCoins
+  // read it exactly as they always did.
+  plod:     { bucket: 'amplifier', params: { stat: 'fallSpeed', mult: 0.5,
+                                             move: 'floorPatrol', moveSpeed: 14, floorGap: 12,
+                                             loop: 'petPlodHum' } },
+  // utility — "bounces falling money back up before it reaches the floor". Event-driven:
+  // the coinLand hook fires the instant a coin would rest, once per coin.
+  kite:     { bucket: 'utility',   params: { effect: 'bounceCoin', lift: 0.8,
+                                             move: 'glide', moveSpeed: 55, glideY: 55,
+                                             glideAmp: 14, glideRate: 1.4, sfx: 'petKiteBoing' } },
+  // controller — "her lure lights up when aliens arrive, and frightened fish gather in
+  // her glow instead of scattering". She changes what fish DO, not what they pay, which
+  // is why she is a controller and not a utility (5A-2). updateFish reads Pet.herd(f).
+  // force:false is the weakness — feeding and hunting still outrank the light, so she
+  // only claims fish with nothing better to do. And a herded school is also a single
+  // bite radius, so she stays a trade.
+  cinder:   { bucket: 'controller', params: { effect: 'herd', when: 'invasion', force: false,
+                                              glowR: 140, litRate: 0.08, litGate: 0.5,
+                                              loopIntensity: 2,
+                                              move: 'bandPatrol', moveSpeed: 20, bandMin: 0.2,
+                                              bandMax: 0.8, bandY: 0.45, bobRate: 0.5, bobAmp: 0.08,
+                                              loop: 'petCinderCrackle' } },
 };
 
-// Six buckets, six implementations. `p` is the live pet instance (position + scratch),
+// Continuous audio beds keyed by loop id — the same split as PET_ART: an asset table,
+// never mechanics. A row names one in params.loop; the framework starts and stops it.
+const PET_LOOPS = {
+  petTuckScrape:    () => sfxLoopCrackle(Snd.sfxBus, { rate: 4, hp: 900,  lp: 2600, vel: 0.020 }),
+  petPlodHum:       () => sfxLoopTone(Snd.sfxBus, { freq: 65, amRate: 3, amDepth: 0.4, vel: 0.06, type: 'sine' }),
+  petCinderCrackle: () => sfxLoopCrackle(Snd.sfxBus, { rate: 3, hp: 1500, lp: 6000, vel: 0.025 }),
+};
+
+const PET_CORNERS = [[0.12, 0.20], [0.88, 0.20], [0.12, 0.80], [0.88, 0.80]];
+
+// Movement styles for buckets with nothing to chase. Each mode keeps the exact constants
+// its pet used before the migration; they arrive as params, so the modes name no pet.
+function petMove(p, q, dt) {
+  switch (q.move) {
+    case 'floorPatrol':                                  // Plod: crawls the sand, turns at the walls
+      p.y = SAND_TOP - (q.floorGap || 12) * S;
+      p.x += p.dir * (q.moveSpeed || 14) * S * dt;
+      if (p.x < 40)     { p.x = 40;     p.dir =  1; }
+      if (p.x > W - 40) { p.x = W - 40; p.dir = -1; }
+      break;
+    case 'glide':                                        // Kite: a lane above the sand, rising and falling
+      p.glide = (p.glide || 0) + dt;
+      p.x += p.dir * (q.moveSpeed || 55) * S * dt;
+      if (p.x < 50)     { p.x = 50;     p.dir =  1; }
+      if (p.x > W - 50) { p.x = W - 50; p.dir = -1; }
+      p.y = SAND_TOP - ((q.glideY || 55) + Math.sin(p.glide * (q.glideRate || 1.4)) * (q.glideAmp || 14)) * S;
+      break;
+    case 'fleeCorner': {                                 // Beacon: the corner furthest from the aliens
+      let cx = W * 0.12, cy = TANK_TOP + TANK_H * 0.2, far = -1;
+      for (const c of PET_CORNERS) {
+        const x = W * c[0], y = TANK_TOP + TANK_H * c[1];
+        let d = Infinity;
+        for (const a of Aliens.live) if (a.alive && a.dying <= 0) d = Math.min(d, Math.hypot(a.x - x, a.y - y));
+        if (d > far) { far = d; cx = x; cy = y; }
+      }
+      const dx = cx - p.x, dy = cy - p.y, d = Math.hypot(dx, dy) || 1;
+      const spd = (q.moveSpeed || 60) * S;
+      p.x += dx / d * Math.min(spd * dt, d);
+      p.y += dy / d * Math.min(spd * dt, d);
+      p.dir = dx > 0 ? 1 : -1;
+      break;
+    }
+    case 'bandPatrol':                                   // Cinder: mid-water, inside a band of the tank
+      p.x += p.dir * (q.moveSpeed || 20) * S * dt;
+      if (p.x < W * (q.bandMin || 0.2)) { p.x = W * (q.bandMin || 0.2); p.dir =  1; }
+      if (p.x > W * (q.bandMax || 0.8)) { p.x = W * (q.bandMax || 0.8); p.dir = -1; }
+      p.y = TANK_TOP + TANK_H * ((q.bandY || 0.45) + Math.sin(Game.time * (q.bobRate || 0.5)) * (q.bobAmp || 0.08));
+      break;
+    default:                                             // gentle idle drift
+      p.x = clamp(p.x + Math.cos(p.pulse * 0.5) * 26 * S * dt, 30, W - 30);
+      p.y = clamp(p.y + Math.sin(p.pulse * 0.8) * 18 * S * dt, TANK_TOP + 40 * S, SAND_TOP - 30 * S);
+      p.dir = Math.cos(p.pulse * 0.5) > 0 ? 1 : -1;
+  }
+}
+
+
+// ---- controller helpers -------------------------------------------------------------
+// A controller changes how FISH or ALIENS BEHAVE rather than what they pay. Every effect
+// writes a TEMPORARY flag onto a subject the host already understands, so the host reads
+// one field it already had, or one derived hook, and never a pet id:
+//   herd  -> Pet.herd(f)   a gather point; `force` decides whether it outranks food/prey
+//   hide  -> f.hidden      a field aliens, the feeder, the sparkle and the renderer
+//                          already respect; nothing else in the game writes it
+//   push  -> f.vy          a nudge, not a teleport
+//   blind -> a.grace       the "cannot hunt yet" timer every alien already carries
+//   slow  -> a.slowT       read back through Pet.alienSpeed(a)
+// `when` is the gate ('always' | 'invasion' | 'alienSpawn') and the weakness is always a
+// param — a count, a cap, a reach, an interval or a duration — never prose.
+
+// True while the row's gate is open. 'alienSpawn' rows are event-driven; the gate still
+// tracks the invasion so their art and audio can ramp with it.
+const ctrlGate = q => q.when === 'always' ? true : !!Game.invasion;
+
+// Row-level subject filter. No filter means "any", so a row only spells out what it limits.
+function ctrlMatch(f, q) {
+  if (!f.alive || f.dying > 0) return false;
+  if (q.kinds  && q.kinds.indexOf(f.kind)   < 0) return false;
+  if (q.stages && q.stages.indexOf(f.stage) < 0) return false;
+  return true;
+}
+
+// hide — recomputed from scratch every frame rather than held in a list. The pools RECYCLE
+// objects, so a remembered reference could unhide (or re-hide) a completely different fish
+// later; clearing first is the only version of this that is safe with a pool. Safe to clear
+// unconditionally because this is the only writer of f.hidden in the game.
+function ctrlHide(p, q) {
+  ctrlRelease();
+  if (!ctrlGate(q)) return;
+  const cap = q.cap || 6, reach = (q.range || 0) * S;
+  let n = 0;
+  for (const f of Fishes.live) {
+    if (n >= cap) break;
+    if (!ctrlMatch(f, q)) continue;
+    if (reach && Math.hypot(f.x - p.x, f.y - p.y) > reach) continue;
+    // Safe in the mouth, but not fed there: hunger keeps ticking, and a pellet cannot
+    // reach them. That is the whole weakness — shelter costs feeding time.
+    f.hidden = true; f.target = null; f.vx = 0; f.vy = 0;
+    f.x = p.x + (q.mouthX || 0) * S; f.y = p.y + (q.mouthY || 4) * S;
+    n++;
+  }
+  p.held = n;
+}
+function ctrlRelease() { for (const f of Fishes.live) if (f.hidden) f.hidden = false; }
+
+// push — knocks a fish out of a zone on an interval. Reach and interval are the weakness.
+function ctrlPush(p, q, dt) {
+  if (p.t > 0) { p.t -= dt; return; }
+  const band = SAND_TOP - (q.zoneH || 70) * S, reach = (q.range || 90) * S;
+  let n = 0;
+  for (const f of Fishes.live) {
+    if (n >= (q.count || 1)) break;
+    if (!ctrlMatch(f, q) || f.y < band) continue;
+    if (Math.abs(f.x - p.x) > reach) continue;
+    f.vy = -(q.lift || 70) * S; f.target = null;
+    puff(f.x, f.y + 6 * S, '#cfe8ff', 6, 70);
+    n++;
+  }
+  if (n) { p.t = q.interval || 1.2; p.snap = 0.18; if (q.sfx) Sfx.play(q.sfx); }
+}
+
+// True when a pet blinded this alien. Spawn grace is exactly CFG.ALIEN_GRACE and only ever
+// ticks DOWN, so anything above it can only have been written by a controller.
+function alienBlinded(a) { return a.alive && a.dying <= 0 && a.grace > CFG.ALIEN_GRACE; }
+
+// blind — writes the alien's own "cannot hunt" timer. `count` per attack is the weakness;
+// p.marked resets on the invasion edge, so it is one alien per attack, not one per second.
+// `duration` is seconds, or the string 'attack' for "until this alien leaves the tank" —
+// which resolves to Infinity rather than a big number pretending to be one. The countdown
+// in updateAliens leaves Infinity alone, and RunSave clamps it to -1 across a save.
+function ctrlBlind(p, q, a) {
+  if (!a || !a.alive || a.dying > 0) return false;
+  if (p.marked >= (q.count || 1)) return false;
+  a.grace = Math.max(a.grace, q.duration === 'attack' ? Infinity : (q.duration || 12));
+  p.marked++;
+  puff(a.x, a.y, '#2b2440', 16, 110);
+  floatText(a.x, a.y - 24, 'BLINDED', '#b9a7ff');
+  if (q.sfx) Sfx.play(q.sfx);
+  return true;
+}
+function ctrlBlindScan(p, q) {
+  if (!ctrlGate(q) || p.marked >= (q.count || 1)) return;
+  const reach = (q.range || 0) * S;
+  for (const a of Aliens.live) {
+    if (!a.alive || a.dying > 0) continue;
+    if (reach && Math.hypot(a.x - p.x, a.y - p.y) > reach) continue;
+    if (ctrlBlind(p, q, a)) return;
+  }
+}
+
+// slow — marks the alien for `duration` seconds; Pet.alienSpeed(a) is where it is felt.
+function ctrlSlow(p, q, a) {
+  if (!a || !a.alive) return;
+  a.slowT = a.slowMax = q.duration || 10;
+  puff(a.x, a.y, '#9fd8ff', 12, 90);
+  floatText(a.x, a.y - 24, 'RATTLED', '#9fd8ff');
+  if (q.sfx) Sfx.play(q.sfx);
+}
+function ctrlSlowTick(dt) { for (const a of Aliens.live) if (a.slowT > 0) a.slowT -= dt; }
+
+// Seven buckets, seven implementations. `p` is the live pet instance (position + scratch),
 // `q` is that row's params, so nothing below ever names a pet.
 const PET_BUCKETS = {
   // Moves to coins and banks them. floorOnly walks the sand; otherwise it swims in 2D.
   collector: {
-    init(p, q) { p.y = q.floorOnly ? SAND_TOP - 10 * S : TANK_TOP + TANK_H * 0.4; p.hiding = false; },
+    init(p, q) { p.y = q.floorOnly ? SAND_TOP - (q.floorGap || 10) * S : TANK_TOP + TANK_H * 0.4;
+                 p.hiding = false; },
     update(p, q, dt) {
       if (q.hideInInvasion) {
+        // Hiding is a state, not a one-shot: the working loop stops while tucked away and
+        // starts again on the way out, so BOTH transitions are handled here.
         const now = Game.invasion;
         if (now !== p.hiding) {
           p.hiding = now;
-          if (now) { Sfx.stopLoop('petTuckScrape'); Sfx.play('petTuckClamp'); }
+          if (now) { Pet.loopOff(q); if (q.hideSfx) Sfx.play(q.hideSfx); }
+          else Pet.loopOn(q);
         }
-        if (now) { if (q.floorOnly) p.y = SAND_TOP - 10 * S; return; }
+        if (now) { if (q.floorOnly) p.y = SAND_TOP - (q.floorGap || 10) * S; return; }
       }
-      if (q.floorOnly) p.y = SAND_TOP - 10 * S;
+      if (q.floorOnly) p.y = SAND_TOP - (q.floorGap || 10) * S;
       let best = null, bd = Infinity;
       for (const c of Coins.live) {
         if (!c.alive) continue;
         if (q.restOnly && !c.rest) continue;         // only what the player already missed
         if (c.age < (q.ageGate || 0)) continue;
-        const d = q.floorOnly ? Math.abs(c.x - p.x) : dist2(p.x, p.y, c.x, c.y);
+        // LINEAR distance on purpose: dist2 returns a SQUARE, and `priority: 'value'`
+        // trades pixels against coin value, so the two must be in the same unit.
+        const d = q.floorOnly ? Math.abs(c.x - p.x) : Math.hypot(c.x - p.x, c.y - p.y);
         const score = q.priority === 'value' ? d - c.value * 4 : d;
         if (score < bd) { bd = score; best = c; }
       }
-      if (!best) return;
+      if (!best) {
+        if (q.idleBob) p.y = clamp(p.y + Math.sin(p.pulse * (q.idleBobRate || 1)) * q.idleBob * dt,
+                                   TANK_TOP + 30 * S, SAND_TOP - 20 * S);
+        return;
+      }
       const spd = q.speed * S;
       if (q.floorOnly) {
         const gap = Math.abs(best.x - p.x);
         p.dir = best.x > p.x ? 1 : -1;
         p.x = clamp(p.x + p.dir * Math.min(spd * dt, gap), 20, W - 20);
-        if (Math.abs(best.x - p.x) < q.reach * S) collectCoin(best);
+        if (Math.abs(best.x - p.x) < q.reach * S) { if (q.sfx) Sfx.play(q.sfx); collectCoin(best); }
       } else {
         const dx = best.x - p.x, dy = best.y - p.y, d = Math.hypot(dx, dy) || 1;
         p.dir = dx > 0 ? 1 : -1;
         p.x = clamp(p.x + dx / d * spd * dt, 20, W - 20);
         p.y = clamp(p.y + dy / d * spd * dt, TANK_TOP + 30 * S, SAND_TOP - 20 * S);
-        if (d < q.reach * S) collectCoin(best);
+        if (d < q.reach * S) { if (q.sfx) Sfx.play(q.sfx); collectCoin(best); }
       }
     },
   },
@@ -4911,25 +5235,84 @@ const PET_BUCKETS = {
   // at all — the host system reads Pet.amp(stat) at its own call site — so this update
   // is only the swim, and adding another amplifier means another row, never another hook.
   amplifier: {
-    init(p, q) { p.pulse = 0; },
+    init(p, q) { if (q.move === 'floorPatrol') p.y = SAND_TOP - (q.floorGap || 12) * S; },
     update(p, q, dt) {
-      p.pulse += dt;
-      p.x = clamp(p.x + Math.cos(p.pulse * 0.5) * 26 * S * dt, 30, W - 30);
-      p.y = clamp(p.y + Math.sin(p.pulse * 0.8) * 18 * S * dt, TANK_TOP + 40 * S, SAND_TOP - 30 * S);
-      p.dir = Math.cos(p.pulse * 0.5) > 0 ? 1 : -1;
-      // one visible pulse per bar so the multiplier reads as a cause, not a coincidence
-      p.ring = (p.ring || 0) - dt;
-      if (p.ring <= 0) { p.ring = 2.4; p.sing = 0.7; Sfx.play('petLullChord'); }
-      if (p.sing > 0) p.sing -= dt;
+      petMove(p, q, dt);
+      // An optional visible pulse, so a multiplier reads as a cause rather than a
+      // coincidence. Plod has none — his effect is felt in how the water falls.
+      if (q.ring) {
+        p.ringT = (p.ringT || 0) - dt;
+        if (p.ringT <= 0) { p.ringT = q.ring; p.sing = 0.7; if (q.ringSfx) Sfx.play(q.ringSfx); }
+        if (p.sing > 0) p.sing -= dt;
+      }
     },
   },
 
-  // One-off triggered effects. Each `effect` is a small branch here; a new utility pet
-  // reuses one of them through params rather than arriving with its own update loop.
+
+  // The seventh bucket (5A-2): pets that change how FISH or ALIENS BEHAVE. The other six
+  // describe what a pet does to the ECONOMY — collect, feed, damage, spawn, multiply, and
+  // the leftovers. This one is a different verb, and six pets want it, so it is a bucket
+  // rather than a third meaning of `utility`. See the ctrl* helpers above for the five
+  // effects; every one of them is params, so a new controller is a row and a drawing.
+  controller: {
+    init(p, q) {
+      p.lit = 0; p.t = q.interval || 0; p.marked = 0; p.held = 0;
+      // Read straight off the live instance by Pet.herd, so the host needs no second hook.
+      p.force = !!q.force;
+    },
+    on: {
+      // A pet that acts on arrival gets the alien the moment it warps in.
+      alienSpawn(p, q, a) {
+        if (q.when !== 'alienSpawn') return;
+        if (q.effect === 'slow')  ctrlSlow(p, q, a);
+        if (q.effect === 'blind') ctrlBlind(p, q, a);
+      },
+      // `count` is per ATTACK, so the edges are where the allowance resets, and anything
+      // held has to come back out when the water is clear.
+      invasionStart(p, q) { p.marked = 0; },
+      invasionEnd(p, q)   { p.marked = 0; if (q.effect === 'hide') ctrlRelease(); },
+    },
+    update(p, q, dt) {
+      // One "the gate is open" ramp every controller gets for free — art and audio read it.
+      p.lit = approach(p.lit, ctrlGate(q) ? 1 : 0, q.litRate || 0.08, dt);
+      const lp = q.loop && Sfx.loops[q.loop];
+      if (lp && lp.setIntensity) lp.setIntensity(1 + p.lit * (q.loopIntensity || 2));
+      switch (q.effect) {
+        case 'herd':  break;                       // Pet.herd(f) IS the mechanic
+        case 'hide':  ctrlHide(p, q);      break;
+        case 'push':  ctrlPush(p, q, dt);  break;
+        case 'blind': ctrlBlindScan(p, q); break;
+        case 'slow':  ctrlSlowTick(dt);    break;
+      }
+      petMove(p, q, dt);
+    },
+    // Unequipping must undo everything the pet did to the tank. Nothing else can.
+    stop(p, q) { if (q.effect === 'hide') ctrlRelease(); },
+  },
+
+  // Genuine one-offs — an effect that belongs to no other bucket. Each `effect` is a small
+  // branch here; a new utility pet reuses one of them through params rather than arriving
+  // with its own update loop. The lure moved out to `controller` in 5A-2: utility is for
+  // what is left over, not a second home for everything.
   utility: {
     init(p, q) { p.t = 0; },
+    // Events reach buckets here. A bucket that wants one declares it; the framework
+    // routes by bucket, so no pet id is ever named.
+    on: {
+      // Kite: the instant a coin would rest on the sand, throw it back up. Once per coin
+      // (c.bounced), and the second landing rests as normal — one save per coin.
+      coinLand(p, q, c) {
+        if (q.effect !== 'bounceCoin' || c.bounced) return;
+        c.bounced = true;
+        c.rest = false;
+        c.vy = -TANK_H * (q.lift || 0.8);          // decays against gravity in updateCoins
+        puff(c.x, c.y, '#bfe8ff', 6, 70);
+        if (q.sfx) Sfx.play(q.sfx, { height: 0.7 });
+      },
+    },
     update(p, q, dt) {
       if (p.t > 0) p.t -= dt;
+      if (q.effect === 'bounceCoin') { petMove(p, q, dt); return; }
       if (q.effect === 'revive') {
         // A dying fish rises and fades over ~1.4s, so she has to actually get there.
         let best = null, bd = Infinity;
@@ -5161,33 +5544,137 @@ const PET_ART = {
     g.beginPath(); g.arc(s * 0.45, -s * 0.12, s * 0.12, 0, TAU); g.fill();
     g.restore();
   },
+  // ---- migrated from the bespoke table (5A-1), pixel-for-pixel ----
+  dollop(g, p, q) {
+      const s = 17 * S, sq = 1 + Math.sin(p.pulse * 3) * 0.12;   // bell pulse
+      g.save(); g.translate(p.x, p.y);
+      g.globalAlpha = 0.85;
+      g.strokeStyle = 'rgba(200,170,255,.6)'; g.lineWidth = Math.max(1, s * 0.10); g.lineCap = 'round';
+      for (let i = -2; i <= 2; i++) {
+        g.beginPath(); g.moveTo(i * s * 0.28, s * 0.25);
+        g.quadraticCurveTo(i * s * 0.34, s * 0.9, i * s * 0.28 + Math.sin(p.pulse * 3 + i) * s * 0.18, s * 1.35);
+        g.stroke();
+      }
+      const bg = g.createRadialGradient(0, -s * 0.2, s * 0.1, 0, 0, s * 1.1);
+      bg.addColorStop(0, '#f2e6ff'); bg.addColorStop(0.7, '#c9a6f2'); bg.addColorStop(1, 'rgba(160,110,220,.25)');
+      g.fillStyle = bg;
+      g.beginPath(); g.ellipse(0, 0, s / sq, s * 0.8 * sq, 0, Math.PI, 0);
+      g.quadraticCurveTo(s * 0.5 / sq, s * 0.45, 0, s * 0.4);
+      g.quadraticCurveTo(-s * 0.5 / sq, s * 0.45, -s / sq, 0);
+      g.fill();
+      g.restore(); g.globalAlpha = 1;
+    
+  },
+  plod(g, p, q) {
+      const s = 18 * S;
+      g.save(); g.translate(p.x, p.y); g.scale(p.dir, 1);
+      g.fillStyle = '#6f9e5a';   // flippers
+      const kick = Math.sin(Game.time * 2.2) * s * 0.12;
+      g.beginPath(); g.ellipse(-s * 0.55, s * 0.30 + kick, s * 0.42, s * 0.16, -0.4, 0, TAU); g.fill();
+      g.beginPath(); g.ellipse(s * 0.45, s * 0.30 - kick, s * 0.42, s * 0.16, 0.4, 0, TAU); g.fill();
+      const shg = g.createRadialGradient(-s * 0.1, -s * 0.5, s * 0.1, 0, -s * 0.2, s * 1.2);
+      shg.addColorStop(0, '#8fae4f'); shg.addColorStop(1, '#4a6b2a');
+      g.fillStyle = shg;
+      g.beginPath(); g.ellipse(0, -s * 0.15, s * 0.95, s * 0.60, 0, Math.PI, 0); g.fill();
+      g.strokeStyle = 'rgba(30,50,15,.5)'; g.lineWidth = Math.max(1, s * 0.07);
+      g.beginPath(); g.moveTo(-s * 0.5, -s * 0.35); g.lineTo(s * 0.5, -s * 0.35);
+      g.moveTo(-s * 0.15, -s * 0.62); g.lineTo(-s * 0.15, -s * 0.15);
+      g.moveTo(s * 0.25, -s * 0.58); g.lineTo(s * 0.25, -s * 0.15); g.stroke();
+      g.fillStyle = '#9ec27a';   // head
+      g.beginPath(); g.arc(s * 0.95, -s * 0.10, s * 0.30, 0, TAU); g.fill();
+      g.fillStyle = '#1d2b12';
+      g.beginPath(); g.arc(s * 1.05, -s * 0.18, s * 0.07, 0, TAU); g.fill();
+      g.restore();
+    
+  },
+  kite(g, p, q) {
+      const s = 22 * S, flap = Math.sin(p.glide * 3) * 0.35;
+      g.save(); g.translate(p.x, p.y); g.scale(p.dir, 1);
+      const wg = g.createLinearGradient(0, -s, 0, s * 0.4);
+      wg.addColorStop(0, '#3d5a78'); wg.addColorStop(1, '#16283c');
+      g.fillStyle = wg;
+      g.beginPath();
+      g.moveTo(s * 0.9, 0);
+      g.quadraticCurveTo(0, -s * (0.9 + flap), -s * 1.3, -s * 0.15);   // far wing
+      g.quadraticCurveTo(-s * 0.5, s * 0.15, -s * 1.6, s * 0.25);      // tail root
+      g.quadraticCurveTo(0, s * (0.45 + flap * 0.4), s * 0.9, 0);      // near wing
+      g.fill();
+      g.strokeStyle = '#16283c'; g.lineWidth = Math.max(1, s * 0.08); g.lineCap = 'round';
+      g.beginPath(); g.moveTo(-s * 1.5, s * 0.22); g.lineTo(-s * 2.2, s * 0.05); g.stroke();
+      g.fillStyle = '#e8f2fa';   // belly flash + eye
+      g.beginPath(); g.ellipse(s * 0.25, s * 0.12, s * 0.42, s * 0.14, 0, 0, TAU); g.fill();
+      g.fillStyle = '#0a1420';
+      g.beginPath(); g.arc(s * 0.72, -s * 0.08, s * 0.07, 0, TAU); g.fill();
+      g.restore();
+    
+  },
+  cinder(g, p, q) {
+      const s = 16 * S;
+      g.save(); g.translate(p.x, p.y);
+      if (p.lit > 0.03) {
+        const gr = q.glowR * S;
+        const gg = g.createRadialGradient(s * 1.1 * p.dir, -s * 0.9, 2, s * 1.1 * p.dir, -s * 0.9, gr);
+        gg.addColorStop(0, `rgba(255,220,140,${0.55 * p.lit})`);
+        gg.addColorStop(1, 'rgba(255,220,140,0)');
+        g.fillStyle = gg;
+        g.beginPath(); g.arc(s * 1.1 * p.dir, -s * 0.9, gr, 0, TAU); g.fill();
+      }
+      g.scale(p.dir, 1);
+      g.fillStyle = '#2a2f3d';   // deep-water body
+      g.beginPath(); g.ellipse(0, 0, s, s * 0.55, 0, 0, TAU); g.fill();
+      g.fillStyle = '#1a1e28';   // tail
+      g.beginPath(); g.moveTo(-s * 0.9, 0); g.lineTo(-s * 1.4, -s * 0.4); g.lineTo(-s * 1.4, s * 0.4); g.fill();
+      g.strokeStyle = '#c9a25a'; g.lineWidth = Math.max(1, s * 0.09); g.lineCap = 'round';
+      g.beginPath(); g.moveTo(s * 0.55, -s * 0.45); g.quadraticCurveTo(s * 0.9, -s * 1.1, s * 1.1, -s * 0.9); g.stroke();
+      g.fillStyle = p.lit > 0.03 ? `rgba(255,225,150,${0.4 + 0.6 * p.lit})` : '#6a5a38';
+      g.beginPath(); g.arc(s * 1.1, -s * 0.9, s * 0.18 * (1 + p.lit * 0.4), 0, TAU); g.fill();
+      g.fillStyle = '#dfe8f2';   // oversized lanternfish eye
+      g.beginPath(); g.arc(s * 0.5, -s * 0.08, s * 0.20, 0, TAU); g.fill();
+      g.fillStyle = '#0a0e16';
+      g.beginPath(); g.arc(s * 0.55, -s * 0.08, s * 0.10, 0, TAU); g.fill();
+      g.restore();
+    
+  },
 };
 
 const Pet = {
-  active: null,     // { id, x, y, dir, ...behaviour scratch }
-  fall: 1,          // fall-speed multiplier (Plod) — read by updateFood/updateCoins
+  active: null,     // { id, x, y, dir, pulse, ...bucket scratch }
   wasInvasion: false,
 
-  // The bucket table wins; PET_BEHAVIOURS is the fallback for the pets still on the old
-  // bespoke path. An id in neither table stays inert, exactly as before.
   row(id) { return PET_BEHAVIOR[id] || null; },
+  // Fall-speed multiplier, read by updateFood/updateCoins exactly as it always was. It is
+  // now DERIVED from the amplifier bucket instead of being assigned by a pet, so Plod is
+  // a row like everything else and nothing has to remember to reset it.
+  get fall() { return this.amp('fallSpeed'); },
+
+  loopOn(q)  { if (q.loop && PET_LOOPS[q.loop]) Sfx.startLoop(q.loop, PET_LOOPS[q.loop]); },
+  loopOff(q) { if (q.loop) Sfx.stopLoop(q.loop); },
+
   start(id) {
     this.stop();
-    if (!id || (!PET_BEHAVIOR[id] && !PET_BEHAVIOURS[id])) return;
-    this.active = { id, x: W * 0.5, y: TANK_TOP + TANK_H * 0.5, dir: 1 };
     const row = PET_BEHAVIOR[id];
-    if (row) PET_BUCKETS[row.bucket].init(this.active, row.params);
-    else if (PET_BEHAVIOURS[id].init) PET_BEHAVIOURS[id].init(this.active);
+    if (!id || !row) return;               // unknown id stays inert, exactly as before
+    this.active = { id, x: W * 0.5, y: TANK_TOP + TANK_H * 0.5, dir: 1, pulse: 0 };
+    PET_BUCKETS[row.bucket].init(this.active, row.params);
+    this.loopOn(row.params);
     Sfx.play('petSummon');
   },
   stop() {
-    this.active = null; this.fall = 1; this.wasInvasion = false;
-    Sfx.stopLoop('petTuckScrape'); Sfx.stopLoop('petPlodHum'); Sfx.stopLoop('petCinderCrackle');
+    const row = this.active && PET_BEHAVIOR[this.active.id];
+    if (row) {
+      // A bucket that writes state onto the tank gets to take it back before the pet goes.
+      const b = PET_BUCKETS[row.bucket];
+      if (b.stop) b.stop(this.active, row.params);
+      this.loopOff(row.params);
+    }
+    this.active = null; this.wasInvasion = false;
   },
   is(id) { return !!this.active && this.active.id === id; },
 
   update(dt) {
     if (!this.active) return;
+    // One clock every pet's art can lean on, ticked here so no bucket has to remember it.
+    this.active.pulse += dt;
     // Invasion edges become events here so no alien code has to know about pets.
     const inv = Game.invasion;
     if (inv !== this.wasInvasion) {
@@ -5195,8 +5682,7 @@ const Pet = {
       this.wasInvasion = inv;
     }
     const row = PET_BEHAVIOR[this.active.id];
-    if (row) PET_BUCKETS[row.bucket].update(this.active, row.params, dt);
-    else PET_BEHAVIOURS[this.active.id].update(this.active, dt);
+    PET_BUCKETS[row.bucket].update(this.active, row.params, dt);
   },
   // Passive multiplier read by whichever system the amplifier bucket targets. Returns 1
   // with no pet, a non-amplifier pet, or an amplifier aimed at a different stat — so a
@@ -5206,14 +5692,30 @@ const Pet = {
     if (!row || row.bucket !== 'amplifier' || row.params.stat !== stat) return 1;
     return row.params.mult;
   },
+  // Game events reach the equipped pet's BUCKET, which decides from params whether they
+  // mean anything to it. Routed by bucket, so no caller and no handler names a pet.
   emit(ev, data) {
-    if (!this.active || PET_BEHAVIOR[this.active.id]) return;   // bucket pets poll, not listen
-    const b = PET_BEHAVIOURS[this.active.id];
-    if (b && b.on && b.on[ev]) b.on[ev](this.active, data);
+    const row = this.active && PET_BEHAVIOR[this.active.id];
+    if (!row) return;
+    const on = PET_BUCKETS[row.bucket].on;
+    if (on && on[ev]) on[ev](this.active, row.params, data);
   },
-  // Cinder's gather point while lit — updateFish steers idle fish toward it.
-  glow() {
-    return this.is('cinder') && this.active.lit > 0.5 ? this.active : null;
+  // A herding controller's gather point for THIS fish, or null — updateFish steers to it.
+  // Derived entirely from the row, so a second herding pet needs no change here. The
+  // returned object is the live pet, and `p.force` on it says whether the pull outranks
+  // food and prey (Beacon) or only claims fish with nothing better to do (Cinder).
+  herd(f) {
+    const row = this.active && PET_BEHAVIOR[this.active.id];
+    if (!row || row.bucket !== 'controller' || row.params.effect !== 'herd') return null;
+    if (this.active.lit <= (row.params.litGate || 0.5)) return null;
+    return ctrlMatch(f, row.params) ? this.active : null;
+  },
+  // Alien speed multiplier, read by updateAliens the way updateCoins reads `fall`. Returns
+  // 1 with no pet, a non-slowing pet, or an alien whose rattle has worn off.
+  alienSpeed(a) {
+    const row = this.active && PET_BEHAVIOR[this.active.id];
+    if (!row || row.bucket !== 'controller' || row.params.effect !== 'slow') return 1;
+    return a.slowT > 0 ? (row.params.mult || 1) : 1;
   },
   draw(g) {
     const p = this.active;
@@ -5226,8 +5728,8 @@ const Pet = {
     g.fillStyle = '#ffd35a';
     g.beginPath(); g.ellipse(p.x, p.y + 16 * S, 20 * S, 6 * S, 0, 0, TAU); g.fill();
     g.restore();
-    if (PET_ART[p.id]) PET_ART[p.id](g, p);
-    else PET_BEHAVIOURS[p.id].draw(g, p);
+    const row = PET_BEHAVIOR[p.id];
+    if (PET_ART[p.id]) PET_ART[p.id](g, p, row ? row.params : {});
   },
 };
 
@@ -5235,17 +5737,17 @@ const Pet = {
 // from the console mid-run. Per-run only — it never writes Save.data.pet or .pets.
 window.__pet = {
   equip(id) {
-    if (!PET_BEHAVIOR[id] && !PET_BEHAVIOURS[id]) return `no behaviour for "${id}"`;
-    Pet.start(id);
     const row = PET_BEHAVIOR[id];
-    return `equipped ${id}` + (row ? ` (${row.bucket})` : ' (legacy bespoke)');
+    if (!row) return `no behaviour for "${id}"`;
+    Pet.start(id);
+    return `equipped ${id} (${row.bucket})`;
   },
   unequip() { Pet.stop(); return 'no pet equipped'; },
   list() {
-    return PETS.filter(x => PET_BEHAVIOR[x.id] || PET_BEHAVIOURS[x.id]).map(x => ({
+    return PETS.filter(x => PET_BEHAVIOR[x.id]).map(x => ({
       id: x.id, name: x.name,
-      bucket: PET_BEHAVIOR[x.id] ? PET_BEHAVIOR[x.id].bucket : 'legacy',
-      params: PET_BEHAVIOR[x.id] ? PET_BEHAVIOR[x.id].params : null,
+      bucket: PET_BEHAVIOR[x.id].bucket,
+      params: PET_BEHAVIOR[x.id].params,
       equipped: Pet.is(x.id),
     }));
   },
@@ -5522,7 +6024,8 @@ const RunSave = {
         rest: c.rest, bounced: !!c.bounced, vy: (c.vy || 0) / TANK_H })),
       aliens: Aliens.live.filter(a => a.alive && a.dying <= 0).map(a => ({
         kind: a.kind, nx: nx(a.x), ny: ny(a.y), vx: a.vx / S, vy: a.vy / S,
-        hp: a.hp, eaten: a.eaten, grace: a.grace, eatCd: a.eatCd,
+        // Infinity is not JSON, so a permanent blind travels as -1 and comes back whole.
+        hp: a.hp, eaten: a.eaten, grace: isFinite(a.grace) ? a.grace : -1, eatCd: a.eatCd,
         phase: a.phase, phaseT: a.phaseT })),
       foods: Foods.live.filter(f => f.alive).map(f => ({ nx: nx(f.x), ny: ny(f.y), quality: f.quality })),
     };
@@ -5594,9 +6097,9 @@ const RunSave = {
       a.kind = d.kind; a.x = rx(d.nx); a.y = ry(d.ny);
       a.vx = d.vx * S; a.vy = d.vy * S;
       a.hp = d.hp; a.maxHp = def.hp; a.hpGhost = d.hp;
-      a.eaten = d.eaten; a.grace = d.grace; a.eatCd = d.eatCd;
+      a.eaten = d.eaten; a.grace = d.grace === -1 ? Infinity : d.grace; a.eatCd = d.eatCd;
       a.phase = d.phase; a.phaseT = d.phaseT;
-      a.hurt = 0; a.dying = 0; a.wob = rand(0, TAU);
+      a.hurt = 0; a.dying = 0; a.wob = rand(0, TAU); a.slowT = a.slowMax = 0;
     }
     for (const d of s.foods) {
       const f = Foods.spawn();
@@ -5775,7 +6278,12 @@ function updateFish(dt) {
     }
 
     // --- pick a target ---
-    if (!eatsFood) {
+    // A herding controller's gather point, or null. A FORCED lure outranks food and prey
+    // outright; an ordinary one only gets the fish that end up with no target anyway.
+    const hd = Pet.herd(f);
+    if (hd && hd.force) {
+      f.target = null;
+    } else if (!eatsFood) {
       if (!f.target || !f.target.alive || f.target.dying > 0) f.target = findPrey(f);
     } else if (f.hunger < CFG.HUNGRY_AT) {
       if (!f.target || !f.target.alive) f.target = nearestFood(f.x, f.y);
@@ -5806,9 +6314,8 @@ function updateFish(dt) {
         f.target = null;
       }
     } else {
-      // Cinder's lure: while it burns, fish with nothing better to do gather in the
-      // glow instead of wandering. Feeding and hunting always win over the light.
-      const gl = Pet.glow();
+      // The lure: while it burns, fish gather in the glow instead of wandering.
+      const gl = hd;
       if (gl) {
         const dx = gl.x - f.x, dy = gl.y - f.y, d = Math.hypot(dx, dy) || 1;
         if (d > 60 * S) {
@@ -5966,7 +6473,9 @@ function updateAliens(dt) {
     }
 
     const r = alienR(a);
-    const spd = d.speed * S;
+    // Pet.alienSpeed is the controller's slow hook — 1 unless a rattling pet marked this
+    // alien and the rattle has not worn off. Same shape as Pet.fall on the coin side.
+    const spd = d.speed * S * Pet.alienSpeed(a);
 
     // --- hunt the nearest fish ---
     let prey = null, bd = Infinity;
@@ -6444,6 +6953,84 @@ const Oyster = {
   pearlPos() { return { x: this.x, y: this.y - this.s * 0.30, r: Math.max(14, this.s * 0.34) }; },
 };
 
+
+// ---- shared status overlay -----------------------------------------------------------
+// A controller effect that lands on ANOTHER entity is invisible without this: the ink
+// lands, the alien keeps swimming, and the player concludes the pet did nothing. So this
+// is mechanics, not decoration — it is how a pet earns trust. One pass, driven entirely
+// by flags the entity already carries (a.grace, a.slowT, f.hidden), so it holds no state
+// of its own and every future controller inherits it for free.
+//
+// Readability at 380px is why every size has a hard pixel floor as well as an S multiple:
+// S is about 0.31 on a phone, and r * 0.09 alone would round to a hairline.
+function drawStatus(g) {
+  g.save();
+  g.lineCap = 'round';
+  for (const a of Aliens.live) {
+    if (!a.alive || a.dying > 0) continue;
+    const r = alienR(a);
+    if (alienBlinded(a)) {
+      // an ink veil with the eyes struck out — legible as "this one cannot see you"
+      g.globalAlpha = 0.52 + Math.sin(Game.time * 3) * 0.07;
+      g.fillStyle = '#241c3a';
+      g.beginPath(); g.arc(a.x, a.y - r * 0.12, r * 0.80, 0, TAU); g.fill();
+      g.globalAlpha = 0.95;
+      g.strokeStyle = '#cbb6ff'; g.lineWidth = Math.max(1.6, r * 0.10);
+      const e = r * 0.30;
+      for (const sx of [-1, 1]) {
+        const cx = a.x + sx * r * 0.34, cy = a.y - r * 0.20;
+        g.beginPath();
+        g.moveTo(cx - e * 0.5, cy - e * 0.5); g.lineTo(cx + e * 0.5, cy + e * 0.5);
+        g.moveTo(cx + e * 0.5, cy - e * 0.5); g.lineTo(cx - e * 0.5, cy + e * 0.5);
+        g.stroke();
+      }
+    }
+    if (a.slowT > 0) {
+      // a cold ring that DRAINS: the player can see how long the rattle has left, which
+      // is the difference between "it worked" and "it is still working".
+      const frac = clamp(a.slowT / (a.slowMax || a.slowT), 0, 1);
+      g.globalAlpha = 0.28;
+      g.strokeStyle = '#7fd4ff'; g.lineWidth = Math.max(1.8, r * 0.11);
+      g.beginPath(); g.arc(a.x, a.y, r * 1.16, 0, TAU); g.stroke();
+      g.globalAlpha = 0.95;
+      g.beginPath(); g.arc(a.x, a.y, r * 1.16, -Math.PI / 2, -Math.PI / 2 + TAU * frac); g.stroke();
+      // chevrons dragging behind it, so the slowness reads even in a still frame
+      g.globalAlpha = 0.5; g.lineWidth = Math.max(1.4, r * 0.08);
+      const back = a.vx >= 0 ? -1 : 1, h = r * 0.26;
+      for (let i = 0; i < 3; i++) {
+        const off = r * (1.38 + i * 0.30);
+        g.beginPath();
+        g.moveTo(a.x + back * (off - h * 0.6), a.y - h);
+        g.lineTo(a.x + back * off, a.y);
+        g.lineTo(a.x + back * (off - h * 0.6), a.y + h);
+        g.stroke();
+      }
+    }
+  }
+  // Sheltered fish are not drawn at all, so the SHELTER has to be: a bubble on the pet
+  // holding them, with the count, or the player just sees their school disappear.
+  let hid = 0;
+  for (const f of Fishes.live) if (f.alive && f.hidden) hid++;
+  if (hid && Pet.active) {
+    const p = Pet.active, r = Math.max(17, 27 * S);
+    g.globalAlpha = 0.26 + Math.sin(Game.time * 2.4) * 0.06;
+    g.fillStyle = '#9fe8ff';
+    g.beginPath(); g.arc(p.x, p.y, r, 0, TAU); g.fill();
+    g.globalAlpha = 0.9;
+    g.strokeStyle = '#dff4ff'; g.lineWidth = Math.max(1.5, 2 * S);
+    g.beginPath(); g.arc(p.x, p.y, r, 0, TAU); g.stroke();
+    const bx = p.x + r * 0.74, by = p.y - r * 0.74, br = Math.max(8, 10 * S);
+    g.globalAlpha = 0.9; g.fillStyle = '#0a1b2a';
+    g.beginPath(); g.arc(bx, by, br, 0, TAU); g.fill();
+    g.strokeStyle = '#9fe8ff'; g.lineWidth = Math.max(1.2, 1.6 * S); g.stroke();
+    g.globalAlpha = 1; g.fillStyle = '#dff4ff';
+    g.font = `700 ${Math.max(11, 13 * S)}px system-ui, sans-serif`;
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText(String(hid), bx, by + 0.5);
+  }
+  g.restore();
+}
+
 function updateOyster(dt) {
   if (!Oyster.active) return;
   Oyster.resolve();
@@ -6820,6 +7407,7 @@ function frame(now) {
   Pet.draw(ctx);   // behind the fish: company, not clutter
   for (const f of Fishes.live) if (f.alive && !f.hidden) drawFish(ctx, f);
   for (const a of Aliens.live) if (a.alive) drawAlien(ctx, a);
+  drawStatus(ctx);   // controller effects that landed on a fish or an alien
   for (const c of Coins.live)  if (c.alive) drawCoin(ctx, c);
   drawShots(ctx);
   drawBits(ctx);
@@ -8043,20 +8631,31 @@ function initAudition() {
 
   for (const id in Music.tracks) {
     const def = Music.tracks[id];
+    const v2Idx = TANK_TRACK_ID.indexOf(id); // -1 for menu/map (V2 only covers the 7 tanks)
     const row = document.createElement('div');
     row.className = 'audRow';
     row.innerHTML = `
       <h4>TRACK &middot; ${id} (${def.bpm} bpm, ${def.layers.length} layers)</h4>
       <div class="audBtns">
+        <span class="audLabel" style="color:#8fe9ff">MUSIC_V1</span>
         <button class="play">PLAY</button>
         <button class="stop">STOP</button>
         <button class="render">RENDER WAV (16 bars)</button>
         <span class="audLabel">intensity</span>
         <input type="range" min="0" max="100" value="100">
         <span class="audLabel audStatus">idle</span>
-      </div>`;
+      </div>
+      ${v2Idx >= 0 ? `<div class="audBtns">
+        <span class="audLabel" style="color:#ffd98f">MUSIC_V2</span>
+        <button class="playV2">PLAY</button>
+        <button class="stopV2">STOP</button>
+        <button class="duckV2Test">DUCK TEST (4dB/200ms)</button>
+        <button class="renderV2">RENDER WAV (60s @ 0.5)</button>
+        <span class="audLabel">intensity</span>
+        <input type="range" class="v2Intensity" min="0" max="100" value="100">
+      </div>` : ''}`;
     row.querySelector('.play').addEventListener('click', () => {
-      Snd.unlock(); Music.play(id, { crossfadeMs: 800 });
+      Snd.unlock(); MusicV2.stopLive(); Music.play(id, { crossfadeMs: 800 });
     });
     row.querySelector('.stop').addEventListener('click', () => Music.stop(400));
     row.querySelector('input[type=range]').addEventListener('input', e => {
@@ -8077,6 +8676,35 @@ function initAudition() {
       } catch (e) { el.textContent = 'render failed'; console.error(e); }
       el.disabled = false;
     });
+    if (v2Idx >= 0) {
+      let v2Intensity = 1;
+      row.querySelector('.playV2').addEventListener('click', () => {
+        Music.stop(300); MusicV2.playLive(v2Idx, v2Intensity);
+      });
+      row.querySelector('.stopV2').addEventListener('click', () => MusicV2.stopLive());
+      row.querySelector('.duckV2Test').addEventListener('click', () => {
+        if (MusicV2._liveNodes) MusicV2.duck(MusicV2._liveNodes, Snd.ctx, 4, 200);
+      });
+      row.querySelector('.v2Intensity').addEventListener('input', e => {
+        v2Intensity = e.target.value / 100;
+        if (MusicV2._liveNodes) MusicV2.playLive(v2Idx, v2Intensity); // re-schedule at new intensity
+      });
+      row.querySelector('.renderV2').addEventListener('click', async btn => {
+        const el = btn.target;
+        el.disabled = true; el.textContent = 'rendering...';
+        try {
+          const blob = await MusicV2.renderTrackWav(v2Idx, 0.5, 60);
+          if (!blob) { el.textContent = 'no OfflineAudioContext'; return; }
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = `${id}_v2.wav`;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 4000);
+          el.textContent = 'RENDER WAV (60s @ 0.5)';
+        } catch (e) { el.textContent = 'render failed'; console.error(e); }
+        el.disabled = false;
+      });
+    }
     list.appendChild(row);
   }
 
