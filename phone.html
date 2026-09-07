@@ -1,0 +1,94 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Aqua Frenzy — playtest launcher</title>
+<style>
+  :root{--gold:#ffd35a}
+  *{box-sizing:border-box}
+  body{
+    margin:0;padding:calc(18px + env(safe-area-inset-top)) 16px calc(18px + env(safe-area-inset-bottom));
+    background:linear-gradient(#0b3f6e,#04121f);color:#eaf6ff;
+    font-family:'Trebuchet MS',system-ui,sans-serif;min-height:100vh;
+  }
+  h1{margin:0 0 2px;font-size:26px;color:var(--gold);letter-spacing:1px}
+  .sub{opacity:.72;font-size:13px;margin-bottom:18px}
+  a.play{
+    display:block;text-align:center;text-decoration:none;color:#3a1a00;font-weight:800;
+    font-size:19px;letter-spacing:1px;padding:20px;margin-bottom:11px;border-radius:16px;
+    background:linear-gradient(#ffd980,#f5a623);box-shadow:0 4px 0 #a8620a;
+  }
+  a.play.alt{background:linear-gradient(#7fd4ff,#3a9fd8);color:#04263a;box-shadow:0 4px 0 #1d6795}
+  a.play small{display:block;font-weight:600;font-size:12px;opacity:.75;letter-spacing:0}
+  h2{font-size:14px;margin:22px 0 8px;color:var(--gold);letter-spacing:1px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  td{padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.10);vertical-align:top}
+  td:first-child{opacity:.62;width:44%}
+  button{
+    width:100%;margin-top:12px;padding:14px;border:none;border-radius:12px;
+    background:#1d6795;color:#fff;font-size:15px;font-weight:700;
+  }
+</style>
+
+<h1>AQUA FRENZY</h1>
+<div class="sub">mobile playtest launcher &middot; build <b id="bv">?v=40</b></div>
+
+<a class="play" id="a1" href="#">PLAY<small>clean build</small></a>
+<a class="play alt" id="a2" href="#">PLAY + FPS<small>frame counter and entity counts</small></a>
+<a class="play alt" id="a3" href="#">PLAY + DEBUG<small>live device panel with a COPY button — paste me the dump</small></a>
+<a class="play alt" id="a4" href="#">MUSIC AUDITION<small>listen to every track/stinger, no gameplay</small></a>
+
+<h2>THIS DEVICE</h2>
+<table id="info"></table>
+<button id="copy">Copy device info</button>
+
+<script>
+const BUILD = 41;                      // bump every build, matches the ?v= counter
+document.getElementById('bv').textContent = '?v=' + BUILD;
+// &b= self-busts even if Safari cached this launcher page itself (RoofHorde v32 lesson)
+document.getElementById('a1').href = `aquafrenzy_web_game.html?v=${BUILD}&b=${Date.now()}`;
+document.getElementById('a2').href = `aquafrenzy_web_game.html?v=${BUILD}&fps=1&b=${Date.now()}`;
+document.getElementById('a3').href = `aquafrenzy_web_game.html?v=${BUILD}&debug=1&b=${Date.now()}`;
+document.getElementById('a4').href = `aquafrenzy_web_game.html?v=${BUILD}&audition=1&b=${Date.now()}`;
+
+const rows = [];
+const add = (k, v) => rows.push([k, v]);
+
+add('Screen',        `${screen.width}x${screen.height}`);
+add('Viewport',      `${innerWidth}x${innerHeight}`);
+add('Orientation',   innerWidth > innerHeight ? 'landscape' : 'PORTRAIT — rotate to play');
+add('devicePixelRatio', devicePixelRatio);
+add('Max touch points', navigator.maxTouchPoints);
+add('CPU cores',     navigator.hardwareConcurrency || '?');
+add('Device memory',  (navigator.deviceMemory || '?') + ' GB');
+add('Standalone',    (matchMedia('(display-mode: standalone)').matches || navigator.standalone) ? 'yes (installed)' : 'no (browser)');
+add('Safe area top', getComputedStyle(document.body).paddingTop);
+add('User agent',    navigator.userAgent);
+
+// GPU string, where the browser exposes it.
+try {
+  const gl = document.createElement('canvas').getContext('webgl');
+  const dbg = gl && gl.getExtension('WEBGL_debug_renderer_info');
+  add('GPU', dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : 'hidden');
+} catch (e) { add('GPU', 'unavailable'); }
+
+if (navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
+  navigator.userAgentData.getHighEntropyValues(['model', 'platformVersion'])
+    .then(v => { add('Model', `${v.model || '?'} / ${v.platformVersion || '?'}`); render(); })
+    .catch(() => {});
+}
+if (navigator.getBattery) {
+  navigator.getBattery().then(b => { add('Battery', Math.round(b.level * 100) + '%' + (b.charging ? ' charging' : '')); render(); });
+}
+
+function render() {
+  document.getElementById('info').innerHTML =
+    rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+}
+render();
+
+document.getElementById('copy').addEventListener('click', async () => {
+  const txt = `Aqua Frenzy ?v=${BUILD}\n` + rows.map(([k, v]) => `${k}: ${v}`).join('\n');
+  try { await navigator.clipboard.writeText(txt); document.getElementById('copy').textContent = 'Copied'; }
+  catch (e) { document.getElementById('copy').textContent = 'Copy failed — select the table'; }
+  setTimeout(() => { document.getElementById('copy').textContent = 'Copy device info'; }, 1500);
+});
+</script>
