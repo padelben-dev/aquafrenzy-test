@@ -740,7 +740,7 @@ const SHOW_AUDIT = BUILD_FLAGS.dev && QS.get('audit') === 'art';
 // genuinely fresh profile. Deliberately NOT a migration and NOT a grant — it deletes, and
 // only when a human asks for it on a dev build.
 const WIPE_SAVE = BUILD_FLAGS.dev && QS.get('wipe') === '1';
-const GAME_BUILD = 51;
+const GAME_BUILD = 53;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -2253,7 +2253,7 @@ const PETS = [
   { id:'quill',   name:'Quill the Needlefish',     desc:'Attacks any alien in the tank, roughly as hard as a level 1 laser.' },
   { id:'marigold',name:'Marigold the Nursefish',   desc:'Gives birth to a baby sunfin every 26 seconds. She will not breed during an alien attack.' },
   { id:'fennel',  name:'Fennel the Seahorse',      desc:'Spits a level 2 pellet at nearby hungry fish every 3 seconds — and it never counts against your food limit.' },
-  { id:'dollop',  name:'Dollop the Jellyfish',     desc:'Drifts through the tank collecting coins. Faster than Tuck, and he never hides.' },
+  { id:'dollop',  name:'Dollop the Jellyfish',     desc:'Swims the whole tank \u2014 floor to surface \u2014 collecting coins, and never hides when aliens arrive.' },
   { id:'rattle',  name:'Rattle the Skeleton',      desc:'Drops a $35 gold coin every 6 seconds. He is already dead, so he never needs feeding.' },
   { id:'clatter', name:'Clatter the Fiddler Crab', desc:'Hits aliens hard, but only ones that come near the bottom of the tank.' },
   { id:'lull',    name:'Lull the Siren',           desc:'Sings, and every grown sunfin drops three coins at once.' },
@@ -2264,8 +2264,8 @@ const PETS = [
   { id:'echo',    name:'Echo the Porpoise',        desc:'Opens the laser and egg slots without making you buy a special fish first, and flags any fish that is about to starve.' },
   { id:'nettle',  name:'Nettle the Hermit Crab',   desc:'Snaps at any fish near the floor, pushing them back up where the coins fall slower.' },
   { id:'kite',    name:'Kite the Manta',           desc:'Bounces falling money back up before it reaches the floor.' },
-  { id:'jolt',    name:'Jolt the Eel',             desc:'Charges up, then tap three times to electrocute the tank. Every sunfin dies and becomes a $200 diamond.' },
-  { id:'bruiser', name:'Bruiser the Shark',        desc:'The hardest hitter in the game. He also eats one of your sunfins now and then.' },
+  { id:'jolt',    name:'Jolt the Eel',             desc:'Charges up, then three taps kill every sunfin in the tank at once, each leaving a $200 diamond. You are cashing in your whole school \u2014 and starting over without it.' },
+  { id:'bruiser', name:'Bruiser the Shark',        desc:'Bites any alien in the tank, and bites hard. He also eats one of your sunfins now and then.' },
   { id:'vesper',  name:'Vesper the Angelfish',     desc:'Swims to dead fish and revives them. She cannot bring back anything that was eaten.' },
   { id:'moxie',   name:'Moxie the Tadpole',        desc:'Transforms into any pet you have unlocked, with a 10 second cooldown.' },
   { id:'cinder',  name:'Cinder the Lanternfish',   desc:'Her lure lights up when aliens arrive, and frightened fish gather in her glow instead of scattering.' },
@@ -2276,7 +2276,7 @@ const PETS = [
   { id:'shiver',  name:'Shiver the Icefish',       desc:'Her blood runs clear and cold. Coins that fall past her freeze in place for a moment instead of sinking.' },
   { id:'growler', name:'Growler the Walrus',       desc:'Bellows at every warp-in. Aliens arrive rattled and swim slower for their first ten seconds.' },
   { id:'tinsel',  name:'Tinsel the Snow Crab',     desc:'Polishes everything shiny. Pearls that drop near him are worth half again as much.' },
-  { id:'aurora',  name:'Aurora the Glowsquid',     desc:'Ripples with northern light. Fish fed inside her glow grow up a little faster.' },
+  { id:'aurora',  name:'Aurora the Glowsquid',     desc:'Costs nothing and upgrades no pellet: any fish fed inside her northern light grows up faster.' },
   { id:'sleet',   name:'Sleet the Penguin',        desc:'Dives through the ice hole to peck the first alien of every attack before it takes a bite.' },
   { id:'lumen',   name:'Lumen the Lampeye',        desc:'Wears a star on her brow. Every 30 seconds it falls off, and your skimmers may have it.' },
   { id:'sonar',   name:'Sonar the Barreleye',      desc:'Sees through the dark. Shows you where the next alien will warp in.' },
@@ -2530,6 +2530,11 @@ const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d', { alpha:false });
 let W = 0, H = 0, DPR = 1;
 let BAR_H = 64, TANK_TOP = 64, TANK_H = 0, FLOOR_Y = 0, SAND_TOP = 0;
+// Phase 7C chrome-bar metrics. The sound/quit row is DOM (#hudBtns) and the egg meter and
+// money plate are canvas, so both need the same numbers or the row will not line up.
+// HUD_BTNS_W is measured from the CSS: musicBtn 53 + 8 gap + quitBtn 60. The row is
+// display:none outside play, so it cannot be measured from the DOM at layout time.
+const HUD_BTN_H = 46, HUD_BTNS_W = 121, HUD_GAP = 8;
 let safeL = 0, safeR = 0, safeT = 0, safeB = 0;
 // Phone HUD mode: under 700px the shop leaves the top bar for a bottom tray in the
 // thumb zone, the money plate takes the top centre, and portrait is a supported
@@ -2597,7 +2602,9 @@ function resize() {
     : 0;
   // Phone: no shop up top, so the bar shrinks to a money strip. Desktop keeps the
   // full brass console height.
-  BAR_H    = (PHONE ? clamp(Math.round(H * 0.075), 46, 64)
+  // Phase 7C: the bar now carries the egg meter, money, sound and quit, so its floor
+  // is set by the 46px touch targets it holds (46 + 6 above + 6 below), not by a ratio.
+  BAR_H    = (PHONE ? clamp(Math.round(H * 0.075), 58, 68)
                     : clamp(Math.round(H * 0.145), 64, 132)) + safeT;
   TANK_TOP = BAR_H;
   FLOOR_Y  = PHONE ? H - TRAY_H : H - Math.max(4, safeB);
@@ -2619,13 +2626,15 @@ function resize() {
   Game.playRect = { x: 0, y: TANK_TOP, w: W, h: FLOOR_Y - TANK_TOP };
 
   Shop.layout();
+  // Phase 7C: sound + quit live IN the chrome bar, vertically centred in it, instead of
+  // floating over the top-right of the water. Sized from the CSS constants, not the DOM —
+  // the row is display:none outside play and would measure 0x0.
   const hb = document.getElementById('hudBtns');
-  if (hb) hb.style.top = (BAR_H + 8) + 'px';
-  // The QUIT/mute buttons float over the top-right of the water. An alien parked
-  // under them is un-tappable (the DOM wins), so movement code treats their strip as
-  // out of bounds. Sized from the CSS constants, not the DOM — the row is display:none
-  // outside play and would measure 0x0.
-  Game.hudRect = { left: W - safeR - 8 - 130, top: BAR_H + 8, bottom: BAR_H + 8 + 46 };
+  if (hb) hb.style.top = (safeT + Math.max(2, Math.round((BAR_H - safeT - HUD_BTN_H) / 2))) + 'px';
+  // They no longer overlap the water, so the strip movement code used to treat as a wall
+  // is gone. Null, not a zero rect: every reader guards on it, and a zero rect would
+  // still be a rect to reason about.
+  Game.hudRect = null;
   // Dev fps meter must clear the phone tray or it covers the shop it is profiling.
   const fe = document.getElementById('fps');
   if (fe) fe.style.bottom = `calc(${6 + TRAY_H}px + env(safe-area-inset-bottom))`;
@@ -2984,7 +2993,9 @@ const COIN_STYLE = {
 
 function drawCoin(g, c) {
   const st = COIN_STYLE[c.type], r = coinR(c);
-  g.save(); g.translate(c.x, c.y);
+  // c.jx / c.jy are the settle fan (Phase 7C) and exist ONLY here. Every gameplay reader
+  // -- collection, magnet, Tuck/Dollop pathing -- uses c.x / c.y untouched.
+  g.save(); g.translate(c.x + (c.jx || 0), c.y + (c.jy || 0));
 
   // soft glow so every drop reads against bright water and pale sand alike
   g.globalAlpha = 0.34; g.fillStyle = st.glow;
@@ -4255,16 +4266,26 @@ function drawTank(g, dt) {
 const SLOT_ROLES = ['base', 'quality', 'quantity', 'specialA', 'specialB', 'laser', 'egg'];
 
 const Shop = {
-  slots: [], moneyBox: { x:0, y:0, w:0, h:0 },
+  slots: [], moneyBox: { x:0, y:0, w:0, h:0 }, eggBox: { x:0, y:0, w:0, h:0 },
   // Top of the bottom tray in phone mode; Infinity on desktop so "y >= trayTop"
   // is simply never true there.
   trayTop: Infinity,
   layout() {
     if (PHONE) {
-      // --- money plate: top centre, big enough to read at arm's length ---
+      // --- chrome bar row (Phase 7C): [egg pips] [$ money] [sound] [quit] ---
+      // Everything the player needs to READ or PRESS lives here; nothing is drawn over
+      // the water. The money plate used to be W*0.5 (190px of a 380px screen) for a
+      // value that never exceeds seven characters — it now takes what is left after the
+      // egg meter and the button pair, floored so the digits never shrink.
       const mh = BAR_H - safeT - 8;
-      const moneyW = clamp(W * 0.5, 150, 260);
-      this.moneyBox = { x: (W - moneyW) / 2, y: safeT + 4, w: moneyW, h: mh };
+      const rowY = safeT + 4;
+      const barL = 6 + safeL, barR = HUD_GAP + safeR;
+      const eggW = 62;
+      // Ceiling 140, not 170: the plate holds at most $-plus-six-digits, and the leftover
+      // reads better as breathing room before the buttons than as an oversized plate.
+      const moneyW = clamp(W - barL - eggW - HUD_GAP - HUD_BTNS_W - HUD_GAP - barR, 92, 140);
+      this.eggBox   = { x: barL, y: rowY, w: eggW, h: mh };
+      this.moneyBox = { x: barL + eggW + HUD_GAP, y: rowY, w: moneyW, h: mh };
       // --- shop tray: the thumb zone. One row of 7 where columns stay >= 56px;
       // otherwise two rows, 4 + 3, with the egg slot ending the bottom row so the
       // meter reads left-to-right into it. Each slot carries its own hit band
@@ -4301,10 +4322,16 @@ const Shop = {
     this.trayTop = Infinity;
     const padL = 6 + safeL, padR = 6 + safeR;
     const moneyW = clamp(W * 0.19, 118, 300);
+    // Phase 7C: the egg meter used to hang below the bar, over the water. It now sits in
+    // the bar immediately left of the money plate, and the shop row gives up that width.
+    const eggW = 78;
     const n = 7, gap = 5;
     // Height-led so a slot stays a near-square socket instead of a stretched letterbox.
     let sh = BAR_H - safeT - 10, sw = sh * 1.12;
-    const avail = W - padL - padR - moneyW - 10;
+    // The sound/quit pair is right-anchored DOM sitting in this same bar, so the canvas
+    // items must reserve its width or the money plate paints underneath it.
+    const rightRes = HUD_BTNS_W + HUD_GAP;
+    const avail = W - padL - padR - moneyW - eggW - rightRes - 10;
     const need = n * sw + gap * (n - 1);
     if (need > avail) {
       const k = avail / need; sw *= k; sh *= k;          // too narrow: shrink, keep aspect
@@ -4320,7 +4347,8 @@ const Shop = {
     const x0 = padL + Math.max(0, (avail - rowW) / 2);
     this.slots.length = 0;
     for (let i = 0; i < n; i++) this.slots.push({ i, x: x0 + i * (sw + gap), y, w: sw, h: sh });
-    this.moneyBox = { x: W - padR - moneyW, y, w: moneyW, h: sh };
+    this.moneyBox = { x: W - padR - rightRes - moneyW, y, w: moneyW, h: sh };
+    this.eggBox   = { x: W - padR - rightRes - moneyW - eggW, y, w: eggW, h: sh };
   },
 
   // What a species costs and what it says on the tin.
@@ -4697,19 +4725,18 @@ const Shop = {
 
     // --- egg meter: three slots in the right-edge HUD stack ---
     // Replaces the old EGGS text in the floor corner: the goal lives under the money a
-    // thumb is already watching, and the newest piece pops when it lands. It sits one
-    // row BELOW the music/quit buttons (top BAR_H+8, ~50px tall) — hanging it directly
-    // off the money plate buried it under them.
+    // Phase 7C: the egg meter lives IN the chrome bar, first in the row, instead of
+    // hanging below it over the water. Its box comes from Shop.layout so the bar's four
+    // items are laid out once and cannot drift apart.
     {
-      const er = Math.max(8, m.h * 0.21);
-      // Phone: the meter's right edge used to clear the mute/QUIT strip by only ~11px
-      // with no margin — a slightly larger money plate or a wider mute icon would close
-      // that gap. Narrowed on phone only; desktop's meter hangs clear of anything.
-      const gap = er * (PHONE ? 2.3 : 2.5);
-      // Phone: the money plate is centred, so the meter hangs centred right under it
-      // (the music/quit buttons are right-anchored and clear of the middle).
-      const cy = PHONE ? BAR_H + 8 + er * 1.35 : BAR_H + 62 + er * 1.35;
-      const cx0 = PHONE ? W / 2 - gap : m.x + m.w - er - 6 - gap * 2;
+      const eb = this.eggBox;
+      // Three pips plus their gaps have to fit eb.w; size the pip from the box rather
+      // than from the money plate's height, so a narrow phone shrinks the eggs instead
+      // of overflowing into the money.
+      const er = Math.max(6, Math.min(eb.h * 0.30, eb.w / 6.2));
+      const gap = er * 2.05;
+      const cy = eb.y + eb.h / 2;
+      const cx0 = eb.x + eb.w / 2 - gap;
       g.fillStyle = 'rgba(4,18,31,.62)';
       roundRect(g, cx0 - er * 1.5, cy - er * 1.35, gap * 2 + er * 3, er * 2.7, er);
       g.fill();
@@ -4979,13 +5006,26 @@ function spawnFood(x, y, free = false, quality = null) {
   return true;
 }
 
+// Phase 7C: a small, once-only DRAW offset given to a coin when it lands, so a pile of
+// drops fans out instead of stacking into a single disc. Purely cosmetic -- see the note
+// at the landing site. Assigned once (never per-frame) so a resting coin does not shimmer.
+function coinSettleJitter(c, r) {
+  // +-1.4r spreads a pile properly while staying far inside the 60px collect radius
+  // (Input.mag / MAG_R), so what the player sees and what they can tap never diverge
+  // enough to cause a miss. That radius is the real ceiling on this offset.
+  c.jx = rand(-r * 1.4, r * 1.4);
+  // Shallow, and only ever DOWNWARD toward the sand line, so the fan reads as depth
+  // rather than as coins floating above the floor.
+  c.jy = rand(0, r * 0.5);
+}
+
 function spawnCoin(x, y, type) {
   const c = Coins.spawn();
   c.x = x; c.y = y; c.vy = 0; c.dwell = CFG.COIN_DWELL;
   const st = COIN_STYLE[type];
   c.type = type; c.scale = st.scale; c.value = st.value;
   c.rise = !!st.rise;                 // beetles float UP and are lost at the surface
-  c.spin = rand(0, TAU); c.rest = false;
+  c.spin = rand(0, TAU); c.rest = false; c.jx = 0; c.jy = 0;
   c.age = 0; c.bounced = false;       // Dollop's claim gate / Kite's one-bounce flag
   c.lucky = false; c.shimmer = false; c.trailT = 0;   // Phase 6C luck flags
   Pet.emit('coinDrop', c);
@@ -6388,6 +6428,7 @@ const Game = {
 
   win() {
     this.state = 'over';
+    clearWaveUI();          // the INCOMING strip must not outlive the run (Phase 7C)
     RunSave.clear();
     showHud(false);
     // The tank track keeps playing under the results screen — a win isn't a reason
@@ -6478,6 +6519,7 @@ const Game = {
   // because progress was never mutated in the first place.
   lose(reason) {
     this.state = 'over';
+    clearWaveUI();          // same contract as win() (Phase 7C)
     RunSave.clear();
     showHud(false);
     Music._stopTension(); Music.stopAllSpecials();
@@ -6642,6 +6684,9 @@ const RunSave = {
       c.lucky = !!d.lucky; c.shimmer = !!d.shimmer;
       c.x = rx(d.nx); c.y = ry(d.ny); c.age = d.age; c.dwell = d.dwell;
       c.rest = d.rest; c.bounced = d.bounced; c.vy = (d.vy || 0) * TANK_H;
+      // A restored pile should fan like a live one; the offset is cosmetic so it does
+      // not need to survive the snapshot, only to exist.
+      if (c.rest) coinSettleJitter(c, coinR(c));
       c.spin = rand(0, TAU);
     }
     for (const d of s.aliens) {
@@ -6728,6 +6773,7 @@ function updateCoins(dt) {
     const r = coinR(c);
     if (!c.rest && c.y >= SAND_TOP - r * 0.2) {
       c.y = SAND_TOP - r * 0.2; c.rest = true; c.vy = 0;
+      coinSettleJitter(c, r);
       Sfx.play('coinFloorTick');
       Pet.emit('coinLand', c);   // Kite un-rests it here for the one bounce
     }
@@ -6893,7 +6939,10 @@ function updateFish(dt) {
 
     if (f.x < r)     { f.x = r;     f.vx = Math.abs(f.vx); }
     if (f.x > W - r) { f.x = W - r; f.vx = -Math.abs(f.vx); }
-    const top = ((Game.playRect && Game.playRect.y) || TANK_TOP) + r * 0.8, bot = SAND_TOP - r * 0.3;
+    // Phase 7C: inset by the sprite's own half-size at BOTH ends. r is the half-size,
+    // so a fish at `top` has its crown exactly on the tank's top edge and one at `bot`
+    // has its belly exactly on the sand line -- neither overlaps the frame.
+    const top = ((Game.playRect && Game.playRect.y) || TANK_TOP) + r, bot = SAND_TOP - r;
     if (f.y < top)   { f.y = top;   f.vy = Math.abs(f.vy); }
     if (f.y > bot)   { f.y = bot;   f.vy = -Math.abs(f.vy); }
 
@@ -7071,12 +7120,13 @@ function updateAliens(dt) {
 
     if (a.x < r)     { a.x = r;     a.vx = Math.abs(a.vx); }
     if (a.x > W - r) { a.x = W - r; a.vx = -Math.abs(a.vx); }
-    if (d.floor) a.y = SAND_TOP - r * 0.5;
+    // Floor-dwellers sit ON the sand, not half inside it.
+    if (d.floor) a.y = SAND_TOP - r;
     else {
       // Clamp into Game.playRect; anything above it (a mid-run viewport change can
       // strand one) is pushed down next frame rather than left floating in the HUD.
       const pr = Game.playRect;
-      const top = (pr ? pr.y : TANK_TOP) + r * 0.7, bot = SAND_TOP - r * 0.3;
+      const top = (pr ? pr.y : TANK_TOP) + r, bot = SAND_TOP - r;
       if (a.y < top) { a.y = top; a.vy = Math.abs(a.vy); }
       if (a.y > bot) { a.y = bot; a.vy = -Math.abs(a.vy); }
       // The QUIT/mute buttons are DOM and swallow taps: an alien hiding under them is
@@ -7282,6 +7332,28 @@ function updateAttacks(dt) {
   }
 }
 
+// The INCOMING strip's geometry, in ONE place. drawWarning paints from it and the art
+// audit measures from it, so the harness can never drift from the thing it audits.
+// Phase 7C: a slim strip capped at 44px on a phone, pinned just under the chrome bar,
+// and clamped so it is never wider than the tank nor off either edge.
+function warnBannerMetrics() {
+  const bh = PHONE ? clamp(H * 0.055, 34, 44) : clamp(H * 0.09, 40, 60);
+  const by = TANK_TOP + 6;
+  const bx = clamp(PHONE ? 8 : W * 0.16, 6, Math.max(6, W - 12));
+  const bw = clamp(PHONE ? W - 16 : W * 0.66, 80, W - bx * 2);
+  return { bh: bh, by: by, bx: bx, bw: bw, stamp: Math.round(bh * 0.92) };
+}
+
+// Every exit from `play` must take the pending-wave UI with it. drawWarning keys off
+// these fields alone -- not Game.state -- so leaving any of them set leaves the strip
+// painting over whatever screen replaced the game.
+function clearWaveUI() {
+  Game.warnT = 0;
+  Game.warnOut = 0;
+  Game.pendingAttack = null;
+  Game.lastAttack = null;
+}
+
 // Silhouette stamps for the warning banner: the pedia's own alien portrait drawer,
 // flattened to a dark shape via source-in. Cached per kind+size — the drawers are too
 // expensive to run per frame inside a banner.
@@ -7291,17 +7363,51 @@ function alienSil(kind, size) {
   const key = kind + '@' + size;
   let cv = silCache.get(key);
   if (!cv) {
+    const d = ALIENS[kind];
+    // 1. the shape, flattened to a solid white mask we can re-tint twice.
+    const mk = document.createElement('canvas');
+    mk.width = mk.height = size;
+    const mg = mk.getContext('2d');
+    mg.translate(size / 2, size / 2);
+    // maxHp 0 = portrait: no health bar (see drawAlien)
+    drawAlien(mg, { kind, x:0, y:0, hp:0, maxHp:0, hpGhost:0, dying:0, hurt:0,
+                    wob:1.3, phase:0, rOverride: size * 0.24 });
+    mg.setTransform(1, 0, 0, 1, 0, 0);
+    mg.globalCompositeOperation = 'source-in';
+    mg.fillStyle = '#ffffff';
+    mg.fillRect(0, 0, size, size);
+
     cv = document.createElement('canvas');
     cv.width = cv.height = size;
     const g2 = cv.getContext('2d');
-    g2.translate(size / 2, size / 2);
-    // maxHp 0 = portrait: no health bar (see drawAlien)
-    drawAlien(g2, { kind, x:0, y:0, hp:0, maxHp:0, hpGhost:0, dying:0, hurt:0,
-                    wob:1.3, phase:0, rOverride: size * 0.24 });
-    g2.setTransform(1, 0, 0, 1, 0, 0);
+
+    // 2. RIM LIGHT: the same mask grown a few px, filled with THIS alien's own colour.
+    // The old stamp flattened everything to #2a0008, which is near-black on a dark red
+    // banner (1.51:1) and — worse — threw away d.col, the only field that differs between
+    // kinds, so six of the seven aliens reduced to an identical blob. The rim makes the
+    // stamp readable AND gives each kind its colour back. The OUTLINE is still shared:
+    // separating those needs per-kind geometry in drawAlien, which is a bigger change.
+    const grow = Math.max(3, size * 0.10), k = (size + grow * 2) / size;
+    g2.save();
+    g2.translate(size / 2, size / 2); g2.scale(k, k); g2.translate(-size / 2, -size / 2);
+    g2.drawImage(mk, 0, 0);
+    g2.restore();
     g2.globalCompositeOperation = 'source-in';
-    g2.fillStyle = '#2a0008';
+    g2.fillStyle = d.col;
     g2.fillRect(0, 0, size, size);
+
+    // 3. the body over the rim: dark enough to read as a silhouette, lifted off pure
+    // black so it does not vanish into the banner.
+    const bd = document.createElement('canvas');
+    bd.width = bd.height = size;
+    const bg = bd.getContext('2d');
+    bg.drawImage(mk, 0, 0);
+    bg.globalCompositeOperation = 'source-in';
+    bg.fillStyle = '#1a0d18';
+    bg.fillRect(0, 0, size, size);
+    g2.globalCompositeOperation = 'source-over';
+    g2.drawImage(bd, 0, 0);
+
     silCache.set(key, cv);
   }
   return cv;
@@ -7414,12 +7520,11 @@ function drawWarning(g) {
   const wave = active ? Game.pendingAttack : Game.lastAttack;
   if (!wave) return;
 
-  const bh = clamp(H * 0.10, 42, 74);
-  // Phone: the top of the tank is already a stack (egg meter centred, music/quit on
-  // the right), so the banner goes full-width BELOW that stack. Desktop: tucked under
-  // the bar, narrowed from 0.72W so it clears the music/quit buttons.
-  const by = PHONE ? BAR_H + 68 : TANK_TOP + 8;
-  const bx = PHONE ? 8 : W * 0.16, bw = PHONE ? W - 16 : W * 0.66;
+  // Phase 7C: the top of the tank is no longer a stack -- egg meter, money, sound and
+  // quit all moved into the chrome bar -- so the strip sits where it belongs, right
+  // under the bar. Geometry from warnBannerMetrics so the audit cannot disagree.
+  const bm = warnBannerMetrics();
+  const bh = bm.bh, by = bm.by, bx = bm.bx, bw = bm.bw;
 
   // Slide: eases in over the first ~0.3s of the countdown, back out over warnOut.
   const inP  = active ? clamp((CFG.WARN_TIME - Game.warnT) / 0.3, 0, 1) : 1;
@@ -7430,8 +7535,10 @@ function drawWarning(g) {
   const glowP = 0.55 + Math.sin(Game.time * 9) * 0.35;
   g.save();
   g.translate(0, -slide * (by + bh + 12));
-  g.globalAlpha = glowP * 0.9;
-  g.fillStyle = 'rgba(120,0,0,.75)';
+  // Backdrop <= 60% so gameplay stays visible behind the strip. glowP peaks at 0.90 and
+  // 0.66 * 0.90 = 0.594, under the ceiling at its brightest pulse.
+  g.globalAlpha = glowP;
+  g.fillStyle = 'rgba(120,0,0,.66)';
   roundRect(g, bx, by, bw, bh, 10); g.fill();
   g.strokeStyle = '#ff5a5a'; g.lineWidth = 3; g.stroke();
   g.globalAlpha = 1;
@@ -7964,6 +8071,11 @@ function frame(now) {
     ctx.translate(rand(-m, m), rand(-m, m));
   }
   drawTank(ctx, dt);
+  // Phase 7C — HARD CLIP. Everything that lives in the water is clipped to the water.
+  // drawTank clips its own scene and restores, so before this every entity could paint
+  // over the chrome bar and through the sand line.
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, TANK_TOP, W, FLOOR_Y - TANK_TOP); ctx.clip();
   for (const f of Foods.live)  if (f.alive) drawFood(ctx, f);
   Pet.draw(ctx);   // behind the fish: company, not clutter
   for (const f of Fishes.live) if (f.alive && !f.hidden) drawFish(ctx, f);
@@ -7972,6 +8084,9 @@ function frame(now) {
   for (const c of Coins.live)  if (c.alive) drawCoin(ctx, c);
   drawShots(ctx);
   drawBits(ctx);
+  ctx.restore();
+  // Outside the clip on purpose: a combo pop is a transient toast, and a toast sliced in
+  // half by a boundary reads as a bug rather than as a limit.
   drawCombo(ctx);
   ctx.restore();
 
@@ -11946,7 +12061,7 @@ function auditSheetFish() {
 //  * Six of the seven banner silhouettes are byte-identical. drawAlien draws ONE body for
 //    every kind (six tentacles at fixed angles, one ellipse, one eye, five teeth); the only
 //    per-kind variation is d.col and d.r. alienSil destroys both -- source-in flattens
-//    colour to #2a0008, and rOverride forces one radius -- so mite, ravager, lurker,
+//    colour, and rOverride forces one radius -- so mite, ravager, lurker,
 //    streak, sentry and splitjaw all reduce to the same 992-ink-pixel stamp. Bloat differs
 //    only because laserProof adds a ring.
 
@@ -11954,8 +12069,9 @@ function auditSheetFish() {
 // stamp is ss = bh*0.92. Recomputed here from the live H so the sheet shows the size the
 // player actually gets on THIS viewport, not a guess.
 function auditAlienStampSize() {
-  const bh = clamp(H * 0.10, 42, 74);
-  return Math.round(bh * 0.92);
+  // Read the real banner geometry rather than re-deriving it -- a harness holding its own
+  // copy of the formula stops auditing the product the moment the product changes.
+  return warnBannerMetrics().stamp;
 }
 
 // The banner backdrop, composited the way drawWarning does it: rgba(120,0,0,.75) laid
@@ -11987,7 +12103,7 @@ function auditSheetAlien() {
 
   // Fingerprint every silhouette first, so the sheet can label identical ones as identical
   // rather than leaving a reader to eyeball 7 near-black shapes.
-  const fp = {};
+  const fp = {}, rimFp = {};
   const scratch = document.createElement('canvas');
   scratch.width = scratch.height = ss;
   const sg = scratch.getContext('2d', { willReadFrequently: true });
@@ -12005,7 +12121,20 @@ function auditSheetAlien() {
         }
       }
     }
+    // SHAPE fingerprint (alpha only). Phase 7C added a per-kind rim colour, so two kinds
+    // can share this fingerprint and still be told apart on screen -- which is why the
+    // colour is fingerprinted separately below rather than folded into this one.
     fp[k] = ink + ':' + x0 + ',' + y0 + ',' + (x1 - x0) + ',' + (y1 - y0);
+    {
+      const mid = ((((y0 + y1) >> 1) * ss) + ((x0 + x1) >> 1)) * 4;
+      let rimK = null, lumK = -1;
+      for (let i = 0; i < ss * ss; i++) {
+        if (d[i * 4 + 3] < 200) continue;
+        const L = auditRelLum(d[i * 4], d[i * 4 + 1], d[i * 4 + 2]);
+        if (L > lumK) { lumK = L; rimK = d[i * 4] + ',' + d[i * 4 + 1] + ',' + d[i * 4 + 2]; }
+      }
+      rimFp[k] = rimK;
+    }
   }
   // Group kinds by identical fingerprint.
   const groups = {};
@@ -12013,21 +12142,55 @@ function auditSheetAlien() {
   for (const sig of Object.keys(groups)) {
     const g2 = groups[sig];
     if (g2.length > 1) {
-      ArtAudit.warn('alien', g2.join('+'), 'SILHOUETTE_IDENTICAL',
-        g2.length + ' aliens share a pixel-identical banner silhouette (' +
-        g2.join(', ') + ') - the INCOMING banner cannot distinguish them',
-        { ink: sig.split(':')[0], kinds: g2 });
+      // Shape is shared. Whether that MATTERS now depends on the rim: if every kind in
+      // the group carries a different rim colour the badge is still readable, and this is
+      // a note about art debt rather than a defect the player can see.
+      const rims = new Set(g2.map(x => rimFp[x]));
+      const distinguishable = rims.size === g2.length;
+      ArtAudit.row('alien', g2.join('+'),
+        g2.length + ' share one outline; ' + rims.size + ' distinct rim colours',
+        distinguishable);
+      if (!distinguishable) {
+        ArtAudit.warn('alien', g2.join('+'), 'SILHOUETTE_IDENTICAL',
+          g2.length + ' aliens share a pixel-identical banner silhouette AND only ' +
+          rims.size + ' distinct rim colour(s) (' + g2.join(', ') +
+          ') - the INCOMING banner cannot distinguish them',
+          { ink: sig.split(':')[0], kinds: g2, rims: [...rims] });
+      }
     }
   }
 
-  // Contrast of the stamp fill against the banner at its most legible moment.
+  // Contrast against the banner at its most legible moment. MEASURED off the real stamp
+  // rather than assuming a fill colour -- Phase 7C changed both the body colour and added
+  // a rim, and a hardcoded value here would have gone on reporting the old build forever.
+  // The rim is what makes the shape readable, so it is the pixel that must clear 3:1.
   const peak = auditBannerFill(0.90);
   const pm = peak.match(/\d+/g).map(Number);
-  const cr = auditContrast([42, 0, 8], pm);
+  let bestRim = null, bestLum = -1, bodyPix = null;
+  {
+    const probe = alienSil(kinds[0], ss);
+    const pg2 = document.createElement('canvas');
+    pg2.width = pg2.height = ss;
+    const pc = pg2.getContext('2d', { willReadFrequently: true });
+    pc.drawImage(probe, 0, 0);
+    const pd = pc.getImageData(0, 0, ss, ss).data;
+    for (let i = 0; i < ss * ss; i++) {
+      if (pd[i * 4 + 3] < 200) continue;
+      const rgb = [pd[i * 4], pd[i * 4 + 1], pd[i * 4 + 2]];
+      const L = auditRelLum(rgb[0], rgb[1], rgb[2]);
+      if (L > bestLum) { bestLum = L; bestRim = rgb; }
+      if (!bodyPix) bodyPix = rgb;
+    }
+  }
+  const cr = bestRim ? auditContrast(bestRim, pm) : 0;
   if (cr < 3) {
     ArtAudit.warn('alien', 'banner', 'SILHOUETTE_CONTRAST',
-      'stamp #2a0008 on the banner is ' + cr.toFixed(2) + ':1 at PEAK glow (WCAG floor 3:1)',
-      { ratio: +cr.toFixed(2), backdrop: peak });
+      'brightest stamp pixel rgb(' + (bestRim || []).join(',') + ') on the banner is ' +
+      cr.toFixed(2) + ':1 at PEAK glow (WCAG floor 3:1)',
+      { ratio: +cr.toFixed(2), backdrop: peak, rim: bestRim });
+  } else {
+    ArtAudit.row('alien', 'banner contrast',
+      'rim rgb(' + (bestRim || []).join(',') + ') vs banner = ' + cr.toFixed(2) + ':1', true);
   }
 
   // Columns: the frames drawAlien can genuinely produce, then the two silhouette views.
