@@ -740,7 +740,7 @@ const SHOW_AUDIT = BUILD_FLAGS.dev && QS.get('audit') === 'art';
 // genuinely fresh profile. Deliberately NOT a migration and NOT a grant — it deletes, and
 // only when a human asks for it on a dev build.
 const WIPE_SAVE = BUILD_FLAGS.dev && QS.get('wipe') === '1';
-const GAME_BUILD = 53;
+const GAME_BUILD = 54;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -2741,33 +2741,176 @@ const FISH_LOOK = {
                  sclera:'#E85838', pupil:'#181818', teeth:true },
 };
 
-// Hungry is a hue/saturation shift of the SAME sprite, not a grey wash:
-// gold #FEC32A -> #D2CC2B (sickly olive), crimson #FD0058 -> #BB5387 (dusty mauve).
-function starveShift(hex, t) {
-  if (t <= 0) return hex;
-  const n = parseInt(hex.slice(1), 16);
-  let R = (n >> 16) & 255, G = (n >> 8) & 255, B = n & 255;
-  // pull toward a desaturated olive of the same value
-  const v = R * 0.30 + G * 0.59 + B * 0.11;
-  R = Math.round(lerp(R, v * 0.92 + 18, t));
-  G = Math.round(lerp(G, v * 0.98 + 14, t));
-  B = Math.round(lerp(B, v * 0.55 + 22, t));
-  return `rgb(${clamp(R,0,255)|0},${clamp(G,0,255)|0},${clamp(B,0,255)|0})`;
+
+// ============ FISH COLOUR — SINGLE AUTHORITY (Phase 7D) ============
+// fishTint() is the ONLY function allowed to decide what colour a fish is. Every fill and
+// stroke on a fish body goes through the paint() helper built from its result. Nothing
+// else may recolour a fish.
+//
+// WHY THIS EXISTS: before this, two independent systems wrote the same channel. The
+// hunger tint pushed the body toward a desaturated OLIVE, and the shimmer/lucky overlay
+// painted a full-body `hsla(hue,100%,72%,.62)` wash whose hue cycled on Game.time —
+// so roughly one sixth of every shimmer cycle passed through the olive/green band and a
+// lucky fish became indistinguishable from a starving one. That is the reported
+// "olive head with no explanation". A washed, desaturated body was the same overlay a
+// half-cycle later. Two meanings, one channel, no way for the player to tell them apart.
+//
+// THE STATE TABLE — one unambiguous channel per state:
+//
+//   healthy adult / juvenile : base palette. SIZE is the only difference between them.
+//   just fed                 : brightness pulse only, < 300ms, NO hue shift.
+//   hungry                   : slight DESATURATION only. No hue, no ring.
+//   starving / sick          : desaturate + green-grey wash + slow blink.
+//                              THE ONLY STATE THAT SHIFTS BODY HUE.
+//   dying                    : sink (rotation, existing) + alpha fade. No hue.
+//   carrying coin            : coin icon only. NO body change whatsoever.
+//   shimmer / lucky          : additive sparkle + GOLD RIM. Never a body hue change,
+//                              so it can never be mistaken for sick.
+//   pet-buffed               : RIM COLOUR only.
+//   being eaten              : flash white, ~2 frames.
+//
+// The returned tint is a set of MODIFIERS on the species palette, not an absolute colour:
+// { hue (deg to shift), sat (multiplier), light (multiplier), alpha, rim (css|null),
+//   flash (0..1 white) }. Keeping them relative means a species keeps its identity in
+//   every state — a starving Dreadfin is still recognisably a Dreadfin.
+// The Starfin is a palette SWAP, not a tint: a different fish wearing the same body.
+// It lives out here with the other palettes so drawFish holds no body-colour literals.
+const FISH_LOOK_STAR = { body:'#FFE98A', shade:'#E6CC5A', belly:'#E8A21A' };
+// The starving ring's two urgency colours. Chrome, not body tint, but still colour data.
+const FISH_RING_DESPERATE = '#ff3b3b', FISH_RING_STARVING = '#ff8c3b';
+const FISH_SICK_HUE = 68;        // degrees toward green-grey; the sick channel
+const FISH_FED_PULSE = 0.28;     // seconds — the "just fed" brightness pulse
+const FISH_EAT_FLASH = 0.05;     // seconds — roughly two frames of white
+const FISH_SHIMMER_RIM = '#ffe27a';
+
+function fishTint(f) {
+  const feeds = f.kind === 'sunfin' || f.kind === 'brood';
+  const tint = { hue: 0, sat: 1, light: 1, alpha: 1, rim: null, flash: 0 };
+
+  // HUNGRY — desaturation only. Deliberately no hue: hue belongs to sick alone.
+  if (feeds && f.hunger < CFG.HUNGRY_AT) {
+    // Mapped across the HUNGRY BAND (HUNGRY_AT -> STARVING_AT), not from HUNGRY_AT down to
+    // zero. The latter only reached 39% of its range before starving took over, so a
+    // hungry fish was 6% desaturated -- measured 7 units of mean colour from healthy,
+    // which is not a signal. Reading the two existing thresholds; changing neither.
+    const h = clamp((CFG.HUNGRY_AT - f.hunger) / (CFG.HUNGRY_AT - CFG.STARVING_AT), 0, 1);
+    tint.sat = lerp(1, 0.62, h);
+  }
+
+  // STARVING / SICK — the one state that owns body hue, plus a slow blink so it reads
+  // in motion as well as in a still frame.
+  if (feeds && f.hunger < CFG.STARVING_AT) {
+    const k = clamp(1 - f.hunger / CFG.STARVING_AT, 0, 1);
+    tint.hue = FISH_SICK_HUE * k;
+    tint.sat = lerp(tint.sat, 0.26, k);
+    tint.light = lerp(1, 0.84, k) * (1 - 0.14 * k * (0.5 + 0.5 * Math.sin(Game.time * 2.2)));
+  }
+
+  // JUST FED — a short brightness pulse, no hue. fedT is set at the feed site and decays;
+  // it does not touch hunger, timings or thresholds.
+  if (f.fedT > 0) tint.light *= 1 + 0.22 * clamp(f.fedT / FISH_FED_PULSE, 0, 1);
+
+  // DYING — alpha only (the sink rotation lives in drawFish's transform).
+  if (f.dying > 0) tint.alpha = clamp(f.dying * 1.6, 0, 1);
+
+  // SHIMMER / LUCKY — a rim, never the body. This is the whole point of the phase.
+  if (f.shimmer && f.dying <= 0) tint.rim = FISH_SHIMMER_RIM;
+
+  // PET-BUFFED — rim colour only. Set by a pet controller; null when no pet touches it.
+  if (f.buffRim) tint.rim = f.buffRim;
+
+  // BEING EATEN — two frames of white.
+  if (f.eatFlash > 0) tint.flash = clamp(f.eatFlash / FISH_EAT_FLASH, 0, 1);
+
+  return tint;
 }
+
+// Apply a tint to one palette colour. Hex in, css out. Hue/sat/light are relative so the
+// species palette survives every state.
+function applyFishTint(hex, tint) {
+  let R, G, B;
+  if (hex.charAt(0) === '#') {
+    const v = parseInt(hex.slice(1), 16);
+    R = (v >> 16) & 255; G = (v >> 8) & 255; B = v & 255;
+  } else { return hex; }   // already a css string: nothing to tint
+  // rgb -> hsl
+  const r1 = R / 255, g1 = G / 255, b1 = B / 255;
+  const mx = Math.max(r1, g1, b1), mn = Math.min(r1, g1, b1);
+  let h = 0, sl = 0; const l = (mx + mn) / 2;
+  if (mx !== mn) {
+    const dd = mx - mn;
+    sl = l > 0.5 ? dd / (2 - mx - mn) : dd / (mx + mn);
+    if (mx === r1) h = (g1 - b1) / dd + (g1 < b1 ? 6 : 0);
+    else if (mx === g1) h = (b1 - r1) / dd + 2;
+    else h = (r1 - g1) / dd + 4;
+    h *= 60;
+  }
+  h = (h + tint.hue) % 360;
+  sl = clamp(sl * tint.sat, 0, 1);
+  const L = clamp(l * tint.light, 0, 0.92);   // only the eaten flash may reach white
+  if (tint.flash > 0) {
+    // White flash rides on top of everything, so an eaten fish reads instantly.
+    return 'hsl(' + h.toFixed(1) + ',' + (sl * (1 - tint.flash) * 100).toFixed(1) + '%,' +
+           ((L + (1 - L) * tint.flash) * 100).toFixed(1) + '%)';
+  }
+  return 'hsl(' + h.toFixed(1) + ',' + (sl * 100).toFixed(1) + '%,' + (L * 100).toFixed(1) + '%)';
+}
+
+// Boot assertion: nothing but the palette + this allowlist may appear as a colour literal
+// inside drawFish. If someone adds a second recolour path, this fires at boot rather than
+// shipping a fish with an unexplained colour. The allowlist is CHROME — outline, eye,
+// teeth, badges — never body tint.
+const FISH_CHROME_COLOURS = [
+  '#0A0605',   // OUT, the outline
+  '#ffffff',   // teeth / eye highlight
+  '#3F444A',   // grinder lure stalk
+  '#F2F6D0',   // teeth
+  '#C00020',   // mouth
+  '#9B9A97',   // pupil crescent
+  '#FFF6C0',   // star badge fill
+  '#B08A10',   // star badge stroke
+  '#FCFC00',   // regent crown
+  '#ffe27a',   // FISH_SHIMMER_RIM
+];
+function assertFishColourAuthority() {
+  const src = drawFish.toString();
+  const found = src.match(/#[0-9a-fA-F]{6}|hsla?\(|rgba?\(/g) || [];
+  const bad = [];
+  for (const lit of found) {
+    if (lit.charAt(0) === '#') {
+      if (FISH_CHROME_COLOURS.indexOf(lit) < 0) bad.push(lit);
+    } else {
+      // A raw hsl()/rgb() literal in drawFish means someone recoloured outside the
+      // authority. applyFishTint builds its strings, and it lives OUTSIDE drawFish.
+      bad.push(lit);
+    }
+  }
+  return bad;
+}
+
+// Reused scratch list for the depth-sorted draw pass (Phase 7D) -- module level so the
+// per-frame sort allocates nothing.
+const _depth = [];
 
 function drawFish(g, f) {
   const r = f.rOverride || fishR(f);
   const wag = Math.sin(f.wag) * 0.38;
   const feeds = f.kind === 'sunfin' || f.kind === 'brood';
   const L = FISH_LOOK[f.kind] || FISH_LOOK.sunfin;
-  const t = feeds ? clamp(1 - f.hunger / CFG.HUNGRY_AT, 0, 1) * 0.85 : 0;
-
-  const cBody  = f.star ? '#FFE98A' : starveShift(L.body,  t);
-  const cShade = f.star ? '#E6CC5A' : starveShift(L.shade, t);
-  const cBelly = f.star ? '#E8A21A' : starveShift(L.belly, t);
-  const cBLo   = starveShift(L.bellyLo, t);
-  const cFin   = starveShift(L.fin,   t);
-  const cFinLo = starveShift(L.finLo, t);
+  // Phase 7D: ONE authority. Starfin is a palette SWAP (a different fish), then the
+  // same tint applies on top — so a starving starfin still reads as starving.
+  const tint  = fishTint(f);
+  const paint = hex => applyFishTint(hex, tint);
+  const base  = f.star
+    ? { body:FISH_LOOK_STAR.body, shade:FISH_LOOK_STAR.shade, belly:FISH_LOOK_STAR.belly,
+        bellyLo:L.bellyLo, fin:L.fin, finLo:L.finLo }
+    : L;
+  const cBody  = paint(base.body);
+  const cShade = paint(base.shade);
+  const cBelly = paint(base.belly);
+  const cBLo   = paint(base.bellyLo);
+  const cFin   = paint(base.fin);
+  const cFinLo = paint(base.finLo);
   const OUT = '#0A0605';
   const lw  = Math.max(1, r * 0.030);      // ~1px at sprite scale — deliberately thin
 
@@ -2786,7 +2929,9 @@ function drawFish(g, f) {
   g.save();
   g.translate(f.x, f.y);
   g.scale(f.dir, 1);
-  if (f.dying > 0) { g.rotate(lerp(0, Math.PI, 1 - f.dying)); g.globalAlpha = clamp(f.dying * 1.6, 0, 1); }
+  // The sink rotation stays here (it is geometry); the fade comes from the tint.
+  if (f.dying > 0) { g.rotate(lerp(0, Math.PI, 1 - f.dying)); }
+  g.globalAlpha = tint.alpha;
   if (f.grow > 0)  { const s = 1 + Math.sin(f.grow * Math.PI) * 0.26; g.scale(s, s); }
 
   g.lineJoin = 'round';
@@ -2949,29 +3094,45 @@ function drawFish(g, f) {
     g.restore();
   }
 
-  // Phase 6C: shimmer fish — a slow-cycling iridescent wash clipped to the body,
-  // plus a thin bright rim. Same species, same behaviour; only the paint changes.
-  if (f.shimmer && f.dying <= 0) {
-    const hue = (Game.time * 55 + f.tint * 5) % 360;
+  // Phase 7D: the RIM is the whole signal now. The old full-body iridescent wash is
+  // gone — it wrote the same channel as the sick tint, and a shimmer fish spent part of
+  // every hue cycle looking exactly like a starving one. A rim cannot be confused with a
+  // body colour, so lucky and sick are now unmistakable at a glance.
+  if (tint.rim) {
     g.save();
-    bodyPath(); g.clip();
-    const ig = g.createLinearGradient(-r, -r * 0.8, r, r * 0.8);
-    ig.addColorStop(0,   `hsla(${hue},100%,72%,.62)`);
-    ig.addColorStop(0.5, `hsla(${(hue + 120) % 360},100%,78%,.50)`);
-    ig.addColorStop(1,   `hsla(${(hue + 240) % 360},100%,72%,.62)`);
-    g.fillStyle = ig; g.fillRect(-r, -r, r * 2, r * 2);
-    g.restore();
-    g.strokeStyle = `hsla(${(hue + 60) % 360},100%,85%,.9)`; g.lineWidth = Math.max(1.2, r * 0.05);
+    // Additive so it reads as LIGHT on the fish rather than paint applied to it.
+    g.globalCompositeOperation = 'lighter';
+    g.strokeStyle = tint.rim;
+    g.lineWidth = Math.max(1.6, r * 0.075);
+    g.globalAlpha = tint.alpha * (0.85 + 0.15 * Math.sin(Game.time * 4 + f.tint));
     bodyPath(); g.stroke();
+    g.restore();
+    // Two travelling specks on the rim: motion the eye catches without a hue change.
+    if (f.shimmer) {
+      g.save();
+      g.globalCompositeOperation = 'lighter';
+      g.fillStyle = '#ffffff';
+      for (let i = 0; i < 2; i++) {
+        const a = Game.time * 1.7 + f.tint + i * Math.PI;
+        g.globalAlpha = tint.alpha * (0.35 + 0.35 * Math.sin(a * 2));
+        g.beginPath();
+        g.arc(Math.cos(a) * r * 0.72, Math.sin(a) * r * 0.62, Math.max(1.2, r * 0.055), 0, TAU);
+        g.fill();
+      }
+      g.restore();
+    }
   }
   g.restore();
 
-  // --- hunger ring: touch players cannot read a subtle hue shift mid-panic ---
-  if (feeds && f.dying <= 0 && f.hunger < CFG.HUNGRY_AT) {
-    const p = 1 - clamp(f.hunger / CFG.HUNGRY_AT, 0, 1);
-    g.globalAlpha = 0.28 + Math.sin(Game.time * 8) * 0.26 * p;
-    g.strokeStyle = f.hunger < CFG.DESPERATE_AT ? '#ff3b3b'
-                  : f.hunger < CFG.STARVING_AT  ? '#ff8c3b' : '#ffd35a';
+  // Phase 7D: this ring is the only ellipse the game draws AROUND a fish, and it used to
+  // appear for merely-hungry as well as starving — a pale halo on a third of the school
+  // at once, which is what made a busy tank read as soup. It is now exclusive to the one
+  // state that is genuinely urgent, matching the state table: hungry is desaturation
+  // ALONE, starving gets the ring.
+  if (feeds && f.dying <= 0 && f.hunger < CFG.STARVING_AT) {
+    const p = 1 - clamp(f.hunger / CFG.STARVING_AT, 0, 1);
+    g.globalAlpha = 0.30 + Math.sin(Game.time * 8) * 0.24 * p;
+    g.strokeStyle = f.hunger < CFG.DESPERATE_AT ? FISH_RING_DESPERATE : FISH_RING_STARVING;
     g.lineWidth = 2.5;
     g.beginPath(); g.arc(f.x, f.y, r * 1.35, 0, TAU); g.stroke();
     g.globalAlpha = 1;
@@ -4557,7 +4718,10 @@ const Shop = {
 
     for (const s of this.slots) {
       const d = this.def(s.i);
-      const locked = d && d.locked;
+      // `missing` = this level has no such slot at all. Presented IDENTICALLY to a gated
+      // slot, because to the player both mean exactly the same thing: not available.
+      const missing = !d;
+      const locked = missing || !!d.locked;
       const afford = d && !locked && d.cost != null && Game.money >= d.cost;
       const pressed = Input.pressedSlot === s.i;
 
@@ -4591,17 +4755,10 @@ const Shop = {
       const cx = s.w / 2, cy = lensH * 0.50;
       const lx = s.w * 0.40, ly = lensH * 0.40;
 
-      if (!d) {
-        // --- closed brass dome (slot does not exist this level) ---
-        const dg = g.createLinearGradient(0, cy - ly, 0, cy + ly);
-        dg.addColorStop(0, '#e6cf9a'); dg.addColorStop(0.5, '#c9a45e'); dg.addColorStop(1, '#96712c');
-        g.fillStyle = dg;
-        g.beginPath(); g.ellipse(cx, cy, lx, ly, 0, 0, TAU); g.fill();
-        g.globalAlpha = 0.5; g.fillStyle = '#fff8dc';
-        g.beginPath(); g.ellipse(cx - lx * 0.18, cy - ly * 0.34, lx * 0.66, ly * 0.34, -0.15, 0, TAU); g.fill();
-        g.globalAlpha = 1;
-      } else {
-        // --- purple glass lens ---
+      // --- glass lens: ONE lens in every state, greyed when unavailable. A missing slot
+      // used to get a brass dome instead, which read as a different kind of object rather
+      // than as "unavailable", and left its price plate blank.
+      {
         const pg = g.createRadialGradient(cx - lx * 0.30, cy - ly * 0.40, lx * 0.10, cx, cy, lx * 1.15);
         pg.addColorStop(0, locked ? '#5a5a68' : '#8e63d8');
         pg.addColorStop(0.55, locked ? '#3f3f4a' : '#5a34ac');
@@ -4613,9 +4770,17 @@ const Shop = {
         g.beginPath(); g.ellipse(cx, cy, lx, ly, 0, 0, TAU); g.clip();
         g.translate(cx, cy);
         const icon = Math.min(s.w, s.h) * 0.30;
-        if (locked) g.globalAlpha = 0.30;
-        else if (!afford && d.cost != null) g.globalAlpha = 0.5;
-        this.drawIcon(g, d, icon);
+        if (missing) {
+          // A padlock, so an unavailable slot SAYS unavailable instead of looking empty.
+          g.globalAlpha = 0.45;
+          g.font = Math.round(icon * 1.1) + 'px serif';
+          g.textAlign = 'center'; g.textBaseline = 'middle';
+          g.fillText('\uD83D\uDD12', 0, 0);
+        } else {
+          if (locked) g.globalAlpha = 0.30;
+          else if (!afford && d.cost != null) g.globalAlpha = 0.5;
+          this.drawIcon(g, d, icon);
+        }
         g.globalAlpha = 1;
         g.restore();
 
@@ -4631,14 +4796,15 @@ const Shop = {
       const py0 = lensH + s.h * 0.02;
       roundRect(g, s.w * 0.06, py0, s.w * 0.88, plateH, plateH * 0.5);
       const vg = g.createLinearGradient(0, py0, 0, py0 + plateH);
-      vg.addColorStop(0, d ? '#6a45c0' : '#8f712c'); vg.addColorStop(1, d ? '#331d70' : '#6b501c');
+      vg.addColorStop(0, '#6a45c0'); vg.addColorStop(1, '#331d70');
       g.fillStyle = vg; g.fill();
       g.strokeStyle = '#c9a45e'; g.lineWidth = 1.5; g.stroke();
       g.globalAlpha = 0.35; g.fillStyle = '#fff';
       roundRect(g, s.w * 0.10, py0 + plateH * 0.14, s.w * 0.44, plateH * 0.24, plateH * 0.12); g.fill();
       g.globalAlpha = 1;
 
-      if (d) {
+      {
+        // Always labelled: a plate with no text at all was the blank-button bug.
         let fs = Math.round(plateH * 0.74);
         g.font = `700 ${fs}px "Consolas","Courier New",monospace`;
         g.textAlign = 'center'; g.textBaseline = 'middle';
@@ -4660,7 +4826,7 @@ const Shop = {
         g.shadowBlur = 0;
 
         // egg progress pips
-        if (d.kind === 'egg') {
+        if (d && d.kind === 'egg') {
           for (let p = 0; p < 3; p++) {
             g.beginPath();
             g.arc(s.w / 2 + (p - 1) * s.w * 0.17, lensH * 0.14, Math.max(2, s.h * 0.042), 0, TAU);
@@ -4966,6 +5132,9 @@ function spawnSunfin(x, y, stage, banked = 0) {
   f.wag = rand(0, TAU); f.tint = rand(20, 50);
   f.grow = 0; f.dying = 0; f.target = null; f.hidden = false; f.star = false;
   f.shimmer = false; f.sparkT = rand(0, 2); f.eaten = false;
+  // Phase 7D visual-only state channels. None of these touch hunger, thresholds or any
+  // CFG number -- they exist purely so fishTint has one unambiguous input per state.
+  f.fedT = 0; f.eatFlash = 0; f.buffRim = null;
   return f;
 }
 
@@ -4987,6 +5156,9 @@ function spawnSpecial(kind, x, y) {
   // spawnSunfin, for the same reason.
   f.grow = 0; f.dying = 0; f.target = null; f.hidden = false; f.star = false;
   f.shimmer = false; f.sparkT = rand(0, 2); f.eaten = false;
+  // Phase 7D visual-only state channels. None of these touch hunger, thresholds or any
+  // CFG number -- they exist purely so fishTint has one unambiguous input per state.
+  f.fedT = 0; f.eatFlash = 0; f.buffRim = null;
   return f;
 }
 
@@ -6910,6 +7082,7 @@ function updateFish(dt) {
           // Hungrier fish get more back: restoration scales with how empty the meter is.
           const frac = 1 - clamp(f.hunger / CFG.HUNGER_MAX, 0, 1);
           f.hunger = Math.min(CFG.HUNGER_MAX, f.hunger + lerp(lo, hi, frac));
+          f.fedT = FISH_FED_PULSE;   // Phase 7D: brightness pulse only, no hue, no timing change
           f.target.alive = false;
           puff(f.x, f.y, '#ffe6b0', 5, 50);
           Sfx.play('fishEat', { size: clamp(fishR(f) / 70, 0, 1) });
@@ -6932,6 +7105,37 @@ function updateFish(dt) {
       } else {
         f.vx = approach(f.vx, Math.sign(f.vx || 1) * spd, 0.02, dt);
         f.vy = approach(f.vy, Math.sin(Game.time * 0.7 + f.tint) * spd * 0.30, 0.03, dt);
+      }
+    }
+
+    // Phase 7D: the two visual-only timers decay here. Neither is read by anything
+    // except fishTint.
+    if (f.fedT > 0)     f.fedT     = Math.max(0, f.fedT - dt);
+    if (f.eatFlash > 0) f.eatFlash = Math.max(0, f.eatFlash - dt);
+
+    // SOFT SEPARATION (readability, Phase 7D). A gentle push apart when two fish overlap,
+    // so a school reads as individuals instead of one blob. Deliberately weak and capped:
+    // it nudges velocity, never position, so nothing can teleport, and it is far below the
+    // steering that drives feeding — a hungry fish still beelines for its pellet. No
+    // hunger, growth, spawn or economy value is touched.
+    if (f.alive && f.dying <= 0 && !f.hidden) {
+      let sx = 0, sy = 0, near = 0;
+      for (const o of Fishes.live) {
+        if (o === f || !o.alive || o.dying > 0 || o.hidden) continue;
+        const dx = f.x - o.x, dy = f.y - o.y;
+        const d2 = dx * dx + dy * dy;
+        const want = (r + (o.rOverride || fishR(o))) * 0.82;
+        if (d2 > 0.01 && d2 < want * want) {
+          const d = Math.sqrt(d2);
+          sx += (dx / d) * (1 - d / want);
+          sy += (dy / d) * (1 - d / want);
+          near++;
+        }
+      }
+      if (near) {
+        const push = 26 * S;
+        f.vx += clamp(sx / near, -1, 1) * push * dt;
+        f.vy += clamp(sy / near, -1, 1) * push * dt * 0.7;
       }
     }
 
@@ -6994,6 +7198,7 @@ function eatPrey(f, target) {
   const d = FISH[f.kind];
   if (target.kind) {                 // prey is a fish
     target.dying = 1; target.eaten = true;   // eaten, so Vesper cannot bring it back
+    target.eatFlash = FISH_EAT_FLASH;        // Phase 7D: ~2 frames of white
     puff(target.x, target.y, '#ff8080', 12, 100);
   } else {                           // prey is a falling collectable
     target.alive = false;
@@ -7100,6 +7305,7 @@ function updateAliens(dt) {
       if (!d.floor) a.vy = approach(a.vy, (dy / dd) * spd, 0.05, dt);
       if (dd < r + fishR(prey) * 0.7) {
         prey.dying = 1; prey.eaten = true;   // eaten, so Vesper cannot bring it back
+        prey.eatFlash = FISH_EAT_FLASH;      // Phase 7D: ~2 frames of white
         Pet.emit('fishEaten', prey);
         if (Game.stat) Game.stat.lost++;
         a.eaten++;
@@ -8078,8 +8284,14 @@ function frame(now) {
   ctx.beginPath(); ctx.rect(0, TANK_TOP, W, FLOOR_Y - TANK_TOP); ctx.clip();
   for (const f of Foods.live)  if (f.alive) drawFood(ctx, f);
   Pet.draw(ctx);   // behind the fish: company, not clutter
-  for (const f of Fishes.live) if (f.alive && !f.hidden) drawFish(ctx, f);
-  for (const a of Aliens.live) if (a.alive) drawAlien(ctx, a);
+  // Phase 7D: depth-sort by y so a fish in front of another OVERLAPS it rather than
+  // interleaving arbitrarily by pool order. The scratch array is module-level and reused,
+  // so this allocates nothing per frame.
+  _depth.length = 0;
+  for (const f of Fishes.live) if (f.alive && !f.hidden) _depth.push(f);
+  for (const a of Aliens.live) if (a.alive) _depth.push(a);
+  _depth.sort((p, q) => p.y - q.y);
+  for (const e of _depth) (e.kind in ALIENS ? drawAlien : drawFish)(ctx, e);
   drawStatus(ctx);   // controller effects that landed on a fish or an alien
   for (const c of Coins.live)  if (c.alive) drawCoin(ctx, c);
   drawShots(ctx);
@@ -11567,6 +11779,20 @@ function checkSaveIntegrity() {
 }
 
 // Runs both checks and publishes them. Called from the boot sequence.
+// Phase 7D: report any colour literal that appeared inside drawFish outside the approved
+// chrome allowlist -- i.e. a second recolour path sneaking back in.
+function runFishColourAudit() {
+  const bad = assertFishColourAuthority();
+  if (bad.length) {
+    console.warn('[fish-colour] FAIL - drawFish contains colour literals outside the ' +
+                 'chrome allowlist, meaning something recolours a fish outside fishTint():', bad);
+  } else {
+    console.log('[fish-colour] PASS - fishTint() is the only body-colour authority');
+  }
+  window.__fishColourAudit = { pass: bad.length === 0, offenders: bad };
+  return bad;
+}
+
 function runPetAudit() {
   const problems = assertPetIndex();
   const save = checkSaveIntegrity();
@@ -11900,17 +12126,20 @@ function initArtAudit() {
 
 // The state table. `f` is merged over the portrait default; `na` marks a state the game
 // does not model, with the reason shown in the cell.
+// One column per row of the Phase 7D state table, with hunger values that straddle the
+// REAL thresholds (HUNGRY_AT 14, STARVING_AT 8.5) so "hungry" and "starving" are the
+// states the game actually distinguishes, not two arbitrary numbers.
 const AUDIT_FISH_STATES = [
-  { key: 'fed',      lbl: 'fed',            f: { hunger: 31 } },
-  { key: 'hungry',   lbl: 'hungry',         f: { hunger: 13.5 } },
-  { key: 'starving', lbl: 'starving',       f: { hunger: 2.5 } },
+  { key: 'healthy',  lbl: 'healthy',        f: { hunger: 31 } },
+  { key: 'fed',      lbl: 'just fed',       f: { hunger: 24, fedT: FISH_FED_PULSE } },
+  { key: 'hungry',   lbl: 'hungry',         f: { hunger: 11 } },
+  { key: 'starving', lbl: 'starving/sick',  f: { hunger: 2.5 } },
   { key: 'dying',    lbl: 'dying .55',      f: { dying: 0.55 } },
-  { key: 'shimmer',  lbl: 'shimmer',        f: { shimmer: true } },
-  { key: 'grow',     lbl: 'grow-pop',       f: { grow: 0.5 } },
+  { key: 'coin',     lbl: 'carrying coin',  f: {}, composite: 'coin' },
+  { key: 'shimmer',  lbl: 'shimmer/lucky',  f: { shimmer: true } },
+  { key: 'buff',     lbl: 'pet-buffed',     f: { buffRim: '#8fe8ff' } },
+  { key: 'eaten',    lbl: 'being eaten',    f: { eatFlash: FISH_EAT_FLASH } },
   { key: 'flip',     lbl: 'facing left',    f: { dir: -1 } },
-  { key: 'coin',     lbl: 'drops a coin',   f: {}, composite: 'coin' },
-  { key: 'buff',     lbl: 'pet-buffed',     na: 'no per-fish buff art exists' },
-  { key: 'eaten',    lbl: 'being eaten',    na: 'no eaten field or pose' },
 ];
 
 // Every species/stage combination the game can put on screen.
@@ -11953,16 +12182,11 @@ function auditFishCellR(v, box) {
 function auditSheetFish() {
   const variants = auditFishVariants();
 
-  // The approved-tint check. drawFish derives a body colour three ways and no other way:
-  //   star -> a fixed gold, bypassing starveShift entirely
-  //   feeds (sunfin/brood) -> starveShift(FISH_LOOK[kind].body, t)
-  //   everything else -> FISH_LOOK[kind].body verbatim
-  // So a tint can only go off-table if a species is MISSING from FISH_LOOK and silently
-  // takes the `|| FISH_LOOK.sunfin` fallback at line 2737 -- which would paint, say, a
-  // Dreadfin in Sunfin gold and look like art, not like a bug. That is what this catches.
-  // The shimmer wash is deliberately NOT checked: it is an hsla cycling on Game.time,
-  // pinned to one phase here, and it is an overlay on top of the body rather than the
-  // body tint itself.
+  // Phase 7D: body colour now has exactly ONE author, fishTint(), and the assertion that
+  // nothing else recolours a fish runs at boot (runFishColourAudit). What remains worth
+  // checking here is the palette itself: a species missing from FISH_LOOK silently takes
+  // the `|| FISH_LOOK.sunfin` fallback and renders as the wrong fish, which looks like
+  // art rather than like a bug.
   for (const k of Object.keys(FISH)) {
     if (!FISH_LOOK[k]) {
       ArtAudit.warn('fish', k, 'TINT_OFF_TABLE',
@@ -11973,12 +12197,23 @@ function auditSheetFish() {
     ArtAudit.warn('fish', 'sunfin', 'TINT_OFF_TABLE', 'FISH_LOOK.sunfin missing - the fallback itself is broken');
   }
 
+  // The single-authority assertion, reported on the sheet that exists to prove it.
+  const offenders = (typeof assertFishColourAuthority === 'function')
+    ? assertFishColourAuthority() : [];
+  if (offenders.length) {
+    ArtAudit.warn('fish', 'drawFish', 'COLOUR_AUTHORITY',
+      'drawFish contains colour literals outside the chrome allowlist - something ' +
+      'recolours a fish outside fishTint(): ' + offenders.join(', '), { offenders: offenders });
+  } else {
+    ArtAudit.row('fish', 'colour authority', 'fishTint() is the only body-colour author', true);
+  }
+
   const items = [];
   for (const v of variants) for (const st of AUDIT_FISH_STATES) items.push({ v: v, st: st });
 
   return auditSheet('fish', 'FISH SHEET - ' + variants.length + ' species/stages x ' +
       AUDIT_FISH_STATES.length + ' states',
-    'sizes are TRUE relative radii (fishR without S) - wag pinned 0.6, Game.time 0 - 3 briefed states do not exist in the game',
+    'one column per row of the 7D state table - sizes are TRUE relative radii, wag pinned 0.6, Game.time 0',
     items,
     function (g, it, cw, ch) {
       const v = it.v, st = it.st;
@@ -12010,6 +12245,8 @@ function auditSheetFish() {
       const f = Object.assign({
         x: 0, y: 0, dir: 1, kind: 'sunfin', stage: 2, wag: 0.6,
         hunger: CFG.HUNGER_MAX, grow: 0, dying: 0, star: false, shimmer: false,
+        // Phase 7D visual state channels; fishTint reads these and nothing else does.
+        fedT: 0, eatFlash: 0, buffRim: null,
         // tint seeds the shimmer wash hue ((Game.time*55 + f.tint*5) % 360). The
         // sim randomises it per fish; pinned here so the column is reproducible.
         tint: 30,
@@ -12695,6 +12932,7 @@ if (typeof Capacitor !== 'undefined' && Capacitor.isNativePlatform && Capacitor.
 // a bad index or a foreign save is reported once at boot rather than discovered by a
 // player receiving the wrong pet.
 runPetAudit();
+runFishColourAudit();
 
 resize();
 if (SHOW_ICON) {
