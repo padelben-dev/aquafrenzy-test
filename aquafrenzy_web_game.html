@@ -754,7 +754,7 @@ let SHOT_FROZEN = false;
 // is tuned by ear on a real device instead of by reading numbers here. Gated exactly like
 // ?icon=1 / ?audit=art / ?debug=1 -- dead in any build with BUILD_FLAGS.dev=false.
 const SHOW_AUDIOTEST = BUILD_FLAGS.dev && QS.get('audio') === 'test';
-const GAME_BUILD = 56;
+const GAME_BUILD = 60;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -830,6 +830,20 @@ const SND_TONE_SHELF_DB = -4;     // take the edge off that peak
 // into one fatiguing tone.
 const SFX_DETUNE_CENTS = 15;
 
+// ---- Phase 7F board: the proposed "underwater" bus ----
+// Auditionable from ?audio=test and wired into nothing else -- Snd.chainMode never leaves
+// 'dry' unless the board moves it. Amendment 1 of the approved direction: a 3-tap feedback
+// delay, NOT a convolver. Cheaper on the phone, and the convolver only gets promoted behind
+// a flag after this one has been measured on the device.
+const SND_UW_LP_HZ    = 2600;                  // the water itself: everything above this dulls
+const SND_UW_SHELF_DB = -6;                    // and what survives loses its edge
+const SND_UW_WET      = 0.28;                  // how much of the delayed signal comes back
+const SND_UW_TAPS     = [0.087, 0.143, 0.211]; // three delays in series -> taps at 87/230/441ms
+const SND_UW_FB       = 0.34;                  // feedback around the whole tap chain
+const SND_UW_FB_LP_HZ = 1400;                  // each repeat darker than the last
+// The output as it stood BEFORE build 56, kept so the board's A/B has an honest "before".
+const SND_RAW_MASTER_GAIN = 0.26;
+
 const Snd = {
   // Bus layout (Phase 9): master -> musicBus / sfxBus / uiBus, each its own gain so
   // the whole category can be balanced (or eventually slider-controlled, Phase 15)
@@ -896,6 +910,100 @@ const Snd = {
     this.sfxBus.gain.value = 0.68 * a.sfx;
     this.uiBus.gain.value = 0.70 * a.sfx;
     this.musicBus.gain.value = a.music;
+  },
+
+  // ---- Phase 7F board: the whole output chain as an A/B switch ----
+  // Three positions, and NOTHING but ?audio=test ever moves off 'dry', which is the graph
+  // init() already built. The board exists to be a before/after reference on real hardware,
+  // and "before" has to mean the chain as it WAS -- so RAW restores the pre-build-56 output
+  // exactly: master back at 0.26, no tone shaping, no limiter, and (read in Sfx.play) no
+  // systematic ducking and no per-play detune. WET puts the proposed underwater bus in front
+  // of the dry chain. No cue's own parameters differ between the three: this switches the
+  // output, never the synthesis.
+  chainMode: 'dry',
+  uwLp: null, uwShelf: null, uwDry: null, uwWet: null, uwOut: null,
+  uwTaps: null, uwFbLp: null, uwFb: null,
+  ensureWet() {
+    if (this.uwLp || !this.ctx) return;
+    const c = this.ctx;
+    this.uwLp = c.createBiquadFilter();
+    this.uwLp.type = 'lowpass'; this.uwLp.frequency.value = SND_UW_LP_HZ; this.uwLp.Q.value = 0.707;
+    this.uwShelf = c.createBiquadFilter();
+    this.uwShelf.type = 'highshelf';
+    this.uwShelf.frequency.value = SND_TONE_SHELF_HZ;
+    this.uwShelf.gain.value = SND_UW_SHELF_DB;
+    this.uwDry = c.createGain(); this.uwDry.gain.value = 1;
+    this.uwWet = c.createGain(); this.uwWet.gain.value = SND_UW_WET;
+    this.uwOut = c.createGain();
+    // Three delays in series with one damped feedback path from the last back to the first.
+    // Taps land at 87 / 230 / 441ms and every pass loses more top end -- that darkening is
+    // the actual "under water" cue, and it costs three DelayNodes and a biquad, created once.
+    this.uwTaps = [];
+    for (let i = 0; i < SND_UW_TAPS.length; i++) {
+      const d = c.createDelay(1.0);
+      d.delayTime.value = SND_UW_TAPS[i];
+      this.uwTaps.push(d);
+    }
+    this.uwFbLp = c.createBiquadFilter();
+    this.uwFbLp.type = 'lowpass'; this.uwFbLp.frequency.value = SND_UW_FB_LP_HZ;
+    this.uwFb = c.createGain(); this.uwFb.gain.value = SND_UW_FB;
+  },
+  setChainMode(mode) {
+    if (!this.ctx) this.init();
+    if (!this.ctx) return this.chainMode;
+    const m = (mode === 'raw' || mode === 'wet') ? mode : 'dry';
+    if (m === 'wet') this.ensureWet();
+    // Tear every edge down before rebuilding one path, so a mode can never be reached by
+    // ADDING an edge to the previous mode's graph -- which would leave two paths to the
+    // speaker and make the A/B a lie. disconnect() with no outgoing edge is legal, but it
+    // is guarded anyway: some engines are stricter than the spec.
+    const off = (nd) => { if (nd) { try { nd.disconnect(); } catch (e) {} } };
+    off(this.master); off(this.toneLp); off(this.toneShelf); off(this.limiter);
+    off(this.uwLp); off(this.uwShelf); off(this.uwDry); off(this.uwWet); off(this.uwOut);
+    off(this.uwFbLp); off(this.uwFb);
+    if (this.uwTaps) for (let i = 0; i < this.uwTaps.length; i++) off(this.uwTaps[i]);
+    if (m === 'raw') {
+      this.master.gain.value = SND_RAW_MASTER_GAIN;
+      this.master.connect(this.ctx.destination);
+    } else {
+      this.master.gain.value = SND_MASTER_GAIN;
+      if (m === 'wet') {
+        this.master.connect(this.uwLp);
+        this.uwLp.connect(this.uwShelf);
+        this.uwShelf.connect(this.uwDry);
+        this.uwDry.connect(this.uwOut);
+        this.uwShelf.connect(this.uwTaps[0]);
+        for (let i = 0; i < this.uwTaps.length; i++) {
+          this.uwTaps[i].connect(this.uwWet);
+          if (i + 1 < this.uwTaps.length) this.uwTaps[i].connect(this.uwTaps[i + 1]);
+        }
+        this.uwWet.connect(this.uwOut);
+        this.uwTaps[this.uwTaps.length - 1].connect(this.uwFbLp);
+        this.uwFbLp.connect(this.uwFb);
+        this.uwFb.connect(this.uwTaps[0]);
+        this.uwOut.connect(this.toneLp);
+      } else {
+        this.master.connect(this.toneLp);
+      }
+      this.toneLp.connect(this.toneShelf);
+      this.toneShelf.connect(this.limiter);
+      this.limiter.connect(this.ctx.destination);
+    }
+    this.chainMode = m;
+    return m;
+  },
+  // One printable line describing the path actually wired right now, so a value that sounds
+  // right on the phone can be read off the screen instead of remembered.
+  describeChain() {
+    if (this.chainMode === 'raw') return 'master ' + SND_RAW_MASTER_GAIN + ' -> destination';
+    const head = 'master ' + (this.master ? this.master.gain.value.toFixed(2) : '?');
+    const tone = ' -> LP ' + Math.round(this.toneLp ? this.toneLp.frequency.value : SND_TONE_LP_HZ) +
+      'Hz -> shelf ' + (this.toneShelf ? this.toneShelf.gain.value : SND_TONE_SHELF_DB) +
+      'dB -> limiter -> destination';
+    if (this.chainMode !== 'wet') return head + tone;
+    return head + ' -> uwLP ' + Math.round(this.uwLp ? this.uwLp.frequency.value : SND_UW_LP_HZ) +
+      'Hz -> 3 taps @87/230/441ms (wet ' +
+      (this.uwWet ? this.uwWet.gain.value.toFixed(2) : SND_UW_WET) + ', fb ' + SND_UW_FB + ')' + tone;
   },
   // Cheap sidechain: ramp musicDuck down `db` decibels then back up over `ms`, no
   // compressor node. Used by loud game SFX (alien bite, laser) and by stinger().
@@ -2053,6 +2161,12 @@ const CFG = {
   // r ~= 0.106 * tank height. Anything smaller reads as a different, busier game.
   SUNFIN_R:     [22, 34, 47, 58],
   SUNFIN_SPEED: [70, 80, 88, 94],   // px/s at reference scale (TUNE)
+  // Phase 7B: ONE global pace knob over everything that swims — fish (sunfin table and
+  // FISH[kind].speed), pets (petMove modes and every bucket's `speed`) and aliens (spawn
+  // velocity and the per-frame chase speed). It deliberately does NOT touch anything
+  // that falls or ticks: COIN_SINK, FOOD_FALL, COIN_DWELL, hunger, drop timers, attack
+  // timers or ALIEN_EAT_CD. Movement feel only. 0.85 = ~18% longer to cross the tank.
+  PACE: 0.85,
   COIN_VALUE:   [0, 15, 35, 200],   // baby drops nothing
   COIN_EVERY:   [0, 5.5, 5.5, 5.5],
 
@@ -2076,6 +2190,12 @@ const CFG = {
   ALIEN_GRACE:    1.6,    // seconds after spawn before it can eat
   ALIEN_EAT_CD:   1.3,    // seconds between meals (TUNE) — without this an alien
                           // swallows a whole school in one pass and no level is winnable
+  // Phase 7C: appetite cooldown — a fish or pet that KILLS another entity ignores prey
+  // for this long (one shared check: satiated()/stampKill() next to eatPrey). It does
+  // NOT change chain income: every predator pays on its own `every` timer whether it
+  // eats or not (measured 2026-09-08: kills/min 34 -> 10, drops/min flat). What it
+  // slows is prey attrition. Aliens are exempt — ALIEN_EAT_CD above is theirs.
+  KILL_COOLDOWN:  5.0,
 
   // Working capital per tank. These are a FLOAT, not a budget, and they are sized from
   // one measured rule: no single thing the shop offers at t=0 may cost more than the
@@ -2616,7 +2736,7 @@ let PHONE = false, TRAY_H = 0, TRAY_ROWS = 1;
 // Without this a fish is a readable blob on a phone and a speck on a desktop.
 let S = 1;
 const fishR     = f => (f.kind === 'sunfin' ? CFG.SUNFIN_R[f.stage]     : FISH[f.kind].r     * (f.kind === 'brood' && f.stage ? 1.25 : 1)) * S;
-const fishSpeed = f => (f.kind === 'sunfin' ? CFG.SUNFIN_SPEED[f.stage] : FISH[f.kind].speed) * S;
+const fishSpeed = f => (f.kind === 'sunfin' ? CFG.SUNFIN_SPEED[f.stage] : FISH[f.kind].speed) * S * CFG.PACE;
 const foodR     = () => CFG.FOOD_R * S;
 const coinR     = c => CFG.COIN_R * (c ? c.scale : 1) * S;
 const coinTapR  = () => Math.max(CFG.COIN_TAP_R * S, 24);   // never below the 44px HIG min
@@ -3222,6 +3342,32 @@ const COIN_STYLE = {
   chest:   { scale:1.44, value:2000, a:'#ffdf9a', b:'#c07028', c:'#5e3410', glow:'#ffcf7a', shape:'chest' },
 };
 
+// Phase 7B: THE pearl shader, shared by the pearl coin and the oyster's pearl. Before
+// this both drew a radial gradient whose stops were all near-white (#fff -> #f2e4f2 ->
+// #b294bd) under a white highlight, with no rim — measured, the darkest pixel of a
+// pearl was luminance ~165 (oyster ~186) against ~80 for a gold coin and ~60 for a
+// chest, so at phone scale it collapsed into a flat grey disc. Now it has a real tonal
+// range (white -> lilac -> plum rim), a nacre sheen (teal/rose lobe on the shadow
+// side), the rim stroke every other drop has, and a highlight with shade to sit on.
+function drawPearlSphere(g, x, y, r) {
+  const body = g.createRadialGradient(x - r * 0.34, y - r * 0.36, r * 0.05, x, y, r);
+  body.addColorStop(0, '#ffffff'); body.addColorStop(0.30, '#f4e9f6');
+  body.addColorStop(0.68, '#c8ace0'); body.addColorStop(1, '#6f4e86');
+  g.fillStyle = body;
+  g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+  const sheen = g.createRadialGradient(x + r * 0.40, y + r * 0.42, r * 0.05, x + r * 0.25, y + r * 0.25, r * 0.85);
+  sheen.addColorStop(0, 'rgba(140,235,225,.55)'); sheen.addColorStop(0.55, 'rgba(255,170,215,.28)');
+  sheen.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = sheen;
+  g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+  g.strokeStyle = 'rgba(58,32,74,.55)'; g.lineWidth = Math.max(1.2, r * 0.09);
+  g.beginPath(); g.arc(x, y, r, 0, TAU); g.stroke();
+  g.fillStyle = 'rgba(255,255,255,.92)';
+  g.beginPath(); g.ellipse(x - r * 0.34, y - r * 0.38, r * 0.28, r * 0.17, -0.55, 0, TAU); g.fill();
+  g.fillStyle = 'rgba(255,255,255,.35)';
+  g.beginPath(); g.arc(x + r * 0.30, y + r * 0.34, r * 0.11, 0, TAU); g.fill();
+}
+
 function drawCoin(g, c) {
   const st = COIN_STYLE[c.type], r = coinR(c);
   // c.jx / c.jy are the settle fan (Phase 7C) and exist ONLY here. Every gameplay reader
@@ -3276,13 +3422,7 @@ function drawCoin(g, c) {
   }
 
   if (st.shape === 'pearl') {
-    const pg = g.createRadialGradient(-r * 0.32, -r * 0.34, r * 0.06, 0, 0, r);
-    pg.addColorStop(0, '#ffffff'); pg.addColorStop(0.55, st.b); pg.addColorStop(1, st.c);
-    g.fillStyle = pg;
-    g.beginPath(); g.arc(0, 0, r, 0, TAU); g.fill();
-    g.globalAlpha = 0.75; g.fillStyle = '#fff';
-    g.beginPath(); g.ellipse(-r * 0.30, -r * 0.34, r * 0.26, r * 0.16, -0.5, 0, TAU); g.fill();
-    g.globalAlpha = 1;
+    drawPearlSphere(g, 0, 0, r);
     g.restore(); return;
   }
 
@@ -4015,12 +4155,8 @@ function drawClam(g, x, y, s, hue, pearl, open = 1) {
     // vesper so it reads as the thing to tap
     g.fillStyle = 'rgba(246,230,255,.34)';
     g.beginPath(); g.arc(0, py, pr * (1.7 + Math.sin(Game.time * 4) * 0.14), 0, TAU); g.fill();
-    const pg = g.createRadialGradient(-pr * 0.36, py - pr * 0.40, pr * 0.08, 0, py, pr);
-    pg.addColorStop(0, '#ffffff'); pg.addColorStop(0.6, '#f2eaf2'); pg.addColorStop(1, '#c2aecb');
-    g.fillStyle = pg;
-    g.beginPath(); g.arc(0, py, pr, 0, TAU); g.fill();
-    g.globalAlpha = clamp(gape, 0, 1) * 0.8; g.fillStyle = '#fff';
-    g.beginPath(); g.ellipse(-pr * 0.34, py - pr * 0.44, pr * 0.32, pr * 0.18, -0.5, 0, TAU); g.fill();
+    g.globalAlpha = clamp(gape, 0, 1);
+    drawPearlSphere(g, 0, py, pr);   // Phase 7B: same shader as the pearl coin
     g.globalAlpha = 1;
   }
 
@@ -5115,8 +5251,9 @@ const Shop = {
     const px = rand(W * 0.2, W * 0.8), py = rand(TANK_TOP + 60 * S, SAND_TOP - 40 * S);
     switch (d.kind) {
       case 'fish':
-        luckBless(d.species === 'sunfin' ? spawnSunfin(px, py, 0)
-                                         : spawnSpecial(d.species, px, py));
+        { const nf = luckBless(d.species === 'sunfin' ? spawnSunfin(px, py, 0)
+                                                    : spawnSpecial(d.species, px, py));
+          if (nf) fishSfx(nf, 'land'); }   // Phase 7A: the species' own landing plop
         // Buying either special fish opens the laser and egg slots.
         if (d.role === 'specialA' || d.role === 'specialB') {
           if (!Game.specialsBought) {
@@ -5193,7 +5330,7 @@ function spawnSunfin(x, y, stage, banked = 0) {
   const f = Fishes.spawn();
   f.kind = 'sunfin';
   f.x = x; f.y = clamp(y, TANK_TOP + 40 * S, SAND_TOP - 20 * S);
-  const sp = CFG.SUNFIN_SPEED[stage] * S;
+  const sp = CFG.SUNFIN_SPEED[stage] * S * CFG.PACE;
   f.vx = Math.random() < 0.5 ? sp : -sp; f.vy = 0;
   f.dir = f.vx > 0 ? 1 : -1;
   f.stage = stage; f.hunger = CFG.HUNGER_MAX;
@@ -5201,6 +5338,7 @@ function spawnSunfin(x, y, stage, banked = 0) {
   f.dropT = rand(2, CFG.COIN_EVERY[stage] || 5);
   f.wag = rand(0, TAU); f.tint = rand(20, 50);
   f.grow = 0; f.dying = 0; f.target = null; f.hidden = false; f.star = false;
+  f.lastKillAt = -Infinity; f.satBubT = 0;   // Phase 7C: recycled body, no leftover appetite
   f.shimmer = false; f.sparkT = rand(0, 2); f.eaten = false;
   // Phase 7D visual-only state channels. None of these touch hunger, thresholds or any
   // CFG number -- they exist purely so fishTint has one unambiguous input per state.
@@ -5215,7 +5353,7 @@ function spawnSpecial(kind, x, y) {
   const f = Fishes.spawn();
   f.kind = kind;
   f.x = x; f.y = clamp(y, TANK_TOP + 50 * S, SAND_TOP - 30 * S);
-  f.vx = Math.random() < 0.5 ? d.speed * S : -d.speed * S; f.vy = 0;
+  f.vx = Math.random() < 0.5 ? d.speed * S * CFG.PACE : -d.speed * S * CFG.PACE; f.vy = 0;
   f.dir = f.vx > 0 ? 1 : -1;
   f.stage = 0; f.hunger = CFG.HUNGER_MAX;
   f.pts = 0; f.need = randi(4, 5); f.regentPts = 0;
@@ -5225,6 +5363,7 @@ function spawnSpecial(kind, x, y) {
   // body that last belonged to a Starfin would otherwise come back gold. Same line as
   // spawnSunfin, for the same reason.
   f.grow = 0; f.dying = 0; f.target = null; f.hidden = false; f.star = false;
+  f.lastKillAt = -Infinity; f.satBubT = 0;   // Phase 7C: recycled body, no leftover appetite
   f.shimmer = false; f.sparkT = rand(0, 2); f.eaten = false;
   // Phase 7D visual-only state channels. None of these touch hunger, thresholds or any
   // CFG number -- they exist purely so fishTint has one unambiguous input per state.
@@ -5280,7 +5419,7 @@ function spawnAlien(kind) {
   a.kind = kind;
   a.x = Math.random() < 0.5 ? -d.r * S : W + d.r * S;
   a.y = d.floor ? SAND_TOP - d.r * 0.5 * S : rand(TANK_TOP + TANK_H * 0.25, SAND_TOP - 40 * S);
-  a.vx = a.x < 0 ? d.speed * S : -d.speed * S;
+  a.vx = a.x < 0 ? d.speed * S * CFG.PACE : -d.speed * S * CFG.PACE;
   a.vy = 0;
   a.hp = a.maxHp = a.hpGhost = d.hp;
   a.eaten = 0; a.grace = CFG.ALIEN_GRACE; a.eatCd = 0; a.phase = 0; a.phaseT = 3;
@@ -5440,13 +5579,13 @@ function petMove(p, q, dt) {
   switch (q.move) {
     case 'floorPatrol':                                  // Plod: crawls the sand, turns at the walls
       p.y = SAND_TOP - (q.floorGap || 12) * S;
-      p.x += p.dir * (q.moveSpeed || 14) * S * dt;
+      p.x += p.dir * (q.moveSpeed || 14) * S * CFG.PACE * dt;
       if (p.x < 40)     { p.x = 40;     p.dir =  1; }
       if (p.x > W - 40) { p.x = W - 40; p.dir = -1; }
       break;
     case 'glide':                                        // Kite: a lane above the sand, rising and falling
       p.glide = (p.glide || 0) + dt;
-      p.x += p.dir * (q.moveSpeed || 55) * S * dt;
+      p.x += p.dir * (q.moveSpeed || 55) * S * CFG.PACE * dt;
       if (p.x < 50)     { p.x = 50;     p.dir =  1; }
       if (p.x > W - 50) { p.x = W - 50; p.dir = -1; }
       p.y = SAND_TOP - ((q.glideY || 55) + Math.sin(p.glide * (q.glideRate || 1.4)) * (q.glideAmp || 14)) * S;
@@ -5460,14 +5599,14 @@ function petMove(p, q, dt) {
         if (d > far) { far = d; cx = x; cy = y; }
       }
       const dx = cx - p.x, dy = cy - p.y, d = Math.hypot(dx, dy) || 1;
-      const spd = (q.moveSpeed || 60) * S;
+      const spd = (q.moveSpeed || 60) * S * CFG.PACE;
       p.x += dx / d * Math.min(spd * dt, d);
       p.y += dy / d * Math.min(spd * dt, d);
       p.dir = dx > 0 ? 1 : -1;
       break;
     }
     case 'bandPatrol':                                   // Cinder: mid-water, inside a band of the tank
-      p.x += p.dir * (q.moveSpeed || 20) * S * dt;
+      p.x += p.dir * (q.moveSpeed || 20) * S * CFG.PACE * dt;
       if (p.x < W * (q.bandMin || 0.2)) { p.x = W * (q.bandMin || 0.2); p.dir =  1; }
       if (p.x > W * (q.bandMax || 0.8)) { p.x = W * (q.bandMax || 0.8); p.dir = -1; }
       p.y = TANK_TOP + TANK_H * ((q.bandY || 0.45) + Math.sin(Game.time * (q.bobRate || 0.5)) * (q.bobAmp || 0.08));
@@ -5623,7 +5762,7 @@ const PET_BUCKETS = {
                                    TANK_TOP + 30 * S, SAND_TOP - 20 * S);
         return;
       }
-      const spd = q.speed * S;
+      const spd = q.speed * S * CFG.PACE;
       if (q.floorOnly) {
         const gap = Math.abs(best.x - p.x);
         p.dir = best.x > p.x ? 1 : -1;
@@ -5707,13 +5846,14 @@ const PET_BUCKETS = {
       // and a needlefish jabbing from just outside the body reads better anyway.
       const strike = q.reach * S + alienR(best);
       if (d > strike * 0.9) {
-        p.x = clamp(p.x + dx / d * q.speed * S * dt, 20, W - 20);
-        p.y = clamp(p.y + dy / d * q.speed * S * dt, TANK_TOP + 30 * S, SAND_TOP - 20 * S);
+        p.x = clamp(p.x + dx / d * q.speed * S * CFG.PACE * dt, 20, W - 20);
+        p.y = clamp(p.y + dy / d * q.speed * S * CFG.PACE * dt, TANK_TOP + 30 * S, SAND_TOP - 20 * S);
       }
       if (p.t <= 0 && d < strike) {
         p.t = q.interval;
         p.jab = 0.16;
         hitAlien(best, q.damage);
+        if (best.dying > 0) stampKill(p);   // Phase 7C: same stamp as a fish kill; satiated(p) gates any future pet eating
         Sfx.play('petQuillJab');
       }
     },
@@ -5848,8 +5988,8 @@ const PET_BUCKETS = {
         }
         const dx = best.x - p.x, dy = best.y - p.y, d = Math.hypot(dx, dy) || 1;
         p.dir = dx > 0 ? 1 : -1;
-        p.x = clamp(p.x + dx / d * q.speed * S * dt, 20, W - 20);
-        p.y = clamp(p.y + dy / d * q.speed * S * dt, TANK_TOP + 30 * S, SAND_TOP - 20 * S);
+        p.x = clamp(p.x + dx / d * q.speed * S * CFG.PACE * dt, 20, W - 20);
+        p.y = clamp(p.y + dy / d * q.speed * S * CFG.PACE * dt, TANK_TOP + 30 * S, SAND_TOP - 20 * S);
         if (d < q.reach * S) {
           // Back to life, fed, and off cooldown in `cooldown` seconds. Game.stat.lost is
           // deliberately NOT decremented: the death happened, and the star bits and the
@@ -6916,6 +7056,7 @@ const RunSave = {
       f.stage = d.stage; f.hunger = d.hunger; f.pts = d.pts; f.need = d.need;
       f.regentPts = d.regentPts; f.dropT = d.dropT; f.tint = d.tint; f.star = !!d.star; f.shimmer = !!d.shimmer;
       f.wag = rand(0, TAU); f.grow = 0; f.dying = 0; f.target = null; f.hidden = false;
+      f.lastKillAt = -Infinity; f.satBubT = 0;   // Phase 7C
     }
     for (const d of s.coins) {
       // Direct pool spawn, not spawnCoin — a restore must not re-fire pet coinDrop
@@ -7113,7 +7254,7 @@ function updateFish(dt) {
     if (eatsFood) {
       f.hunger -= dt;
       if (f.hunger <= 0) {
-        f.dying = 1; Sfx.play('fishDeath'); Haptics.heavy();
+        f.dying = 1; fishSfx(f, 'die'); Haptics.heavy();
         if (Game.stat) Game.stat.lost++;
         puff(f.x, f.y, '#7a9aa8', 10, 70);
         continue;
@@ -7132,7 +7273,14 @@ function updateFish(dt) {
     if (hd && hd.force) {
       f.target = null;
     } else if (!eatsFood) {
-      if (!f.target || !f.target.alive || f.target.dying > 0) f.target = findPrey(f);
+      if (satiated(f)) {
+        // Phase 7C: full. Ignore prey, wander like any idle fish, and let a couple of
+        // pale bubbles rise from the mouth every ~0.7s so the player can SEE why the
+        // predator is swimming past its dinner.
+        f.target = null;
+        f.satBubT = (f.satBubT || 0) - dt;
+        if (f.satBubT <= 0) { f.satBubT = 0.7; puff(f.x + f.dir * r * 0.7, f.y - r * 0.15, '#d8f4ff', 2, 26); }
+      } else if (!f.target || !f.target.alive || f.target.dying > 0) f.target = findPrey(f);
     } else if (f.hunger < CFG.HUNGRY_AT) {
       if (!f.target || !f.target.alive) f.target = nearestFood(f.x, f.y);
     } else if (f.target && !f.target.alive) f.target = null;
@@ -7157,7 +7305,7 @@ function updateFish(dt) {
           f.fedT = FISH_FED_PULSE;   // Phase 7D: brightness pulse only, no hue, no timing change
           f.target.alive = false;
           puff(f.x, f.y, '#ffe6b0', 5, 50);
-          Sfx.play('fishEat', { size: clamp(fishR(f) / 70, 0, 1) });
+          fishSfx(f, 'eat');   // Phase 7A: per-species eat
           growFish(f, CFG.FOOD_GROWTH[q]);
         }
         f.target = null;
@@ -7264,6 +7412,17 @@ function updateFish(dt) {
   Fishes.reap();
 }
 
+// Phase 7C: THE appetite check, shared by fish and pets. A kill stamps the killer's
+// lastKillAt; satiated() is true for CFG.KILL_COOLDOWN seconds after it — and only when
+// the stamp belongs to this level's clock (Game.time restarts at 0 per level, so a stale
+// stamp can never carry a cooldown across levels; spawn paths also reset it). Aliens are
+// not on this system: they keep CFG.ALIEN_EAT_CD, which is survival balance, not income.
+function stampKill(e) { e.lastKillAt = Game.time; }
+function satiated(e) {
+  const t = Game.time - (e.lastKillAt ?? -Infinity);
+  return t >= 0 && t < CFG.KILL_COOLDOWN;
+}
+
 // A predator catching its prey. Species with `every:0` pay out per catch instead of
 // on a timer — that is what makes a Star Skimmer worthless without stars to eat.
 function eatPrey(f, target) {
@@ -7272,12 +7431,15 @@ function eatPrey(f, target) {
     target.dying = 1; target.eaten = true;   // eaten, so Vesper cannot bring it back
     target.eatFlash = FISH_EAT_FLASH;        // Phase 7D: ~2 frames of white
     puff(target.x, target.y, '#ff8080', 12, 100);
+    stampKill(f);                            // Phase 7C: full for KILL_COOLDOWN seconds
   } else {                           // prey is a falling collectable
     target.alive = false;
     puff(target.x, target.y, COIN_STYLE[target.type].glow, 8, 70);
   }
-  if (f.kind === 'ripper') Sfx.play('ripperBite');
-  else Sfx.play('fishEat', { size: clamp(fishR(f) / 70, 0, 1) });
+  // Phase 7A: a caught fish is the predator's KILL and the prey's DIE; a caught
+  // collectable is just the predator's EAT.
+  if (target.kind) { fishSfx(f, 'kill'); fishSfx(target, 'die'); }
+  else fishSfx(f, 'eat');
   if (d.every === 0) fishCoin(f, f.x, f.y + 6, d.drop);
 }
 
@@ -7326,7 +7488,7 @@ function applyElixir(f) {
     f.hunger = CFG.HUNGER_MAX;
     floatText(f.x, f.y - 26, 'WASTED', '#ff9d9d');
   } else {
-    f.dying = 1; Sfx.play('fishDeath'); Haptics.heavy();
+    f.dying = 1; fishSfx(f, 'die'); Haptics.heavy();
     if (Game.stat) Game.stat.lost++;
     puff(f.x, f.y, '#ff5050', 14, 110);
     floatText(f.x, f.y - 26, 'TOO SMALL!', '#ff5050');
@@ -7359,7 +7521,7 @@ function updateAliens(dt) {
     const r = alienR(a);
     // Pet.alienSpeed is the controller's slow hook — 1 unless a rattling pet marked this
     // alien and the rattle has not worn off. Same shape as Pet.fall on the coin side.
-    const spd = d.speed * S * Pet.alienSpeed(a);
+    const spd = d.speed * S * CFG.PACE * Pet.alienSpeed(a);
 
     // --- hunt the nearest fish ---
     let prey = null, bd = Infinity;
@@ -7379,6 +7541,7 @@ function updateAliens(dt) {
         prey.dying = 1; prey.eaten = true;   // eaten, so Vesper cannot bring it back
         prey.eatFlash = FISH_EAT_FLASH;      // Phase 7D: ~2 frames of white
         Pet.emit('fishEaten', prey);
+        fishSfx(prey, 'die');   // Phase 7A: the prey's own death cue under the alien's bite
         if (Game.stat) Game.stat.lost++;
         a.eaten++;
         a.eatCd = d.eatCd || CFG.ALIEN_EAT_CD;
@@ -7437,7 +7600,9 @@ function hitAlien(a, dmg) {
   }
   a.hp -= dmg;
   a.hurt = 0.09;
-  Sfx.play('laserHit', { level: dmg });   // dmg IS Game.laser here — see the hitAlien(target, Game.laser) call site
+  // dmg IS Game.laser here — see the hitAlien(target, Game.laser) call site. hp = fraction
+  // left after this hit, so the thump falls as the alien nears death (Phase 7A).
+  Sfx.play('laserHit', { level: dmg, hp: a.maxHp > 0 ? Math.max(0, a.hp) / a.maxHp : 1 });
   if (a.hp <= 0) killAlien(a);
 }
 
@@ -10808,7 +10973,7 @@ const SFX_GAIN_TRIM = {
   alienSpawn_mite:4, alienDeath_mite:4, alienSpawn_ravager:3.59, alienDeath_ravager:4,
   alienSpawn_bloat:4, alienDeath_bloat:4, alienSpawn_lurker:4, alienDeath_lurker:4,
   alienSpawn_streak:4, alienDeath_streak:4, alienSpawn_sentry:3.848, alienDeath_sentry:3.906,
-  alienSpawn_splitjaw:3.78, alienDeath_splitjaw:3.701, alienBite:2.696, splitjawSplit:4, laserHit:3.97,
+  alienSpawn_splitjaw:3.78, alienDeath_splitjaw:3.701, alienBite:2.696, splitjawSplit:4, laserHit:1.05,
   laserFire:4, laserUpgrade:4, heartbeatThump:2.2, reliefSting:2.2,
   uiTap:4, uiBuy:2.38, uiDeny:3.409, uiEggPlaced:1.88, uiStar1:2.022, uiStar2:1.972, uiStar3:1.861,
   uiPediaNew:3.628, uiPetSelect:4, uiMapOpen:4, uiQuitConfirm:2.552,
@@ -10852,7 +11017,9 @@ const Sfx = {
     // ---- Phase 7F: ducking is now a POLICY, not five hand-placed calls ----
     // Every game cue dips the music a little; UI dips it less. The five existing explicit
     // duckMusic() calls are deeper and still win via the depth guard above.
-    Snd.duckMusic(def.bus === 'ui' ? 1.2 : 2.5, def.bus === 'ui' ? 90 : 130);
+    // ...except in the board's RAW position, which has to reproduce the pre-build-56
+    // behaviour exactly or the A/B is not comparing what it claims to compare.
+    if (Snd.chainMode !== 'raw') Snd.duckMusic(def.bus === 'ui' ? 1.2 : 2.5, def.bus === 'ui' ? 90 : 130);
 
     // ---- Phase 7F: per-play detune, without touching a single build() ----
     // Every build() creates its oscillators through ctx.createOscillator. Shadowing that
@@ -10860,7 +11027,9 @@ const Sfx = {
     // every oscillator comes back pre-detuned, and no sound definition changes. Deleting
     // the shadow restores the prototype method. `finally` so a throwing build() cannot
     // leave the patch installed.
-    const cents = (Math.random() * 2 - 1) * SFX_DETUNE_CENTS;
+    // The shim goes in either way, so build() is called through an identical path in all
+    // three chain positions; RAW simply detunes by zero.
+    const cents = Snd.chainMode === 'raw' ? 0 : (Math.random() * 2 - 1) * SFX_DETUNE_CENTS;
     const realCreateOsc = ctx.createOscillator;
     ctx.createOscillator = function () {
       const o = realCreateOsc.call(ctx);
@@ -10946,6 +11115,143 @@ Sfx.register('broodSpawnEgg', { category: 'fish', maxVoices: 2, build(ctx, dest)
   sfxNoise(ctx, dest, { dur: 0.1, vel: 0.08, hp: 0, lp: 900 });
   return d;
 } });
+
+// ============ PHASE 7A: SFX IDENTITY — one voice per fish species, one per pet ============
+// Every species and every pet owns a VOICE: { wave, base, env, glide, noise, grit } =
+// oscillator type, pitch anchor (Hz), duration multiplier, the signature pitch-bend ratio
+// (<1 falls, >1 rises), the transient's noise colour [hp, lp] and how noisy it is (0..1).
+// The four EVENT shapes (land / eat / kill / die) are each one generator over that voice,
+// so the shapes stay comparable across the cast while the timbre says WHO made the sound.
+// Every generated id is a normal Sfx.register entry: mute switch, anti-stack window,
+// per-id voice caps and the global 6-voice cap all apply exactly as for the older cues.
+//   SFX_FISH[species] = { land, eat, kill, die }   -> sfx ids   (8 species x 4)
+//   SFX_PET[petId]    = { land, eat, kill, die }   -> sfx ids   (35 pets x 4)
+// A boot-time check refuses two voices with an identical parameter set.
+// Pet entries are DEFINED only — nothing in the pet behaviours calls petSfx() yet; that
+// wiring belongs to the pet-behaviour pass, not this one.
+
+const FISH_SFX_SPECIES = ['sunfin', 'starfin', 'brood', 'ripper', 'skimmer', 'grinder', 'picker', 'dread'];
+// Starfin is a sunfin in the sim (kind 'sunfin', star:true) but its own pedia card, so it
+// gets its own voice.
+const fishSfxSpecies = f => (f.star && f.kind === 'sunfin') ? 'starfin' : f.kind;
+
+const SFX_FISH_VOICE = {
+  sunfin:  { wave:'sine',     base:420, env:1.00, glide:0.70, noise:[300, 2400],   grit:0.30 },
+  starfin: { wave:'triangle', base:560, env:0.90, glide:1.40, noise:[1200, 6000],  grit:0.25 },
+  brood:   { wave:'sine',     base:240, env:1.45, glide:0.55, noise:[80, 900],     grit:0.35 },
+  ripper:  { wave:'square',   base:210, env:0.70, glide:0.40, noise:[800, 6000],   grit:0.60 },
+  skimmer: { wave:'triangle', base:660, env:0.80, glide:1.60, noise:[2000, 9000],  grit:0.20 },
+  grinder: { wave:'sawtooth', base:150, env:1.10, glide:0.50, noise:[400, 3000],   grit:0.70 },
+  picker:  { wave:'square',   base:340, env:0.95, glide:1.20, noise:[1500, 7000],  grit:0.45 },
+  dread:   { wave:'sawtooth', base:95,  env:1.60, glide:0.35, noise:[40, 700],     grit:0.55 },
+};
+
+// Tank families — the character the five pets of a tank share. Index = tank (0..6).
+const SFX_PET_FAMILY = [
+  { wave:'sawtooth', base:220, env:1.00, noise:[200, 1800],   grit:0.35 },  // Coral Shelf — warm, brassy
+  { wave:'triangle', base:300, env:1.10, noise:[300, 2500],   grit:0.30 },  // Rosewater Ruins — soft, rounded
+  { wave:'sine',     base:380, env:0.95, noise:[500, 4000],   grit:0.25 },  // Jade Terrace — clean, woody
+  { wave:'square',   base:170, env:0.90, noise:[150, 3000],   grit:0.55 },  // Iron Fathoms — metallic, hollow
+  { wave:'sawtooth', base:130, env:1.05, noise:[80, 1200],    grit:0.65 },  // Ember Trench — hot, gritty
+  { wave:'sine',     base:720, env:0.70, noise:[2500, 11000], grit:0.15 },  // Glacier Hollow — icy, glassy
+  { wave:'sine',     base:70,  env:1.50, noise:[30, 500],     grit:0.45 },  // Midnight Abyss — dark, subby
+];
+// Within a tank the five pets climb a pitch ladder and alternate the glide direction, so
+// siblings read as cousins by ear, never twins.
+const SFX_PET_SLOT = [
+  { mul:1.00, glide:0.60, env:1.00 },
+  { mul:1.20, glide:1.35, env:0.85 },
+  { mul:1.50, glide:0.75, env:1.15 },
+  { mul:0.80, glide:1.60, env:0.95 },
+  { mul:1.80, glide:0.45, env:1.25 },
+];
+
+// The four shapes. `size` (0..1, fish only) lowers the pitch a little for bigger fish, as
+// the old fishEat did — the voice's waveform and glide still carry the identity.
+const SFX_IDENTITY_EVENTS = {
+  // LAND — a water plop: a filtered splash, then the voice settles onto its base note and
+  // signs off with its glide.
+  land(ctx, dest, v, size) {
+    const b = v.base * (1 - 0.25 * size);
+    sfxNoise(ctx, dest, { dur: 0.09 * v.env, vel: 0.12 + 0.12 * v.grit, hp: v.noise[0] * 0.5, lp: v.noise[1] });
+    return sfxNotes(ctx, dest, [
+      { type: v.wave, freq: b * 1.5, freq2: b, dur: 0.16 * v.env, vel: 0.22, t: 0.02, attack: 0.01 },
+      { type: v.wave, freq: b, freq2: b * v.glide, dur: 0.14 * v.env, vel: 0.14, t: 0.02 + 0.14 * v.env },
+    ]);
+  },
+  // EAT — one short pop along the signature glide; grittier voices get a crunch.
+  eat(ctx, dest, v, size) {
+    const b = v.base * (1 - 0.3 * size);
+    if (v.grit > 0.4) sfxNoise(ctx, dest, { dur: 0.04, vel: 0.08 * v.grit, hp: v.noise[0], lp: v.noise[1] });
+    return sfxNotes(ctx, dest, [{ type: v.wave, freq: b * 1.15, freq2: b * v.glide, dur: 0.09 * v.env, vel: 0.24 }]);
+  },
+  // KILL — a bite: a hard noise transient, the glide struck harder, then a low tail.
+  kill(ctx, dest, v, size) {
+    const b = v.base * (1 - 0.2 * size);
+    sfxNoise(ctx, dest, { dur: 0.07 * v.env, vel: 0.14 + 0.16 * v.grit, hp: v.noise[0], lp: v.noise[1] });
+    return sfxNotes(ctx, dest, [
+      { type: v.wave, freq: b * 1.3, freq2: b * v.glide * 0.6, dur: 0.08 * v.env, vel: 0.22, attack: 0.003 },
+      { type: v.wave, freq: b * 0.9, freq2: b * 0.35, dur: 0.12 * v.env, vel: 0.16, t: 0.07 * v.env },
+    ]);
+  },
+  // DIE — the voice flicks through its glide once, then sinks to a quarter of its base
+  // under a soft noise tail. Always ends falling: a death reads the same for everyone,
+  // the opening flick is what names the species.
+  die(ctx, dest, v, size) {
+    const b = v.base * (1 - 0.2 * size);
+    sfxNoise(ctx, dest, { dur: 0.32 * v.env, vel: 0.06 + 0.06 * v.grit, hp: v.noise[0] * 0.5, lp: v.noise[1] * 0.6 });
+    return sfxNotes(ctx, dest, [
+      { type: v.wave, freq: b, freq2: b * v.glide, dur: 0.08 * v.env, vel: 0.16, attack: 0.008 },
+      { type: v.wave, freq: b * v.glide, freq2: b * 0.25, dur: 0.36 * v.env, vel: 0.18, t: 0.07 * v.env, attack: 0.01 },
+    ]);
+  },
+};
+// Per-event gain trims, in the SFX_GAIN_TRIM convention (measured offline against the
+// Phase 15 targets: fishEat/fishDeath peaks as the reference for the fish bus).
+const SFX_IDENTITY_TRIM = { land: 1.9, eat: 1.9, kill: 1.45, die: 2.2 };
+
+const SFX_FISH = Object.create(null), SFX_PET = Object.create(null);
+const SFX_IDENTITY_VOICES = Object.create(null);   // 'fish_sunfin' / 'pet_tuck' -> voice
+function registerIdentityVoice(table, key, prefix, category, voice) {
+  const ids = {};
+  for (const ev of ['land', 'eat', 'kill', 'die']) {
+    const id = `${prefix}_${key}_${ev}`;
+    Sfx.register(id, {
+      category, maxVoices: ev === 'die' ? 2 : 3, minInterval: ev === 'eat' ? 0.06 : 0.08,
+      build: (ctx, dest, { size = 0 } = {}) => SFX_IDENTITY_EVENTS[ev](ctx, dest, voice, clamp(size, 0, 1)),
+    });
+    SFX_GAIN_TRIM[id] = SFX_IDENTITY_TRIM[ev];
+    ids[ev] = id;
+  }
+  table[key] = ids;
+  SFX_IDENTITY_VOICES[`${prefix}_${key}`] = voice;
+}
+for (const sp of FISH_SFX_SPECIES) registerIdentityVoice(SFX_FISH, sp, 'fish', 'fish-id', SFX_FISH_VOICE[sp]);
+PETS.forEach((p, i) => {
+  const fam = SFX_PET_FAMILY[Math.floor(i / 5)], slot = SFX_PET_SLOT[i % 5];
+  registerIdentityVoice(SFX_PET, p.id, 'pet', 'pet-id', {
+    wave: fam.wave, base: Math.round(fam.base * slot.mul), env: +(fam.env * slot.env).toFixed(3),
+    glide: slot.glide, noise: fam.noise, grit: fam.grit,
+  });
+});
+// No two voices may share a parameter set — the whole point is telling them apart.
+(function assertSfxIdentityUnique() {
+  const seen = new Map();
+  for (const k in SFX_IDENTITY_VOICES) {
+    const sig = JSON.stringify(SFX_IDENTITY_VOICES[k]);
+    if (seen.has(sig)) console.error('SFX identity: ' + k + ' duplicates ' + seen.get(k));
+    seen.set(sig, k);
+  }
+})();
+// The two call sites the game uses. Both are no-ops for an unknown species/pet.
+function fishSfx(f, ev) {
+  const t = SFX_FISH[fishSfxSpecies(f)];
+  if (t) Sfx.play(t[ev], { size: clamp(fishR(f) / 70, 0, 1) });
+}
+function petSfx(petId, ev) {
+  const t = SFX_PET[petId];
+  if (t) Sfx.play(t[ev]);
+}
 
 // ---- FOOD ----
 Sfx.register('foodDrop', { category: 'food', maxVoices: 3, build(ctx, dest) {
@@ -11131,9 +11437,21 @@ Sfx.register('reliefSting', { category: 'aliens', maxVoices: 1, minInterval: 0.5
     { type: 'sine',     freq: 1319, dur: 0.34, vel: 0.14, t: 0.22 },
   ]);
 } });
-Sfx.register('laserHit', { category: 'aliens', maxVoices: 4, build(ctx, dest, { level = 1 } = {}) {
+// Phase 7A alien-hit remix: a layered transient — a click on top of a body thump — whose
+// thump pitch tracks the alien's remaining HP. `hp` is the 0..1 fraction left AFTER the
+// hit, so a fresh alien thuds at ~220Hz and the killing blows land near 70Hz: progress
+// toward the kill is audible. The old sawtooth zap survives as a quiet top layer so the
+// laser level still colours the hit. The death cue (alienDeath_<kind>) is untouched and
+// a different shape entirely — a pitched-down, shortened copy of that kind's spawn roar.
+Sfx.register('laserHit', { category: 'aliens', maxVoices: 4, build(ctx, dest, { level = 1, hp = 1 } = {}) {
+  const h = clamp(hp, 0, 1);
+  const body = 70 + 150 * h;
   const f0 = 900 + level * 80;
-  return sfxNotes(ctx, dest, [{ type: 'sawtooth', freq: f0, freq2: f0 * 0.35, dur: 0.06, vel: 0.14 }]);
+  sfxNoise(ctx, dest, { dur: 0.018, vel: 0.30, hp: 2500, lp: 9000 });                                       // click
+  return sfxNotes(ctx, dest, [
+    { type: 'sine',     freq: body * 2.2, freq2: body, dur: 0.11 + 0.05 * (1 - h), vel: 0.34, attack: 0.003 }, // thump
+    { type: 'sawtooth', freq: f0, freq2: f0 * 0.35, dur: 0.05, vel: 0.05 },                                    // level zap
+  ]);
 } });
 
 // ---- LASER ----
@@ -11951,27 +12269,175 @@ function runPetAudit() {
 }
 
 // ============ PHASE 7F — ?audio=test SOUND BOARD ============
-// A dev-only bench for auditioning the whole SFX bank ON THE DEVICE, one sound at a time,
+// A dev-only bench for auditioning the whole SFX bank ON THE DEVICE, one cue at a time,
 // with the output chain live under your thumb. It exists because the mix has to be tuned by
 // ear on a real iPhone speaker, and every previous audio pass was tuned by reading numbers.
 //
-// Four things it does that a single tap cannot:
+// It changes no sound. Every button calls Sfx.play() — the production path, detune, anti-stack,
+// voice caps and all — so what the board plays is what the game plays. Nothing here
+// reimplements synthesis, and no cue's parameters are read from a table that could drift out
+// of sync with the code: the face of every button is PROBED off the real build() (see
+// audioTestProbe), and the levels come from an offline render of the real build().
+//
+// Six things it does that a single tap cannot:
+//   CHAIN  flips the whole output between RAW (the pre-7F chain), DRY (what ships today) and
+//     WET (the proposed underwater bus), globally, mid-audition. Same cue, three chains.
 //   REPEAT x10 fires a cue at its own real minInterval. Repetition fatigue and missing
 //     detune are invisible on one tap; this is the control that makes coinFloorTick
 //     obviously wrong.
+//   LOW LANE lists every cue whose lowest synthesised frequency is under 500Hz, with that
+//     frequency printed, ordered from the deepest up. These are the cues a phone driver
+//     cannot reproduce — heartbeatThump's 62->38Hz sweep is top of the list.
 //   STACK fires a three-alien wave's worth of cues inside one frame, which is the only way
 //     to hear the limiter working (or not).
-//   MEASURE offline-renders every sound and reports its peak level and a dominant-frequency
-//     estimate, so the lane assignment for the next pass comes from measurement rather than
-//     from anybody's memory of what a sound "sounds like".
+//   MEASURE offline-renders every sound and reports peak level and a dominant-frequency
+//     estimate, so lane assignment for the next pass comes from measurement.
 //   The sliders write straight into the live graph, so a value you like is a value you can
-//     read off the screen and tell me.
+//     read off the screen and tell me. They are audition-only and persist nowhere.
+
+function audioTestProbe() {
+  // What does each cue actually synthesise? Answer it by READING the synthesis rather than
+  // the audio: call every build() against ONE throwaway OfflineAudioContext with
+  // createOscillator/createBufferSource shadowed, and record the oscillator type, every
+  // frequency the build schedules on it, and the duration build() itself returns.
+  //
+  // Nothing is rendered. That matters on the target device: iOS Safari caps live
+  // AudioContexts, and the bank is now over two hundred cues — one context for the whole
+  // probe instead of one per cue. It is also the only honest way to print a fundamental on
+  // a button face, because a hand-maintained table of "what this sound is" drifts the first
+  // time somebody edits a build() and forgets the table. (Phase 7A shipped exactly that bug
+  // in the art harness; not repeating it here.)
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const out = Object.create(null);
+  if (!OAC) return out;
+  let octx;
+  try { octx = new OAC(1, 128, 44100); } catch (e) { return out; }
+
+  // Every node the build asks for gets its connect() wrapped, so the probe ends up holding
+  // the cue's actual signal graph. That is the ONLY way to tell a carrier from a modulator:
+  // an LFO does not connect to an AudioParam directly, it connects to a depth GainNode which
+  // connects to the param, so a one-hop test says "audible" and gets it wrong. The first cut
+  // of this probe did exactly that and reported petPlodHum's fundamental as 3Hz -- the
+  // tremolo rate -- instead of 70Hz. An oscillator counts as audible only if some path from
+  // it, following node-to-node edges only, reaches the dest gain this cue was built into.
+  let edges = new Map();
+  const trace = function (nd) {
+    if (!nd || typeof nd.connect !== 'function' || nd.__atTraced) return nd;
+    nd.__atTraced = true;
+    const rc = nd.connect.bind(nd);
+    nd.connect = function (t) {
+      let a = edges.get(nd);
+      if (!a) { a = []; edges.set(nd, a); }
+      a.push({ to: t, param: typeof t.connect !== 'function' });
+      return rc.apply(nd, arguments);
+    };
+    return nd;
+  };
+  const factories = [];
+  for (const k in octx) if (/^create/.test(k) && typeof octx[k] === 'function') factories.push(k);
+  for (let i = 0; i < factories.length; i++) {
+    const k = factories[i], real = octx[k].bind(octx);
+    octx[k] = function () { return trace(real.apply(null, arguments)); };
+  }
+  const reaches = function (start, dest) {
+    const st = [start], seen = new Set();
+    while (st.length) {
+      const nd = st.pop();
+      if (nd === dest) return true;
+      if (seen.has(nd)) continue;
+      seen.add(nd);
+      const es = edges.get(nd);
+      if (!es) continue;
+      for (let i = 0; i < es.length; i++) if (!es[i].param) st.push(es[i].to);
+    }
+    return false;
+  };
+
+  // These two wrap the ALREADY-traced factories, so a source is both traced and recorded.
+  const tracedOsc = octx.createOscillator.bind(octx);
+  const tracedBuf = octx.createBufferSource.bind(octx);
+  let made = [], noises = [];
+  octx.createOscillator = function () {
+    const o = tracedOsc();
+    // AudioParam has no public read-back of its scheduled curve, so wrap the four
+    // scheduling methods on THIS param and keep every value that goes through them. That
+    // is how a sweep (freq -> freq2) shows up as a range rather than a single number.
+    const p = o.frequency, seen = [];
+    const wrap = ['setValueAtTime', 'linearRampToValueAtTime', 'exponentialRampToValueAtTime', 'setTargetAtTime'];
+    for (let i = 0; i < wrap.length; i++) {
+      const m = wrap[i];
+      if (typeof p[m] !== 'function') continue;
+      const fn = p[m].bind(p);
+      p[m] = function (v) {
+        if (typeof v === 'number' && isFinite(v) && v > 0) seen.push(v);
+        return fn.apply(p, arguments);
+      };
+    }
+    made.push({ o: o, seen: seen });
+    return o;
+  };
+  octx.createBufferSource = function () { const b = tracedBuf(); noises.push(b); return b; };
+
+  const ids = Object.keys(Sfx.defs);
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i], def = Sfx.defs[id];
+    made = []; noises = []; edges = new Map();
+    let dur = null, ok = true, dest = null;
+    try {
+      dest = octx.createGain();
+      dur = def.build(octx, dest, {});
+    } catch (e) { ok = false; }
+    const types = [], freqs = [];
+    let mods = 0;
+    for (let k = 0; k < made.length; k++) {
+      const r = made[k];
+      if (!dest || !reaches(r.o, dest)) { mods++; continue; }
+      let t = 'osc';
+      try { t = r.o.type; } catch (e) {}
+      if (types.indexOf(t) < 0) types.push(t);
+      const list = r.seen.length ? r.seen : [r.o.frequency.value];
+      for (let j = 0; j < list.length; j++) if (list[j] > 0) freqs.push(list[j]);
+    }
+    let noise = 0;
+    for (let k = 0; k < noises.length; k++) if (dest && reaches(noises[k], dest)) noise++;
+    freqs.sort(function (a, b) { return a - b; });
+    out[id] = {
+      ok: ok,
+      types: types,
+      noise: noise,
+      mods: mods,
+      lo: freqs.length ? freqs[0] : 0,
+      hi: freqs.length ? freqs[freqs.length - 1] : 0,
+      dur: typeof dur === 'number' && isFinite(dur) ? dur : 0.2,
+      bus: def.bus, minInterval: def.minInterval, maxVoices: def.maxVoices,
+      trim: sfxGainTrim(id),
+    };
+  }
+  return out;
+}
+
+// The one-line description that goes on a button's face: what makes the sound, at what
+// pitch, for how long. All three come from audioTestProbe, i.e. from the code itself.
+function audioTestFace(p) {
+  if (!p) return '';
+  let voice = p.types.join('+');
+  if (p.noise) voice = voice ? voice + '+noise' : 'noise';
+  if (!voice) voice = 'silent?';
+  let pitch;
+  if (!p.lo) pitch = '—';
+  else if (Math.round(p.lo) === Math.round(p.hi)) pitch = Math.round(p.lo) + 'Hz';
+  else pitch = Math.round(p.lo) + '–' + Math.round(p.hi) + 'Hz';
+  // Modulators are counted, never averaged into the pitch: an LFO is a rate, not a note.
+  return voice + '  ' + pitch + '  ' + Math.round(p.dur * 1000) + 'ms' +
+         (p.mods ? '  +' + p.mods + 'mod' : '');
+}
 
 function audioTestMeasure(id) {
   // Render one sound offline and report peak level + a dominant-frequency estimate.
   // Zero-crossing rate is a crude estimator, but for these short, mostly single-oscillator
   // cues it is honest enough to sort a lane by -- and it is MEASURED, not a table someone
-  // has to keep in sync with the synthesis.
+  // has to keep in sync with the synthesis. Rendered PRE-master-chain, so the number is the
+  // cue's own level, not what the limiter leaves of it.
   const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
   const def = Sfx.defs[id];
   if (!OAC || !def) return Promise.resolve(null);
@@ -11980,7 +12446,7 @@ function audioTestMeasure(id) {
   dest.gain.value = sfxGainTrim(id);
   dest.connect(octx.destination);
   try { def.build(octx, dest, {}); } catch (e) { return Promise.resolve(null); }
-  return octx.startRendering().then(buf => {
+  return octx.startRendering().then(function (buf) {
     const d = buf.getChannelData(0);
     let peak = 0;
     for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > peak) peak = a; }
@@ -11997,13 +12463,14 @@ function audioTestMeasure(id) {
     }
     const hz = n > 1 ? (cross / 2) / (n / sr) : 0;
     return { id: id, peak: peak, db: 20 * Math.log10(peak), hz: hz };
-  }).catch(() => null);
+  }).catch(function () { return null; });
 }
 
 function initAudioTest() {
   const LANES = [
-    ['coins',  'COINS'], ['ui', 'UI'], ['fish', 'FISH'], ['food', 'FOOD'],
-    ['pets',   'PETS'],  ['aliens', 'ALIENS'], ['laser', 'LASER'], ['oyster', 'OYSTER'],
+    ['coins', 'COINS'], ['ui', 'UI'], ['fish', 'FISH'], ['food', 'FOOD'],
+    ['pets', 'PETS'], ['aliens', 'ALIENS'], ['laser', 'LASER'], ['oyster', 'OYSTER'],
+    ['fish-id', 'FISH · PER-SPECIES IDENTITY'], ['pet-id', 'PETS · PER-PET IDENTITY'],
   ];
   const css = document.createElement('style');
   css.textContent = [
@@ -12011,23 +12478,34 @@ function initAudioTest() {
     "  font:600 13px/1.4 'Trebuchet MS',system-ui,sans-serif;padding:10px 10px 60px;-webkit-overflow-scrolling:touch}",
     '#atRoot h1{font-size:15px;margin:0 0 8px;color:#E8A21A;letter-spacing:.06em}',
     '#atRoot h2{font-size:11px;margin:16px 0 6px;color:#7FC3E8;letter-spacing:.14em}',
+    '#atRoot p.atNote{font-size:11px;line-height:1.5;color:#8FA6B1;margin:4px 0 8px}',
     '#atUnlock{width:100%;min-height:52px;margin-bottom:10px;border:2px solid #E8A21A;border-radius:10px;',
     '  background:#2A2110;color:#E8A21A;font:800 15px sans-serif;letter-spacing:.1em}',
     '#atUnlock.on{border-color:#5FD0A0;color:#5FD0A0;background:#0d2a1f}',
+    '.atChain{display:flex;gap:6px;margin:6px 0}',
+    '.atChain button{flex:1;min-height:52px;border:1px solid #1B4055;border-radius:8px;background:#0C2837;',
+    '  color:#A3BAC4;font:800 12px sans-serif;letter-spacing:.06em;padding:4px}',
+    '.atChain button small{display:block;font:600 9px/1.3 ui-monospace,monospace;color:#5E7684;letter-spacing:0}',
+    '.atChain button.on{background:#12455F;border-color:#7FC3E8;color:#DFF3FF}',
+    '.atChain button.on small{color:#9FD2EC}',
     '.atCtl{display:flex;align-items:center;gap:8px;margin:6px 0}',
-    '.atCtl label{flex:0 0 108px;font-size:11px;color:#A3BAC4}',
+    '.atCtl label{flex:0 0 118px;font-size:11px;color:#A3BAC4}',
     '.atCtl input{flex:1;min-height:32px}',
-    '.atCtl b{flex:0 0 74px;text-align:right;font-family:ui-monospace,monospace;font-size:12px;color:#E8A21A}',
-    '.atGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px}',
+    '.atCtl b{flex:0 0 78px;text-align:right;font-family:ui-monospace,monospace;font-size:12px;color:#E8A21A}',
+    '.atGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(196px,1fr));gap:6px}',
     '.atCell{display:flex;gap:4px}',
-    '.atBtn{flex:1;min-height:46px;border:1px solid #1B4055;border-radius:8px;background:#0C2837;',
+    '.atBtn{flex:1;min-height:48px;border:1px solid #1B4055;border-radius:8px;background:#0C2837;',
     '  color:#E6EFF2;font:600 11px sans-serif;padding:4px 6px;text-align:left;overflow:hidden}',
     '.atBtn:active{background:#16455e}',
-    '.atBtn small{display:block;color:#748C97;font-size:10px;font-family:ui-monospace,monospace}',
-    '.atRep{flex:0 0 40px;min-height:46px;border:1px solid #1B4055;border-radius:8px;',
+    '.atBtn small{display:block;color:#748C97;font-size:10px;font-family:ui-monospace,monospace;white-space:nowrap}',
+    '.atBtn.deep{border-color:#8A3B4B}',
+    '.atBtn.deep small{color:#E2809A}',
+    '.atRep{flex:0 0 42px;min-height:48px;border:1px solid #1B4055;border-radius:8px;',
     '  background:#0a2231;color:#7FC3E8;font:700 11px sans-serif}',
     '.atWide{width:100%;min-height:48px;margin:6px 0;border:1px solid #7FC3E8;border-radius:8px;',
     '  background:#0B2A3A;color:#7FC3E8;font:800 13px sans-serif;letter-spacing:.08em}',
+    '#atRoot details{margin:6px 0}',
+    '#atRoot summary{font-size:11px;color:#7FC3E8;letter-spacing:.12em;padding:8px 2px;cursor:pointer}',
     '#atLog{font-family:ui-monospace,monospace;font-size:11px;color:#A8B85B;white-space:pre;',
     '  background:#051520;border-radius:6px;padding:8px;margin-top:8px;overflow-x:auto;min-height:40px}',
   ].join('');
@@ -12045,21 +12523,31 @@ function initAudioTest() {
   const root = document.createElement('div');
   root.id = 'atRoot';
   document.body.appendChild(root);
-  const el = (tag, cls, txt) => { const e = document.createElement(tag);
-    if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
+  const el = function (tag, cls, txt) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (txt != null) e.textContent = txt;
+    return e;
+  };
 
-  root.appendChild(el('h1', null, 'AQUA FRENZY · SOUND BOARD · build ' + GAME_BUILD));
+  const probe = audioTestProbe();
+  const ids = Object.keys(Sfx.defs);
+
+  root.appendChild(el('h1', null, 'AQUA FRENZY · SOUND BOARD · build ' + GAME_BUILD +
+    ' · ' + ids.length + ' cues'));
 
   // iOS will not start a context outside a real gesture, so the board opens locked and the
   // first button IS the gesture. Everything else stays inert until this is pressed.
   const unlock = el('button', null, 'TAP TO UNLOCK AUDIO');
   unlock.id = 'atUnlock';
-  unlock.onclick = () => {
+  unlock.onclick = function () {
     Snd.unlock(); Snd.resume();
-    setTimeout(() => {
+    setTimeout(function () {
       const ok = Snd.running();
-      unlock.textContent = ok ? 'AUDIO RUNNING — ctx ' + Snd.ctx.sampleRate + 'Hz' : 'STILL SUSPENDED — TAP AGAIN';
+      unlock.textContent = ok ? 'AUDIO RUNNING — ctx ' + Snd.ctx.sampleRate + 'Hz'
+                              : 'STILL SUSPENDED — TAP AGAIN';
       unlock.classList.toggle('on', ok);
+      repaint();
     }, 120);
   };
   root.appendChild(unlock);
@@ -12067,117 +12555,239 @@ function initAudioTest() {
   const log = el('div', null, 'ready.');
   log.id = 'atLog';
 
+  // ---- A/B/RAW: the whole output chain, switched globally, mid-audition ----
+  root.appendChild(el('h2', null, 'OUTPUT CHAIN — A / B'));
+  const chainRow = el('div', 'atChain');
+  const CHAINS = [
+    ['raw', 'RAW', 'pre-7F: master .26,\nno tone, no limiter,\nno duck, no detune'],
+    ['dry', 'DRY', 'shipping today:\nmaster .50 -> LP -> shelf\n-> limiter'],
+    ['wet', 'WET', 'proposed underwater:\nLP ' + SND_UW_LP_HZ + ' + 3-tap delay,\nthen the dry chain'],
+  ];
+  const chainBtns = {};
+  for (let i = 0; i < CHAINS.length; i++) {
+    const mode = CHAINS[i][0];
+    const b = el('button', null, CHAINS[i][1]);
+    b.appendChild(el('small', null, CHAINS[i][2]));
+    b.onclick = function () {
+      Snd.unlock();
+      const got = Snd.setChainMode(mode);
+      for (const k in chainBtns) chainBtns[k].classList.toggle('on', k === got);
+      repaint();
+      log.textContent = 'chain -> ' + got.toUpperCase() + '\n' + Snd.describeChain();
+    };
+    chainBtns[mode] = b;
+    chainRow.appendChild(b);
+  }
+  root.appendChild(chainRow);
+  root.appendChild(el('p', 'atNote',
+    'RAW is the chain as it was before build 56, restored for reference: it drops master back ' +
+    'to 0.26, bypasses the tone filters and the limiter, and turns off the systematic ducking ' +
+    'and the per-play detune. DRY is what ships right now. WET adds the proposed underwater ' +
+    'bus in front of the dry chain. No cue is retuned by any of the three.'));
+
   // ---- live output-chain controls ----
-  root.appendChild(el('h2', null, 'OUTPUT CHAIN — LIVE'));
-  const ctl = (label, min, max, step, get, set, fmt) => {
+  root.appendChild(el('h2', null, 'LIVE CONTROLS — AUDITION ONLY, SAVED NOWHERE'));
+  const painters = [];
+  const repaint = function () { for (let i = 0; i < painters.length; i++) painters[i](); };
+  const ctl = function (label, min, max, step, get, set, fmt) {
     const row = el('div', 'atCtl');
     row.appendChild(el('label', null, label));
     const i = document.createElement('input');
     i.type = 'range'; i.min = min; i.max = max; i.step = step;
     const out = el('b');
-    const paint = () => { out.textContent = fmt(get()); };
-    i.value = get();
-    i.oninput = () => { set(parseFloat(i.value)); paint(); };
+    const paint = function () { i.value = get(); out.textContent = fmt(get()); };
+    i.oninput = function () { set(parseFloat(i.value)); out.textContent = fmt(parseFloat(i.value)); };
     paint();
+    painters.push(paint);
     row.appendChild(i); row.appendChild(out);
     root.appendChild(row);
   };
+  // The four the brief asks for, first.
+  ctl('underwater cut', 400, 8000, 50,
+      function () { return Snd.uwLp ? Snd.uwLp.frequency.value : SND_UW_LP_HZ; },
+      function (v) { Snd.ensureWet(); if (Snd.uwLp) Snd.uwLp.frequency.value = v; },
+      function (v) { return Math.round(v) + ' Hz'; });
+  ctl('delay amount', 0, 1, 0.01,
+      function () { return Snd.uwWet ? Snd.uwWet.gain.value : SND_UW_WET; },
+      function (v) { Snd.ensureWet(); if (Snd.uwWet) Snd.uwWet.gain.value = v; },
+      function (v) { return v.toFixed(2); });
+  ctl('music bus', 0, 1.5, 0.01,
+      function () { return Snd.musicBus ? Snd.musicBus.gain.value : 0.8; },
+      function (v) { if (Snd.musicBus) Snd.musicBus.gain.value = v; },
+      function (v) { return v.toFixed(2); });
+  ctl('sfx bus', 0, 1.5, 0.01,
+      function () { return Snd.sfxBus ? Snd.sfxBus.gain.value / 0.68 : 1; },
+      function (v) {
+        // One control for both effect buses, each held at its own baseline ratio (0.68
+        // game / 0.70 UI) so moving it does not silently rebalance UI against gameplay.
+        if (Snd.sfxBus) Snd.sfxBus.gain.value = 0.68 * v;
+        if (Snd.uiBus) Snd.uiBus.gain.value = 0.70 * v;
+      },
+      function (v) { return v.toFixed(2) + '×'; });
+  // The master chain, kept from the first cut of this board — these are the numbers that
+  // ship, so they have to be reachable from the same screen.
   ctl('master', 0, 1, 0.01,
-      () => (Snd.master ? Snd.master.gain.value : SND_MASTER_GAIN),
-      v => { if (Snd.master) Snd.master.gain.value = v; },
-      v => v.toFixed(2));
-  ctl('lowpass Hz', 1000, 12000, 100,
-      () => (Snd.toneLp ? Snd.toneLp.frequency.value : SND_TONE_LP_HZ),
-      v => { if (Snd.toneLp) Snd.toneLp.frequency.value = v; },
-      v => Math.round(v) + ' Hz');
-  ctl('shelf dB', -12, 0, 0.5,
-      () => (Snd.toneShelf ? Snd.toneShelf.gain.value : SND_TONE_SHELF_DB),
-      v => { if (Snd.toneShelf) Snd.toneShelf.gain.value = v; },
-      v => v.toFixed(1) + ' dB');
+      function () { return Snd.master ? Snd.master.gain.value : SND_MASTER_GAIN; },
+      function (v) { if (Snd.master) Snd.master.gain.value = v; },
+      function (v) { return v.toFixed(2); });
+  ctl('tone lowpass', 1000, 12000, 100,
+      function () { return Snd.toneLp ? Snd.toneLp.frequency.value : SND_TONE_LP_HZ; },
+      function (v) { if (Snd.toneLp) Snd.toneLp.frequency.value = v; },
+      function (v) { return Math.round(v) + ' Hz'; });
+  ctl('tone shelf', -12, 0, 0.5,
+      function () { return Snd.toneShelf ? Snd.toneShelf.gain.value : SND_TONE_SHELF_DB; },
+      function (v) { if (Snd.toneShelf) Snd.toneShelf.gain.value = v; },
+      function (v) { return v.toFixed(1) + ' dB'; });
   ctl('limit thresh', -24, 0, 0.5,
-      () => (Snd.limiter ? Snd.limiter.threshold.value : -6),
-      v => { if (Snd.limiter) Snd.limiter.threshold.value = v; },
-      v => v.toFixed(1) + ' dB');
+      function () { return Snd.limiter ? Snd.limiter.threshold.value : -6; },
+      function (v) { if (Snd.limiter) Snd.limiter.threshold.value = v; },
+      function (v) { return v.toFixed(1) + ' dB'; });
+
+  // ---- music, so the music-bus slider and the ducking have something to act on ----
+  const mus = el('details');
+  mus.appendChild(el('summary', null, 'MUSIC BED — needed before the music slider means anything'));
+  const musGrid = el('div', 'atGrid');
+  const trackIds = Object.keys(Music.tracks);
+  for (let i = 0; i < trackIds.length; i++) {
+    const tid = trackIds[i];
+    const b = el('button', 'atBtn', tid);
+    b.onclick = function () {
+      Snd.unlock(); Music.play(tid, { crossfadeMs: 400 });
+      log.textContent = 'music -> ' + tid;
+    };
+    const cell = el('div', 'atCell'); cell.appendChild(b); musGrid.appendChild(cell);
+  }
+  const stopB = el('button', 'atBtn', 'STOP MUSIC');
+  stopB.onclick = function () { Music.stop(300); log.textContent = 'music stopped'; };
+  const stopCell = el('div', 'atCell'); stopCell.appendChild(stopB); musGrid.appendChild(stopCell);
+  mus.appendChild(musGrid);
+  root.appendChild(mus);
 
   // ---- whole-bank actions ----
   const stack = el('button', 'atWide', 'STACK TEST — a 3-alien wave in one frame');
-  stack.onclick = () => {
+  stack.onclick = function () {
     Snd.unlock();
     // What actually happens when a wave lands and the player is collecting: three alien
     // cues, a bite, two coins, a tick and a tap, all inside one frame. If the limiter is
     // doing its job this is loud but not distorted.
     const burst = ['alienSpawn_mite', 'alienSpawn_ravager', 'alienSpawn_streak', 'alienBite',
                    'coinGold', 'coinDiamond', 'coinFloorTick', 'uiTap', 'laserFire'];
-    for (const id of burst) if (Sfx.defs[id]) Sfx.play(id);
-    log.textContent = 'STACK: fired ' + burst.length + ' cues in one frame.\n' +
+    const anyKill = ids.filter(function (k) { return /^fish_[a-z]+_kill$/.test(k); })[0];
+    if (anyKill) burst.push(anyKill);
+    let fired = 0;
+    for (let i = 0; i < burst.length; i++) if (Sfx.defs[burst[i]]) { Sfx.play(burst[i]); fired++; }
+    log.textContent = 'STACK: fired ' + fired + ' cues in one frame, chain=' + Snd.chainMode + '.\n' +
       'Global cap is ' + Sfx.MAX_CONCURRENT + ', so some were refused by design.';
   };
   root.appendChild(stack);
 
   const measure = el('button', 'atWide', 'MEASURE ALL — offline render, peak + dominant Hz');
-  measure.onclick = async () => {
-    measure.textContent = 'MEASURING…';
-    const ids = Object.keys(Sfx.defs);
+  measure.onclick = async function () {
     const out = [];
-    for (const id of ids) { const r = await audioTestMeasure(id); if (r) out.push(r); }
-    out.sort((a, b) => b.hz - a.hz);
-    const pad = (s, n) => (String(s) + '                    ').slice(0, n);
-    log.textContent = pad('ID', 20) + pad('PEAK dBFS', 11) + 'DOMINANT Hz\n' +
-      out.map(r => pad(r.id, 20) + pad(r.db === -Infinity ? 'silent' : r.db.toFixed(1), 11) +
-                   Math.round(r.hz)).join('\n');
+    for (let i = 0; i < ids.length; i++) {
+      if ((i % 12) === 0) {
+        measure.textContent = 'MEASURING… ' + i + ' / ' + ids.length;
+        await new Promise(function (r) { setTimeout(r, 0); });   // let the label repaint
+      }
+      const r = await audioTestMeasure(ids[i]);
+      if (r) out.push(r);
+    }
+    out.sort(function (a, b) { return b.hz - a.hz; });
+    const pad = function (s, n) { return (String(s) + '                              ').slice(0, n); };
+    log.textContent = pad('ID', 26) + pad('PEAK dBFS', 11) + 'DOMINANT Hz\n' +
+      out.map(function (r) {
+        return pad(r.id, 26) + pad(r.db === -Infinity ? 'silent' : r.db.toFixed(1), 11) + Math.round(r.hz);
+      }).join('\n');
     measure.textContent = 'MEASURE ALL — ' + out.length + ' sounds';
   };
   root.appendChild(measure);
   root.appendChild(log);
 
+  // ---- one cue as a cell: face carries voice / pitch / duration, straight off the code ----
+  const makeCell = function (id, deep) {
+    const def = Sfx.defs[id], p = probe[id];
+    const cell = el('div', 'atCell');
+    const b = el('button', 'atBtn' + (deep ? ' deep' : ''));
+    b.appendChild(document.createTextNode(id));
+    b.appendChild(el('small', null, audioTestFace(p)));
+    b.onclick = function () {
+      Snd.unlock(); Sfx.play(id);
+      log.textContent = 'play  ' + id + '\n' + audioTestFace(p) +
+        '   trim ' + (p ? p.trim.toFixed(2) : '?') + '   bus ' + def.bus + '   chain ' + Snd.chainMode;
+    };
+    const rep = el('button', 'atRep', '×10');
+    // Fires at the sound's OWN minInterval plus a hair, so the anti-stack window does not
+    // silently swallow the repeats and hide the very fatigue we are testing for.
+    rep.onclick = function () {
+      Snd.unlock();
+      const gap = Math.max(60, def.minInterval * 1000 + 20);
+      let i = 0;
+      const tick = function () { if (i++ >= 10) return; Sfx.play(id); setTimeout(tick, gap); };
+      tick();
+      log.textContent = 'repeat ×10  ' + id + '  @' + Math.round(gap) + 'ms';
+    };
+    cell.appendChild(b); cell.appendChild(rep);
+    return cell;
+  };
+
+  // ---- LOW LANE AUDIBILITY: everything a phone driver probably cannot reproduce ----
+  // Sorted deepest first, each with the lowest frequency its build() actually schedules.
+  // Marked rows are under 200Hz, where an iPhone speaker has essentially no output.
+  const lowIds = ids.filter(function (id) { const p = probe[id]; return p && p.lo > 0 && p.lo < 500; })
+                    .sort(function (a, b) { return probe[a].lo - probe[b].lo; });
+  const under200 = lowIds.filter(function (id) { return probe[id].lo < 200; }).length;
+  root.appendChild(el('h2', null, 'LOW LANE AUDIBILITY  ·  ' + lowIds.length + ' under 500Hz, ' +
+    under200 + ' under 200Hz'));
+  root.appendChild(el('p', 'atNote',
+    'Every cue whose lowest scheduled oscillator frequency is under 500Hz, deepest first. ' +
+    'Play each one on the phone and mark the ones you cannot hear — that list is the input ' +
+    'to the re-voicing pass. Red-edged rows are under 200Hz.'));
+  const lowGrid = el('div', 'atGrid');
+  for (let i = 0; i < lowIds.length; i++) lowGrid.appendChild(makeCell(lowIds[i], probe[lowIds[i]].lo < 200));
+  root.appendChild(lowGrid);
+
   // ---- the bank, grouped by lane ----
   const seen = Object.create(null);
-  const addGroup = (key, title) => {
-    const ids = (Sfx.groups[key] || []).slice().sort();
-    if (!ids.length) return;
-    root.appendChild(el('h2', null, title + '  ·  ' + ids.length));
+  const addGroup = function (key, title) {
+    const g = (Sfx.groups[key] || []).slice().sort();
+    if (!g.length) return;
+    // Big groups (the 140 per-pet identity cues) open collapsed, or the board is unusable
+    // on a phone. Small ones stay open so nothing important hides behind a tap.
+    const box = el('details');
+    box.open = g.length <= 24;
+    box.appendChild(el('summary', null, title + '  ·  ' + g.length));
     const grid = el('div', 'atGrid');
-    for (const id of ids) {
-      seen[id] = 1;
-      const def = Sfx.defs[id];
-      const cell = el('div', 'atCell');
-      const b = el('button', 'atBtn');
-      b.appendChild(document.createTextNode(id));
-      b.appendChild(el('small', null, 'x' + def.maxVoices + '  ' + def.minInterval + 's  ' + def.bus));
-      b.onclick = () => { Snd.unlock(); Sfx.play(id); log.textContent = 'play  ' + id; };
-      const rep = el('button', 'atRep', '×10');
-      // Fires at the sound's OWN minInterval plus a hair, so the anti-stack window does not
-      // silently swallow the repeats and hide the very fatigue we are testing for.
-      rep.onclick = () => {
-        Snd.unlock();
-        const gap = Math.max(60, def.minInterval * 1000 + 20);
-        let i = 0;
-        const tick = () => { if (i++ >= 10) return; Sfx.play(id); setTimeout(tick, gap); };
-        tick();
-        log.textContent = 'repeat x10  ' + id + '  @' + Math.round(gap) + 'ms';
-      };
-      cell.appendChild(b); cell.appendChild(rep);
-      grid.appendChild(cell);
-    }
-    root.appendChild(grid);
+    for (let i = 0; i < g.length; i++) { seen[g[i]] = 1; grid.appendChild(makeCell(g[i], false)); }
+    box.appendChild(grid);
+    root.appendChild(box);
   };
-  for (const [k, t] of LANES) addGroup(k, t);
+  root.appendChild(el('h2', null, 'THE BANK — EVERY REGISTERED CUE'));
+  for (let i = 0; i < LANES.length; i++) addGroup(LANES[i][0], LANES[i][1]);
   // Anything registered under a category the list above does not name still gets a home,
   // so a sound added later cannot silently go missing from the bench.
-  const rest = Object.keys(Sfx.defs).filter(id => !seen[id]).sort();
+  const rest = ids.filter(function (id) { return !seen[id]; }).sort();
   if (rest.length) {
-    root.appendChild(el('h2', null, 'OTHER  ·  ' + rest.length));
+    const box = el('details');
+    box.open = rest.length <= 24;
+    box.appendChild(el('summary', null, 'UNCATEGORISED  ·  ' + rest.length));
     const grid = el('div', 'atGrid');
-    for (const id of rest) {
-      const cell = el('div', 'atCell');
-      const b = el('button', 'atBtn', id);
-      b.onclick = () => { Snd.unlock(); Sfx.play(id); log.textContent = 'play  ' + id; };
-      cell.appendChild(b); grid.appendChild(cell);
-    }
-    root.appendChild(grid);
+    for (let i = 0; i < rest.length; i++) grid.appendChild(makeCell(rest[i], false));
+    box.appendChild(grid);
+    root.appendChild(box);
   }
 
-  window.__audioTest = { measure: audioTestMeasure, ids: Object.keys(Sfx.defs) };
+  chainBtns[Snd.chainMode].classList.add('on');
+  log.textContent = ids.length + ' cues probed, ' + lowIds.length + ' of them under 500Hz.\n' +
+    'chain = ' + Snd.chainMode.toUpperCase() + ' (what ships). Tap RAW to hear the pre-7F chain.';
+
+  window.__audio = window.__audioTest = {
+    probe: probe,
+    measure: audioTestMeasure,
+    ids: ids,
+    low: lowIds,
+    face: audioTestFace,
+    chain: function (m) { return Snd.setChainMode(m); },
+  };
 }
 // ============ ART AUDIT (?audit=art, dev-only) ============
 
