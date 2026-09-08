@@ -721,7 +721,16 @@ const QS = new URLSearchParams(location.search);
 const BUILD_FLAGS = { dev: true, platform: 'web' };
 const SHOW_FPS = BUILD_FLAGS.dev && QS.get('fps') === '1';
 const SHOW_DBG = BUILD_FLAGS.dev && QS.get('debug') === '1';
-const GAME_BUILD = 46;
+// ?icon=1 (store-asset QA renderer, Phase native-1 plumbing): draws Sunfin-on-Coral-Shelf
+// straight to an offscreen canvas for icon/feature-graphic export. Gated exactly like
+// ?debug=1 / ?audition=1 — dead in any build with BUILD_FLAGS.dev=false. See initIconRender().
+const SHOW_ICON = BUILD_FLAGS.dev && QS.get('icon') === '1';
+// ?audit=art (art & state audit, Phase 7A): renders fish/alien/pet/map contact sheets so
+// every character, state and card can be inspected in one screenshot. Gated exactly like
+// ?icon=1 / ?debug=1 / ?audition=1 — dead in any build with BUILD_FLAGS.dev=false.
+// Diagnostic only: changes no gameplay, economy or balance. See initArtAudit().
+const SHOW_AUDIT = BUILD_FLAGS.dev && QS.get('audit') === 'art';
+const GAME_BUILD = 49;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -1927,9 +1936,16 @@ const Haptics = {
   heavy()  { this._fire('heavy'); },
   _fire(strength) {
     if (!Save.data || Save.data.haptics === false) return;
-    if (BUILD_FLAGS.platform !== 'web') {
-      // TODO(native): route to the platform haptics API, e.g. Capacitor's
-      // @capacitor/haptics ImpactStyle.Light/Medium/Heavy for these three strengths.
+    if (BUILD_FLAGS.platform !== 'web' && typeof Capacitor !== 'undefined' &&
+        Capacitor.isNativePlatform && Capacitor.isNativePlatform()) {
+      try {
+        const { Haptics: NativeHaptics, ImpactStyle } = Capacitor.Plugins;
+        const style = strength === 'light' ? ImpactStyle.Light
+                    : strength === 'heavy' ? ImpactStyle.Heavy
+                    : ImpactStyle.Medium;
+        NativeHaptics.impact({ style });
+      } catch (e) {}
+      return;
     }
     // web: intentionally nothing. (navigator.vibrate exists on some Android Chrome
     // builds, but it is a buzz, not a haptic, and out of scope for this pass.)
@@ -2223,7 +2239,7 @@ const TANK_SHOP = [
 // `act` is the per-frame behaviour; pets with no act yet are unlocked but inert.
 const PETS = [
   { id:'tuck',    name:'Tuck the Snail',           desc:'Crawls the tank floor and collects any coins you miss. Hides while aliens are in the tank.' },
-  { id:'barnaby', name:'Barnaby the Oyster',       desc:'Opens every 45 seconds and holds for 5, showing a $200 pearl. Tap it before he shuts.' },
+  { id:'barnaby', name:'Barnaby the Oyster',       desc:'Shuts his shell over any baby sunfin beside him when aliens arrive \u2014 two at a time, and you cannot feed them in there.' },
   { id:'quill',   name:'Quill the Needlefish',     desc:'Attacks any alien in the tank, roughly as hard as a level 1 laser.' },
   { id:'marigold',name:'Marigold the Nursefish',   desc:'Gives birth to a baby sunfin every 26 seconds. She will not breed during an alien attack.' },
   { id:'fennel',  name:'Fennel the Seahorse',      desc:'Spits a level 2 pellet at nearby hungry fish every 3 seconds — and it never counts against your food limit.' },
@@ -2235,7 +2251,7 @@ const PETS = [
   { id:'plod',    name:'Plod the Turtle',          desc:'Everything that falls in your tank falls at half speed.' },
   { id:'widget',  name:'Widget the Automaton',     desc:'Drops a bomb every 18 seconds. Worth $150 if you tap it — and it kills any fish it touches.' },
   { id:'beacon',  name:'Beacon the Angler',        desc:'Lures every sunfin to him during an attack \u2014 they will leave their food to come \u2014 and hides in the corner furthest from the aliens.' },
-  { id:'echo',    name:'Echo the Porpoise',        desc:'Unlocks every shop slot early, shows alien health bars, and flags fish before they starve.' },
+  { id:'echo',    name:'Echo the Porpoise',        desc:'Opens the laser and egg slots without making you buy a special fish first, and flags any fish that is about to starve.' },
   { id:'nettle',  name:'Nettle the Hermit Crab',   desc:'Snaps at any fish near the floor, pushing them back up where the coins fall slower.' },
   { id:'kite',    name:'Kite the Manta',           desc:'Bounces falling money back up before it reaches the floor.' },
   { id:'jolt',    name:'Jolt the Eel',             desc:'Charges up, then tap three times to electrocute the tank. Every sunfin dies and becomes a $200 diamond.' },
@@ -2253,7 +2269,7 @@ const PETS = [
   { id:'aurora',  name:'Aurora the Glowsquid',     desc:'Ripples with northern light. Fish fed inside her glow grow up a little faster.' },
   { id:'sleet',   name:'Sleet the Penguin',        desc:'Dives through the ice hole to peck the first alien of every attack before it takes a bite.' },
   { id:'lumen',   name:'Lumen the Lampeye',        desc:'Wears a star on her brow. Every 30 seconds it falls off, and your skimmers may have it.' },
-  { id:'sonar',   name:'Sonar the Barreleye',      desc:'Sees through the dark. Shows you where the next alien will warp in, ten seconds early.' },
+  { id:'sonar',   name:'Sonar the Barreleye',      desc:'Sees through the dark. Shows you where the next alien will warp in.' },
   { id:'nyx',     name:'Nyx the Vampire Squid',    desc:'Wraps each alien you kill in her cloak and squeezes one extra diamond out of it.' },
   { id:'grim',    name:'Grim the Gulper',          desc:'His mouth is bigger than he is. Once per attack he swallows an alien bite meant for your fish.' },
   { id:'sol',     name:'Sol the Sunstar',          desc:'The first sunrise the abyss has ever seen. Every coin in the tank drifts gently toward her.' },
@@ -2403,6 +2419,32 @@ const Storage = {
   set(k, v)     { try { return Promise.resolve(this._backend.setSync(k, v)); } catch (e) { return Promise.resolve(); } },
   remove(k)     { try { return Promise.resolve(this._backend.removeSync(k)); } catch (e) { return Promise.resolve(); } },
 };
+
+// ---- Native storage backend (Capacitor Preferences, native-1) ----
+// @capacitor/preferences has no synchronous bridge (every call crosses to native code
+// as a Promise), but every call site in this file uses the *Sync methods above. Rather
+// than rewrite those call sites (out of scope for a plumbing-only pass), this backend
+// keeps localStorage as the synchronous read-through cache it always was, and mirrors
+// every write into Preferences (SharedPreferences-backed, more durable than WebView
+// localStorage under storage pressure) fire-and-forget. Reads stay instant and
+// synchronous; the Preferences copy is what actually protects a save from a WebView
+// data wipe. Only installed when running inside the native shell -- web keeps the
+// plain localStorage backend above untouched. (The one-time SAVE_KEY/RUN_KEY hydration
+// from Preferences back into localStorage lives further down, once RUN_KEY exists.)
+if (typeof Capacitor !== 'undefined' && Capacitor.isNativePlatform && Capacitor.isNativePlatform()) {
+  const { Preferences } = Capacitor.Plugins;
+  Storage.useBackend({
+    getSync(k)    { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    setSync(k, v) {
+      try { localStorage.setItem(k, v); } catch (e) {}
+      try { Preferences.set({ key: k, value: v }); } catch (e) {}
+    },
+    removeSync(k) {
+      try { localStorage.removeItem(k); } catch (e) {}
+      try { Preferences.remove({ key: k }); } catch (e) {}
+    },
+  });
+}
 
 // ============ SAVE STATE ============
 const SAVE_KEY = 'aquaFrenzy.save.v1';
@@ -4902,7 +4944,10 @@ function spawnSpecial(kind, x, y) {
   f.pts = 0; f.need = randi(4, 5); f.regentPts = 0;
   f.dropT = d.every || 0;
   f.wag = rand(0, TAU); f.tint = d.hue + rand(-6, 6);
-  f.grow = 0; f.dying = 0; f.target = null; f.hidden = false;
+  // f.star must be reset like every other field: this is a recycled pool object, and a
+  // body that last belonged to a Starfin would otherwise come back gold. Same line as
+  // spawnSunfin, for the same reason.
+  f.grow = 0; f.dying = 0; f.target = null; f.hidden = false; f.star = false;
   f.shimmer = false; f.sparkT = rand(0, 2); f.eaten = false;
   return f;
 }
@@ -5032,6 +5077,17 @@ const PET_BEHAVIOR = {
   // Every row below is params only — no bucket gained a branch, a knob or a host hook
   // for any of them. The pets that could not clear that bar are in the 5B report.
 
+  // controller — an oyster's whole verb is CLOSING, and `hide` is the one existing effect
+  // that is unmistakably his. He is the tank-1 seed of what Gunther finishes in tank 3:
+  // babies only, two of them, and only what is ALREADY BESIDE HIM — `range` is the weakness
+  // Gunther has not got, and a shell that barely shifts cannot go and fetch. Deliberately
+  // NOT a producer dropping a prize on a timer: the tank's clam decor already shows a $200
+  // pearl every 45s on its own, so a pet doing nearly the same thing beside it would be
+  // more confusing than the line this replaces, not less.
+  barnaby:  { bucket: 'controller', params: { effect: 'hide', when: 'invasion',
+                                              kinds: ['sunfin'], stages: [0], cap: 2,
+                                              range: 220, mouthY: -4,
+                                              move: 'floorPatrol', moveSpeed: 8, floorGap: 8 } },
   // producer — "Drops a $35 gold coin every 6 seconds. He is already dead, so he never
   // needs feeding." FLAT: $35 is still $35 in tank 7, so he fades on his own.
   rattle:   { bucket: 'producer',   params: { interval: 6, what: 'coin', coinType: 'gold' } },
@@ -5205,6 +5261,10 @@ function alienBlinded(a) { return a.alive && a.dying <= 0 && a.grace > CFG.ALIEN
 function ctrlBlind(p, q, a) {
   if (!a || !a.alive || a.dying > 0) return false;
   if (p.marked >= (q.count || 1)) return false;
+  // Never spend a charge on an alien that is already blind. Invisible at count:1, but at
+  // count:2 the scan would find the SAME alien again next frame and burn the second mark
+  // on it — the allowance would go up and nothing else would go dark. (5B verification.)
+  if (alienBlinded(a)) return false;
   a.grace = Math.max(a.grace, q.duration === 'attack' ? Infinity : (q.duration || 12));
   p.marked++;
   puff(a.x, a.y, '#2b2440', 16, 110);
@@ -5216,7 +5276,7 @@ function ctrlBlindScan(p, q) {
   if (!ctrlGate(q) || p.marked >= (q.count || 1)) return;
   const reach = (q.range || 0) * S;
   for (const a of Aliens.live) {
-    if (!a.alive || a.dying > 0) continue;
+    if (!a.alive || a.dying > 0 || alienBlinded(a)) continue;
     if (reach && Math.hypot(a.x - p.x, a.y - p.y) > reach) continue;
     if (ctrlBlind(p, q, a)) return;
   }
@@ -5712,6 +5772,42 @@ const PET_ART = {
   // an alien never has: a ribcage, one huge claw, a spout, a lure on a stalk, a spiral
   // shell, eight arms, two tusks, a star. ----
 
+  // Oyster: two shells on the sand that CLOSE as the lure ramps, so the mechanic is the
+  // silhouette. Teal-and-pearl on purpose — the tank's clam decor is pink, and these two
+  // must never be mistaken for each other.
+  barnaby(g, p) {
+    // 18, not the 15 this started at: at 380px a 26px-wide shell read as a pebble, and a
+    // pet the player is told to watch has to be watchable.
+    const s = 18 * Math.max(S, 0.85);
+    // p.lit runs 0 (calm) -> 1 (aliens in the water), so the shell shuts exactly when it
+    // is sheltering. 26deg agape at rest, clamped shut under attack.
+    const gap = (1 - (p.lit || 0)) * 0.46 + 0.02;
+    g.save(); g.translate(p.x, p.y); g.scale(p.dir || 1, 1);
+    g.strokeStyle = '#123642'; g.lineWidth = Math.max(1.3, s * 0.09); g.lineJoin = 'round';
+    for (const sy of [-1, 1]) {                       // lower shell, then upper
+      g.save(); g.rotate(sy * gap);
+      g.fillStyle = sy > 0 ? '#2f7f8c' : '#3f9aa8';
+      g.beginPath(); g.ellipse(0, sy * s * 0.16, s * 1.02, s * 0.40, 0, 0, TAU);
+      g.fill(); g.stroke();
+      g.strokeStyle = 'rgba(220,248,255,.45)'; g.lineWidth = Math.max(1, s * 0.055);
+      for (let i = -2; i <= 2; i++) {                 // ribbing, so it reads as a shell
+        g.beginPath();
+        g.moveTo(i * s * 0.30, sy * s * 0.02);
+        g.lineTo(i * s * 0.36, sy * s * 0.48);
+        g.stroke();
+      }
+      g.strokeStyle = '#123642'; g.lineWidth = Math.max(1.3, s * 0.09);
+      g.restore();
+    }
+    // the pearl lining, visible only while he is open
+    if (gap > 0.16) {
+      g.globalAlpha = clamp((gap - 0.16) * 3.4, 0, 1);
+      g.fillStyle = '#f4fbff';
+      g.beginPath(); g.ellipse(0, 0, s * 0.62, s * 0.20, 0, 0, TAU); g.fill();
+      g.globalAlpha = 1;
+    }
+    g.restore();
+  },
   // Skeleton fish: the ribcage is the tell — nothing alive in the tank is see-through.
   rattle(g, p) {
     const s = 15 * Math.max(S, 0.85);
@@ -5765,8 +5861,11 @@ const PET_ART = {
   gunther(g, p) {
     const s = 20 * Math.max(S, 0.85), open = p.lit || 0;
     g.save(); g.translate(p.x, p.y); g.scale(p.dir || 1, 1);
-    g.fillStyle = '#4a6f92';
-    g.beginPath(); g.ellipse(0, 0, s * 1.25, s * 0.72, 0, 0, TAU); g.fill();
+    // Lighter than the water he swims in, with a hard outline: at 380px a blue whale on
+    // a blue tank simply disappeared.
+    g.fillStyle = '#6d97bd';
+    g.strokeStyle = '#152a3d'; g.lineWidth = Math.max(1.4, s * 0.09);
+    g.beginPath(); g.ellipse(0, 0, s * 1.25, s * 0.72, 0, 0, TAU); g.fill(); g.stroke();
     g.fillStyle = '#8fb4d2';                                                   // pale belly
     g.beginPath(); g.ellipse(0, s * 0.28, s * 1.05, s * 0.36, 0, 0, TAU); g.fill();
     g.fillStyle = '#3a5a78';                                                   // fluke
@@ -5889,12 +5988,14 @@ const PET_ART = {
   growler(g, p) {
     const s = 18 * Math.max(S, 0.85), lit = p.lit || 0;
     g.save(); g.translate(p.x, p.y); g.scale(p.dir || 1, 1);
-    g.fillStyle = '#8a6b56';
-    g.beginPath(); g.ellipse(0, 0, s * 1.12, s * 0.72, 0, 0, TAU); g.fill();
-    g.fillStyle = '#6d5241';                                                   // rear flipper
+    // The cave decor is brown too, so the original brown walrus vanished into it.
+    g.fillStyle = '#c2a184';
+    g.strokeStyle = '#43301f'; g.lineWidth = Math.max(1.4, s * 0.09);
+    g.beginPath(); g.ellipse(0, 0, s * 1.12, s * 0.72, 0, 0, TAU); g.fill(); g.stroke();
+    g.fillStyle = '#9b7c62';                                                   // rear flipper
     g.beginPath(); g.moveTo(-s * 1.02, s * 0.10); g.lineTo(-s * 1.62, -s * 0.30);
     g.lineTo(-s * 1.50, s * 0.52); g.fill();
-    g.fillStyle = '#a4826a';                                                   // muzzle
+    g.fillStyle = '#e0c8ad';                                                   // muzzle
     g.beginPath(); g.ellipse(s * 0.82, s * 0.20, s * 0.44, s * 0.34, 0, 0, TAU); g.fill();
     g.fillStyle = '#f4efe4';                                                   // tusks
     for (const sx of [-1, 1]) {
@@ -6399,6 +6500,26 @@ let loseArm = 0;
 // references (fish `target`, the Oyster's decor prop) are deliberately dropped — the
 // AI re-picks a target within a frame and Oyster.reset rebinds the prop.
 const RUN_KEY = 'aquaFrenzy.run.v1';
+
+// One-time hydration (native-1): if localStorage is empty for either save key (fresh
+// WebView data, e.g. after an Android-initiated storage clear) but Preferences still
+// has a copy, restore it into localStorage so the next getSync() call sees it. Async
+// by nature; harmless no-op in the far more common case where localStorage already
+// has the data. Lives here (not next to the backend registration above) because it
+// needs RUN_KEY, which isn't defined yet at that point in the file.
+if (typeof Capacitor !== 'undefined' && Capacitor.isNativePlatform && Capacitor.isNativePlatform()) {
+  (async () => {
+    try {
+      const { Preferences } = Capacitor.Plugins;
+      for (const k of [SAVE_KEY, RUN_KEY]) {
+        if (localStorage.getItem(k) != null) continue;
+        const { value } = await Preferences.get({ key: k });
+        if (value != null) localStorage.setItem(k, value);
+      }
+    } catch (e) {}
+  })();
+}
+
 const RunSave = {
   timer: 0,
 
@@ -7439,8 +7560,10 @@ function drawStatus(g) {
   let hid = 0;
   for (const f of Fishes.live) if (f.alive && f.hidden) hid++;
   if (hid && Pet.active) {
-    const p = Pet.active, r = Math.max(17, 27 * S);
-    g.globalAlpha = 0.26 + Math.sin(Game.time * 2.4) * 0.06;
+    // Big enough to ENCIRCLE the pet holding them — a bubble drawn inside the silhouette
+    // just washes the pet out, which is exactly what the first 380px shot showed.
+    const p = Pet.active, r = Math.max(30, 46 * S);
+    g.globalAlpha = 0.16 + Math.sin(Game.time * 2.4) * 0.05;
     g.fillStyle = '#9fe8ff';
     g.beginPath(); g.arc(p.x, p.y, r, 0, TAU); g.fill();
     g.globalAlpha = 0.9;
@@ -9002,6 +9125,25 @@ const Nav = {
 window.addEventListener('popstate', () => { Nav.onBack(); history.pushState({ aq:1 }, '', location.href); });
 history.pushState({ aq:1 }, '', location.href);
 window.__nav = Nav;   // headless-check hook
+
+// ---- Native App plugin wiring (Capacitor, native-1) ----
+// Adds the real hardware-back listener and app-state listener alongside the web
+// paths above (neither is removed -- this file still runs correctly as a plain web
+// page). Aliased to `CapApp` because the game's own lifecycle object above is also
+// named `App`; do not shadow it.
+if (typeof Capacitor !== 'undefined' && Capacitor.isNativePlatform && Capacitor.isNativePlatform()) {
+  const { App: CapApp } = Capacitor.Plugins;
+  CapApp.addListener('backButton', () => {
+    const result = Nav.onBack();
+    // Only the true dead-end (menu, nothing left to close) lets the hardware button
+    // fall through to its normal OS behavior (exit to background); every mapped
+    // transition above is swallowed because Nav.onBack() already handled it.
+    if (result === 'menu->noop') CapApp.exitApp();
+  });
+  CapApp.addListener('appStateChange', ({ isActive }) => {
+    if (isActive) App.onShow(); else App.onHide();
+  });
+}
 
 // ---- double-tap zoom / pinch-zoom guard (native-1) ----
 // `user-scalable=no` alone is ignored by some WebKit builds. Belt-and-braces: block
@@ -10838,8 +10980,13 @@ const Ads = {
     if (Game.state !== 'play') return;
     this._waveOn = true;
     const snap = { tag: ++this._scTag, lost0: Game.stat ? Game.stat.lost : 0, fish: [] };
+    // Restores are lossless. kind + stage alone silently downgraded a Starfin to a
+    // plain sunfin and reset its growth; MAX_REWARDED_PER_STAGE and
+    // SECOND_CHANCE_MAX_FISH are the levers that balance this feature, not fidelity.
     for (const f of Fishes.live)
-      if (f.alive && f.dying <= 0) snap.fish.push({ uid: f.uid, ref: f, kind: f.kind, stage: f.stage });
+      if (f.alive && f.dying <= 0)
+        snap.fish.push({ uid: f.uid, ref: f, kind: f.kind, stage: f.stage,
+                         star: !!f.star, pts: f.pts, need: f.need });
     this._sc = snap;
   },
   tick(dt) {
@@ -10884,13 +11031,29 @@ const Ads = {
   },
   _restoreFish(dead) {
     const A = CFG.ADS;
+    // Re-filter HERE, not at wave end. The ad runs for seconds, and Vesper revives in
+    // place -- same object, same uid, dying back to 0 -- so a fish that was dead when
+    // the card appeared can be swimming by the time the reward lands. Restoring it
+    // again spawns a duplicate. Same predicate _waveEnd uses, applied to the roster as
+    // it is NOW: restore only what is absent from Fishes.live, or present and dead.
+    const roster = new Map();
+    for (const f of Fishes.live) roster.set(f.uid, f);
+    const pending = dead.filter(s => {
+      const cur = roster.get(s.uid);
+      return !cur || !(cur.alive && cur.dying <= 0);
+    });
     let alive = Fishes.live.filter(f => f.alive && f.dying <= 0).length, n = 0;
-    for (const s of dead) {
+    for (const s of pending) {
       if (alive >= A.SECOND_CHANCE_MAX_FISH) break;
       const x = rand(W * 0.25, W * 0.75), y = TANK_TOP + TANK_H * rand(0.30, 0.60);
       let f;
       if (s.kind === 'sunfin') f = spawnSunfin(x, y, s.stage);
       else { f = spawnSpecial(s.kind, x, y); f.stage = s.stage; }
+      // Lossless: a Starfin comes back a Starfin, with its growth where it was. Both
+      // spawners randomise `need` and zero `pts`, so these must be reapplied after.
+      f.star = !!s.star;
+      if (s.pts  != null) f.pts  = s.pts;
+      if (s.need != null) f.need = s.need;
       f.hunger = CFG.HUNGER_MAX;
       // spawn sparkle
       puff(f.x, f.y, '#fff7c0', 14, 120);
@@ -10898,7 +11061,12 @@ const Ads = {
       alive++; n++;
     }
     if (n) { floatText(W / 2, TANK_TOP + 60, `${n} FISH RETURNED`, '#ffd35a'); Sfx.play('uiStar2'); }
-    this.log('reward_granted', { placement: AD_PLACEMENTS.SECOND_CHANCE, stage: this.stage(), restored: n });
+    // `restored` is the post-filter count -- what actually came back. `skipped` is what
+    // the grant-time re-filter dropped (revived while the ad played), which is the only
+    // evidence that the double-restore guard fired at all.
+    this.log('reward_granted', { placement: AD_PLACEMENTS.SECOND_CHANCE, stage: this.stage(),
+                                 restored: n, offered: dead.length,
+                                 skipped: dead.length - pending.length });
   },
 
   // ---- 3d EGG DISCOUNT: a "-25%" pill on the egg slot once a piece costs >= $50k.
@@ -11010,17 +11178,1124 @@ function runBootAudit() {
   return report;
 }
 
+// ============ ICON/STORE-ASSET RENDERER (?icon=1, dev-only) ============
+// Reuses drawTank() (Coral Shelf / Midnight Abyss water gradients) and drawFish()
+// (Sunfin) verbatim — no new art code. Draws to its own offscreen <canvas id="iconCanvas">
+// so the alpha-false game canvas is untouched; the QA harness reads iconCanvas via
+// toDataURL(). Query params: layer=full|fg|bg (default full), scene=icon|feature
+// (default icon), w=, h= (defaults 1024x1024, or 1024x500 for scene=feature).
+function initIconRender() {
+  $('startScreen').classList.add('hidden');
+  const layer = QS.get('layer') || 'full';
+  const scene = QS.get('scene') || 'icon';
+  const cw = Number(QS.get('w')) || (scene === 'feature' ? 1024 : 1024);
+  const ch = Number(QS.get('h')) || (scene === 'feature' ? 500 : 1024);
+
+  const ic = document.createElement('canvas');
+  ic.id = 'iconCanvas';
+  ic.width = cw; ic.height = ch;
+  ic.style.cssText = 'position:fixed;left:0;top:0;background:transparent;z-index:9999';
+  document.body.appendChild(ic);
+  const g = ic.getContext('2d', { alpha: true });
+
+  // Temporarily borrow the game's own layout globals so drawTank()/drawFish() (which
+  // read W/H/TANK_TOP/TANK_H/S/Game.tank directly) paint at icon resolution instead
+  // of the live phone-canvas size. Restored at the end — nothing else in the file
+  // observes this function running.
+  const save = { W, H, TANK_TOP, TANK_H, SAND_TOP, S, tank: Game.tank };
+  W = cw; H = ch; TANK_TOP = 0; TANK_H = ch; SAND_TOP = ch * 0.92; S = cw / 720;
+
+  function paintFish(gg, cx, cy, r, dir, angleTilt) {
+    const f = { x: cx, y: cy, dir, wag: 0.9, kind: 'sunfin', star: false, hunger: 0,
+                grow: 0, dying: 0, rOverride: r };
+    gg.save();
+    gg.translate(cx, cy); gg.rotate(angleTilt || 0); gg.translate(-cx, -cy);
+    drawFish(gg, f);
+    gg.restore();
+  }
+
+  if (scene === 'feature') {
+    Game.tank = THEMES.findIndex(t => t.name === 'Midnight Abyss');
+    seedDecor();
+    drawTank(g, 0);
+    // three-fish school + one alien silhouette, purely decorative/static (no sim tick)
+    paintFish(g, cw * 0.30, ch * 0.42, cw * 0.055, 1, -0.05);
+    paintFish(g, cw * 0.46, ch * 0.60, cw * 0.040, -1, 0.06);
+    paintFish(g, cw * 0.60, ch * 0.34, cw * 0.032, 1, -0.03);
+    g.save();
+    g.globalAlpha = 0.85; g.fillStyle = '#05070d';
+    g.beginPath();
+    g.ellipse(cw * 0.80, ch * 0.55, cw * 0.075, ch * 0.20, 0.2, 0, TAU);
+    g.fill();
+    g.restore();
+    // Wordmark, styled exactly per .title (Trebuchet MS 900, #ffd35a fill, #a05a10
+    // hard shadow, soft dark glow) — kept inside a 10% margin on every side.
+    g.save();
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.font = "900 " + Math.round(ch * 0.20) + "px 'Trebuchet MS', 'Segoe UI', system-ui, sans-serif";
+    if ('letterSpacing' in g) g.letterSpacing = Math.round(ch * 0.01) + 'px';
+    const tx = cw * 0.5, ty = ch * 0.5;
+    g.shadowColor = 'rgba(0,0,0,.6)'; g.shadowBlur = ch * 0.05; g.shadowOffsetY = ch * 0.02;
+    g.fillStyle = '#a05a10'; g.fillText('AQUA FRENZY', tx, ty + ch * 0.018);
+    g.shadowColor = 'transparent';
+    g.fillStyle = '#ffd35a'; g.fillText('AQUA FRENZY', tx, ty);
+    g.restore();
+  } else {
+    Game.tank = THEMES.findIndex(t => t.name === 'Coral Shelf');
+    seedDecor();
+    const cx = cw * 0.5, cy = ch * 0.5, r = Math.min(cw, ch) * (layer === 'fg' ? 0.30 : 0.34);
+    if (layer === 'bg') {
+      const th = THEMES[Game.tank];
+      const grad = g.createLinearGradient(0, 0, 0, ch);
+      grad.addColorStop(0, th.water[0]); grad.addColorStop(0.62, th.water[1]); grad.addColorStop(1, th.deep);
+      g.fillStyle = grad; g.fillRect(0, 0, cw, ch);
+    } else {
+      if (layer !== 'fg') drawTank(g, 0);
+      paintFish(g, cx, cy, r, 1, -0.12); // three-quarter-ish: slight tilt + long fin/bill readable from drawFish
+      if (layer !== 'fg') {
+        const vg = g.createRadialGradient(cx, cy, r * 0.6, cx, cy, Math.max(cw, ch) * 0.72);
+        vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,.55)');
+        g.fillStyle = vg; g.fillRect(0, 0, cw, ch);
+      }
+    }
+  }
+
+  W = save.W; H = save.H; TANK_TOP = save.TANK_TOP; TANK_H = save.TANK_H;
+  SAND_TOP = save.SAND_TOP; S = save.S; Game.tank = save.tank;
+  window.__iconReady = true;
+}
+
+
+// ============ ART AUDIT (?audit=art, dev-only) ============
+
+// ============ PHASE 7A — ART & STATE AUDIT HARNESS (?audit=art) ============
+// A DIAGNOSTIC route. It renders every character, state and card to contact sheets so a
+// whole class of art can be judged in one screenshot instead of by playing to it. It
+// changes no gameplay, no economy, no balance, and no art: every cell calls the SAME
+// draw function the game calls, so what you see here is what the tank draws.
+//
+// Three rules this harness lives by, each learned the hard way in this file:
+//
+//  1. It never runs the frame loop. frame() clamps dt above (0.05) but not below, so
+//     interleaving driven and real timestamps yields a NEGATIVE dt, which blows values
+//     up to +-1e21 and surfaces several layers away as "IndexSizeError: the radius
+//     provided is negative" out of a canvas arc. This harness is fully synchronous and
+//     never calls frame() at all.
+//  2. It pins Game.time to 0. Game.time carries a per-page-load offset that survives
+//     startLevel, so anything keyed to sin/cos(Game.time) -- the alien tentacle wobble,
+//     the shimmer wash, the hunger ring pulse -- would differ between two loads of the
+//     SAME build and make two sheets incomparable. Pinned, the sheet is reproducible.
+//  3. Cell size is FIXED and the column count reflows. Scaling a contact sheet down to
+//     380px would shrink the art to illegibility, which defeats the point; instead the
+//     grid wraps to fewer, taller columns and every sprite stays its true size at both
+//     phone and desktop width.
+//
+// Nothing in here mutates game state. Every fish, alien and pet drawn is a throwaway
+// literal; the live pools are never touched.
+
+const ArtAudit = {
+  cellW: 132,          // fixed: art is never scaled to fit the viewport
+  cellH: 136,
+  pad: 10,
+  warns: [],
+  rows: [],            // one row per audited item, for the console table
+  sheets: [],
+
+  // Report a machine finding. `code` is the stable check id, `id` the thing at fault.
+  warn(sheet, id, code, msg, data) {
+    this.warns.push({ sheet: sheet, id: id, code: code, msg: msg, data: data || null });
+  },
+  // Report an audited item and whether it passed, for the summary table.
+  row(sheet, id, detail, ok) {
+    this.rows.push({ sheet: sheet, id: id, detail: detail, ok: !!ok });
+  },
+};
+
+// The sheet width available to us. On a phone this is the real viewport; on desktop we
+// cap it so a sheet stays screenshot-able rather than becoming one enormous strip.
+function auditSheetWidth() {
+  return Math.max(360, Math.min(window.innerWidth - 8, 1280));
+}
+
+// Build one contact sheet. `items` is the list to render; drawCell(g, item, w, h, i) is
+// called with the origin translated to the cell's top-left and the cell already clipped,
+// so a sheet author cannot accidentally paint over a neighbour.
+function auditSheet(name, title, subtitle, items, drawCell, opt) {
+  opt = opt || {};
+  const cw = opt.cellW || ArtAudit.cellW;
+  const ch = opt.cellH || ArtAudit.cellH;
+  const avail = auditSheetWidth();
+  const cols = Math.max(1, Math.floor((avail - ArtAudit.pad * 2) / cw));
+  const rows = Math.ceil(items.length / cols);
+  const headH = subtitle ? 46 : 30;
+
+  const cv = document.createElement('canvas');
+  cv.width = ArtAudit.pad * 2 + cols * cw;
+  cv.height = headH + ArtAudit.pad + rows * ch + ArtAudit.pad;
+  cv.className = 'auditSheet';
+  cv.setAttribute('data-sheet', name);
+  const g = cv.getContext('2d');
+
+  g.fillStyle = '#0a0f16';
+  g.fillRect(0, 0, cv.width, cv.height);
+  g.font = "700 14px 'Trebuchet MS',sans-serif";
+  g.fillStyle = '#ffd35a'; g.textAlign = 'left'; g.textBaseline = 'alphabetic';
+  g.fillText(title, ArtAudit.pad, 20);
+  if (subtitle) {
+    g.font = "700 10px 'Trebuchet MS',sans-serif";
+    g.fillStyle = '#8fb4d0';
+    g.fillText(subtitle, ArtAudit.pad, 36);
+  }
+
+  for (let i = 0; i < items.length; i++) {
+    const cx = ArtAudit.pad + (i % cols) * cw;
+    const cy = headH + ArtAudit.pad + Math.floor(i / cols) * ch;
+    g.save();
+    g.beginPath(); g.rect(cx, cy, cw, ch); g.clip();
+    g.translate(cx, cy);
+    // cell chrome: a faint frame so the grid reads even where a sprite is tiny
+    g.strokeStyle = 'rgba(255,255,255,.07)'; g.lineWidth = 1;
+    g.strokeRect(0.5, 0.5, cw - 1, ch - 1);
+    try {
+      drawCell(g, items[i], cw, ch, i);
+    } catch (e) {
+      g.fillStyle = '#ff6a6a';
+      g.font = "700 9px 'Trebuchet MS',sans-serif";
+      g.textAlign = 'center';
+      g.fillText('DRAW THREW', cw / 2, ch / 2);
+      ArtAudit.warn(name, String(i), 'CELL_THREW', 'drawCell threw: ' + e.message);
+    }
+    g.restore();
+  }
+
+  ArtAudit.sheets.push({ name: name, canvas: cv, cols: cols, rows: rows, cells: items.length });
+  return cv;
+}
+
+// The id + state caption every cell carries, drawn at the cell's foot.
+function auditLabel(g, cw, ch, id, state, colour) {
+  g.font = "700 9px 'Trebuchet MS',sans-serif";
+  g.textAlign = 'center'; g.textBaseline = 'alphabetic';
+  g.fillStyle = colour || '#cfe4f5';
+  g.fillText(String(id).slice(0, 20), cw / 2, ch - 14);
+  if (state) {
+    g.fillStyle = '#8fb4d0';
+    g.fillText(String(state).slice(0, 22), cw / 2, ch - 4);
+  }
+}
+
+// The 1px bounding box the brief asks for around every sprite. Drawn on the half-pixel
+// so it is exactly one pixel wide rather than a 2px blur.
+function auditBBox(g, x, y, w, h, colour) {
+  g.save();
+  g.strokeStyle = colour || 'rgba(95,255,143,.85)';
+  g.lineWidth = 1;
+  g.strokeRect(Math.round(x) + 0.5, Math.round(y) + 0.5, Math.round(w), Math.round(h));
+  g.restore();
+}
+
+// Measure what a draw call ACTUALLY inked, by scanning alpha. measureText and a
+// function's nominal radius both lie -- this is ground truth, and it is what the
+// emblem geometry checks below are computed from.
+function auditInkBBox(g, x, y, w, h) {
+  const d = g.getImageData(x, y, w, h).data;
+  let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1, ink = 0;
+  for (let yy = 0; yy < h; yy++) {
+    for (let xx = 0; xx < w; xx++) {
+      if (d[(yy * w + xx) * 4 + 3] > 8) {
+        ink++;
+        if (xx < x0) x0 = xx; if (xx > x1) x1 = xx;
+        if (yy < y0) y0 = yy; if (yy > y1) y1 = yy;
+      }
+    }
+  }
+  if (x1 < 0) return null;
+  return { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1, ink: ink,
+           cx: (x0 + x1) / 2, cy: (y0 + y1) / 2 };
+}
+
+// Emblem geometry against a medallion of diameter D centred at (mcx,mcy) in the same
+// coordinate space as the bbox. Shared by the pet sheet; kept here because the three
+// thresholds are one rule, not three.
+const AUDIT_EMBLEM = { OFFSET_MAX: 0.04, FILL_LO: 0.55, FILL_HI: 0.85 };
+function auditEmblemGeom(bb, mcx, mcy, D) {
+  const offX = bb.cx - mcx, offY = bb.cy - mcy;
+  const off = Math.sqrt(offX * offX + offY * offY);
+  const fill = Math.max(bb.w, bb.h) / D;
+  // Worst-case reach from the medallion centre to a bbox corner: if that exceeds the
+  // radius the glyph's box leaves the circle.
+  const dx = Math.max(Math.abs(bb.x - mcx), Math.abs(bb.x + bb.w - mcx));
+  const dy = Math.max(Math.abs(bb.y - mcy), Math.abs(bb.y + bb.h - mcy));
+  const reach = Math.sqrt(dx * dx + dy * dy);
+  return {
+    offX: offX, offY: offY, off: off, offPct: off / D,
+    fill: fill, reach: reach,
+    badOffset: off > AUDIT_EMBLEM.OFFSET_MAX * D,
+    badOverflow: reach > D / 2,
+    badFill: fill < AUDIT_EMBLEM.FILL_LO || fill > AUDIT_EMBLEM.FILL_HI,
+  };
+}
+
+// ---- the plain-text summary table ----
+// Printed to console so a terminal screenshot carries the whole verdict. Padded columns,
+// one line per WARN, then a tally per check code.
+function auditPrintSummary() {
+  const pad = (s, n) => (String(s) + '                                             ').slice(0, n - 1) + ' ';
+  const L = [];
+  L.push('');
+  L.push('=================================================================================');
+  L.push(' AQUA FRENZY - ART & STATE AUDIT  (build ' + GAME_BUILD + ')');
+  L.push('=================================================================================');
+  L.push(' ' + pad('SHEET', 10) + pad('CELLS', 7) + pad('GRID', 12) + 'CANVAS');
+  L.push(' ' + '-'.repeat(78));
+  for (const s of ArtAudit.sheets) {
+    L.push(' ' + pad(s.name, 10) + pad(s.cells, 7) +
+           pad(s.cols + ' x ' + s.rows, 12) + s.canvas.width + ' x ' + s.canvas.height);
+  }
+  L.push('');
+  if (!ArtAudit.warns.length) {
+    L.push(' WARNINGS: none');
+  } else {
+    L.push(' WARNINGS (' + ArtAudit.warns.length + ')');
+    L.push(' ' + pad('SHEET', 8) + pad('ID', 20) + pad('CODE', 26) + 'DETAIL');
+    L.push(' ' + '-'.repeat(78));
+    for (const w of ArtAudit.warns) {
+      L.push(' ' + pad(w.sheet, 8) + pad(w.id, 20) + pad(w.code, 26) + w.msg);
+    }
+    L.push('');
+    const byCode = {};
+    for (const w of ArtAudit.warns) byCode[w.code] = (byCode[w.code] || 0) + 1;
+    L.push(' TALLY BY CHECK');
+    L.push(' ' + '-'.repeat(78));
+    for (const c of Object.keys(byCode).sort()) {
+      L.push(' ' + pad(c, 24) + byCode[c]);
+    }
+  }
+  L.push('');
+  L.push(' items audited: ' + ArtAudit.rows.length +
+         '   passed: ' + ArtAudit.rows.filter(r => r.ok).length +
+         '   flagged: ' + ArtAudit.rows.filter(r => !r.ok).length);
+  L.push('=================================================================================');
+  console.log(L.join('\n'));
+  return L.join('\n');
+}
+
+// ---- entry point ----
+// Called from the boot sequence INSTEAD of the game boot, in the same else-if chain the
+// ?icon=1 store-asset route uses. resize() has already run by then, so S / W / H / lw are
+// valid and every draw function behaves exactly as it does in the tank.
+function initArtAudit() {
+  // Pin time so two runs of the same build produce identical sheets (rule 2 above).
+  Game.time = 0;
+
+  // Hide every screen the boot may have left up, then mount our own container.
+  const screens = document.querySelectorAll('.screen, #startScreen, #mapScreen, #auditionScreen');
+  for (let i = 0; i < screens.length; i++) screens[i].classList.add('hidden');
+  const gameCv = document.getElementById('game');
+  if (gameCv) gameCv.style.display = 'none';
+
+  const host = document.createElement('div');
+  host.id = 'auditScreen';
+  host.style.cssText = 'position:fixed;inset:0;overflow:auto;background:#070b11;' +
+                       'z-index:9999;padding:6px;-webkit-overflow-scrolling:touch';
+  const head = document.createElement('div');
+  head.style.cssText = "color:#ffd35a;font:800 13px 'Trebuchet MS',sans-serif;padding:6px 4px";
+  head.textContent = 'ART & STATE AUDIT - build ' + GAME_BUILD + ' - ?audit=art';
+  host.appendChild(head);
+  document.body.appendChild(host);
+
+  // Each sheet is guarded: one broken renderer must not cost us the other three.
+  const SHEETS = [
+    ['fish',  typeof auditSheetFish  === 'function' ? auditSheetFish  : null],
+    ['alien', typeof auditSheetAlien === 'function' ? auditSheetAlien : null],
+    ['pet',   typeof auditSheetPet   === 'function' ? auditSheetPet   : null],
+    ['map',   typeof auditSheetMap   === 'function' ? auditSheetMap   : null],
+  ];
+  for (const pair of SHEETS) {
+    const name = pair[0], fn = pair[1];
+    if (!fn) {
+      ArtAudit.warn(name, '-', 'SHEET_MISSING', 'renderer auditSheet' +
+                    name.charAt(0).toUpperCase() + name.slice(1) + ' is not defined');
+      continue;
+    }
+    try {
+      const cv = fn();
+      if (cv) {
+        cv.style.cssText = 'display:block;margin:0 auto 14px;max-width:100%;height:auto';
+        host.appendChild(cv);
+      }
+    } catch (e) {
+      ArtAudit.warn(name, '-', 'SHEET_THREW', 'renderer threw: ' + e.message);
+      console.error('[audit] sheet ' + name + ' threw', e);
+    }
+  }
+
+  const text = auditPrintSummary();
+  window.__audit = {
+    build: GAME_BUILD,
+    generated: 'deterministic (Game.time pinned to 0)',
+    sheets: ArtAudit.sheets.map(s => ({ name: s.name, cells: s.cells,
+                                        cols: s.cols, rows: s.rows,
+                                        w: s.canvas.width, h: s.canvas.height })),
+    warns: ArtAudit.warns,
+    rows: ArtAudit.rows,
+    counts: {
+      audited: ArtAudit.rows.length,
+      passed: ArtAudit.rows.filter(r => r.ok).length,
+      flagged: ArtAudit.rows.filter(r => !r.ok).length,
+      warns: ArtAudit.warns.length,
+    },
+    summaryText: text,
+    // Published so the near-duplicate reporting cut can be retuned against evidence.
+    closestEmblemPairs: ArtAudit.closestEmblemPairs || null,
+  };
+  return window.__audit;
+}
+
+// ---- FISH SHEET ----
+// Every species and growth stage against every visual state drawFish can actually
+// produce, both facings, each sprite boxed by its real inked bounds.
+//
+// THREE OF THE ELEVEN STATES IN THE BRIEF DO NOT EXIST AS FISH STATE, and the sheet says
+// so in the cell rather than quietly omitting it -- a missing cell is exactly the failure
+// a contact sheet exists to prevent:
+//   * carrying-coin -- a carried coin is not a fish field. Coins are their own pool
+//     entity drawn by drawCoin(); a fish never renders one. The cell shows the coin the
+//     fish DROPS, beside the fish, and is labelled as a composite, not a fish state.
+//   * pet-buffed   -- no per-fish buff art exists. drawStatus (the overlay pass) has
+//     exactly one fish-facing branch: it counts f.hidden fish and draws ONE shelter
+//     bubble on the PET, not on any fish. So a buffed fish is drawn identically to an
+//     unbuffed one.
+//   * being-eaten  -- there is no eaten field and no eaten pose. A fish that is eaten is
+//     removed from the pool; the only death visual is f.dying, which is its own column.
+//
+// Determinism: wag is pinned to 0.6 (the shipped portrait value) rather than left on the
+// sim's accumulating phase, and Game.time is 0, so the sheet is byte-reproducible.
+
+// The state table. `f` is merged over the portrait default; `na` marks a state the game
+// does not model, with the reason shown in the cell.
+const AUDIT_FISH_STATES = [
+  { key: 'fed',      lbl: 'fed',            f: { hunger: 31 } },
+  { key: 'hungry',   lbl: 'hungry',         f: { hunger: 13.5 } },
+  { key: 'starving', lbl: 'starving',       f: { hunger: 2.5 } },
+  { key: 'dying',    lbl: 'dying .55',      f: { dying: 0.55 } },
+  { key: 'shimmer',  lbl: 'shimmer',        f: { shimmer: true } },
+  { key: 'grow',     lbl: 'grow-pop',       f: { grow: 0.5 } },
+  { key: 'flip',     lbl: 'facing left',    f: { dir: -1 } },
+  { key: 'coin',     lbl: 'drops a coin',   f: {}, composite: 'coin' },
+  { key: 'buff',     lbl: 'pet-buffed',     na: 'no per-fish buff art exists' },
+  { key: 'eaten',    lbl: 'being eaten',    na: 'no eaten field or pose' },
+];
+
+// Every species/stage combination the game can put on screen.
+function auditFishVariants() {
+  const v = [];
+  for (let s = 0; s <= 3; s++) v.push({ kind: 'sunfin', stage: s, id: 'sunfin s' + s });
+  v.push({ kind: 'sunfin', stage: 2, star: true, id: 'starfin' });
+  v.push({ kind: 'brood', stage: 0, id: 'brood s0' });
+  v.push({ kind: 'brood', stage: 1, id: 'brood s1' });
+  for (const k of ['ripper', 'skimmer', 'grinder', 'picker', 'dread']) {
+    v.push({ kind: k, stage: 0, id: k });
+  }
+  return v;
+}
+
+// The nominal radius fishR would compute, minus the world scale S -- so the sheet can
+// size a cell by the fish's REAL size rather than a constant. fishR itself is unusable
+// here: it multiplies by S, and it throws outright for any kind missing from FISH.
+function auditFishNominalR(kind, stage) {
+  if (kind === 'sunfin') return CFG.SUNFIN_R[stage] || CFG.SUNFIN_R[0];
+  const d = FISH[kind];
+  if (!d) return 40;
+  return d.r * (kind === 'brood' && stage ? 1.25 : 1);
+}
+
+// Largest nominal radius on the sheet, so everything can be normalised against it once.
+let AUDIT_FISH_RMAX = 0;
+function auditFishCellR(v, box) {
+  if (!AUDIT_FISH_RMAX) {
+    for (const x of auditFishVariants()) {
+      const n = auditFishNominalR(x.kind, x.stage);
+      if (n > AUDIT_FISH_RMAX) AUDIT_FISH_RMAX = n;
+    }
+  }
+  // 0.30 of the cell for the biggest fish; everything else in true proportion to it. The
+  // hunger ring is drawn at r*1.35, so the largest still clears the cell edge.
+  return box * 0.30 * (auditFishNominalR(v.kind, v.stage) / AUDIT_FISH_RMAX);
+}
+
+function auditSheetFish() {
+  const variants = auditFishVariants();
+
+  // The approved-tint check. drawFish derives a body colour three ways and no other way:
+  //   star -> a fixed gold, bypassing starveShift entirely
+  //   feeds (sunfin/brood) -> starveShift(FISH_LOOK[kind].body, t)
+  //   everything else -> FISH_LOOK[kind].body verbatim
+  // So a tint can only go off-table if a species is MISSING from FISH_LOOK and silently
+  // takes the `|| FISH_LOOK.sunfin` fallback at line 2737 -- which would paint, say, a
+  // Dreadfin in Sunfin gold and look like art, not like a bug. That is what this catches.
+  // The shimmer wash is deliberately NOT checked: it is an hsla cycling on Game.time,
+  // pinned to one phase here, and it is an overlay on top of the body rather than the
+  // body tint itself.
+  for (const k of Object.keys(FISH)) {
+    if (!FISH_LOOK[k]) {
+      ArtAudit.warn('fish', k, 'TINT_OFF_TABLE',
+        'species has no FISH_LOOK entry - falls back to Sunfin colours and renders as the wrong fish');
+    }
+  }
+  if (!FISH_LOOK.sunfin) {
+    ArtAudit.warn('fish', 'sunfin', 'TINT_OFF_TABLE', 'FISH_LOOK.sunfin missing - the fallback itself is broken');
+  }
+
+  const items = [];
+  for (const v of variants) for (const st of AUDIT_FISH_STATES) items.push({ v: v, st: st });
+
+  return auditSheet('fish', 'FISH SHEET - ' + variants.length + ' species/stages x ' +
+      AUDIT_FISH_STATES.length + ' states',
+    'sizes are TRUE relative radii (fishR without S) - wag pinned 0.6, Game.time 0 - 3 briefed states do not exist in the game',
+    items,
+    function (g, it, cw, ch) {
+      const v = it.v, st = it.st;
+      const cx = cw / 2, cy = ch / 2 - 10;
+
+      if (st.na) {
+        g.strokeStyle = 'rgba(255,255,255,.10)'; g.lineWidth = 1;
+        g.beginPath(); g.moveTo(10, 12); g.lineTo(cw - 10, ch - 34); g.stroke();
+        g.beginPath(); g.moveTo(cw - 10, 12); g.lineTo(10, ch - 34); g.stroke();
+        g.fillStyle = '#ffb86a'; g.font = "700 9px 'Trebuchet MS',sans-serif";
+        g.textAlign = 'center';
+        g.fillText('N/A', cx, cy - 4);
+        const words = st.na.split(' ');
+        let line = '', ln = 0;
+        g.fillStyle = '#8fb4d0'; g.font = "700 8px 'Trebuchet MS',sans-serif";
+        for (const w of words) {
+          if ((line + ' ' + w).length > 20) { g.fillText(line, cx, cy + 8 + ln * 9); line = w; ln++; }
+          else line = line ? line + ' ' + w : w;
+        }
+        if (line) g.fillText(line, cx, cy + 8 + ln * 9);
+        auditLabel(g, cw, ch, v.id, st.lbl, '#ffb86a');
+        ArtAudit.row('fish', v.id + '/' + st.key, 'N/A - ' + st.na, true);
+        return;
+      }
+
+      // Portrait defaults, then the variant, then the state. rOverride keeps fishR (and
+      // therefore S and CFG.SUNFIN_R) out of it entirely, so the cell size is ours.
+      const r = auditFishCellR(v, Math.min(cw, ch - 34));
+      const f = Object.assign({
+        x: 0, y: 0, dir: 1, kind: 'sunfin', stage: 2, wag: 0.6,
+        hunger: CFG.HUNGER_MAX, grow: 0, dying: 0, star: false, shimmer: false,
+        // tint seeds the shimmer wash hue ((Game.time*55 + f.tint*5) % 360). The
+        // sim randomises it per fish; pinned here so the column is reproducible.
+        tint: 30,
+        rOverride: r,
+      }, { kind: v.kind, stage: v.stage, star: !!v.star }, st.f || {});
+
+      g.save();
+      g.translate(cx, cy);
+      drawFish(g, f);
+      g.restore();
+      // drawFish leaves strokeStyle/lineWidth dirty when the hunger ring fires; the cell
+      // is restored by auditSheet's save/restore, but reset here so our own label is clean.
+      g.lineWidth = 1;
+
+      if (st.composite === 'coin') {
+        // The coin this species DROPS, drawn beside it. This is a composite the game never
+        // renders as one sprite -- a fish and its coin are two entities.
+        const drop = (FISH[v.kind] && FISH[v.kind].drop) || null;
+        if (drop && COIN_STYLE[drop]) {
+          try {
+            g.save(); g.translate(cx + r * 1.15, cy + r * 0.75);
+            drawCoin(g, { x: 0, y: 0, type: drop, scale: 0.75, spin: 0,
+                          lucky: false, shimmer: false, rest: true });
+            g.restore();
+          } catch (e) { /* a coin style the drawer cannot render is not a fish finding */ }
+        }
+      }
+
+      const bb = auditInkBBox(g, 0, 0, cw, ch - 26);
+      if (bb) auditBBox(g, bb.x, bb.y, bb.w, bb.h);
+      auditLabel(g, cw, ch, v.id, st.lbl);
+      ArtAudit.row('fish', v.id + '/' + st.key, st.lbl, true);
+    },
+    { cellW: 118, cellH: 128 });
+}
+
+// ---- ALIEN SHEET ----
+// All seven aliens across every frame drawAlien can actually produce, plus the INCOMING
+// banner's silhouette stamp shown twice: once over the banner's real backdrop (the way a
+// player sees it) and once over mid-grey (which isolates SHAPE from CONTRAST).
+//
+// Two things this sheet exists to make undeniable, both verified by pixel measurement:
+//
+//  * There is no attack pose. drawAlien reads only kind/rOverride/x/y/dying/hurt/phase/
+//    wob/hp/maxHp/hpGhost -- nothing about eating. An alien mid-bite is drawn identically
+//    to an idle one. The "action" column below is therefore the hurt flash, which is the
+//    only per-frame state the drawer actually has, and it is labelled as such rather than
+//    dressed up as an attack frame the game does not own.
+//  * Six of the seven banner silhouettes are byte-identical. drawAlien draws ONE body for
+//    every kind (six tentacles at fixed angles, one ellipse, one eye, five teeth); the only
+//    per-kind variation is d.col and d.r. alienSil destroys both -- source-in flattens
+//    colour to #2a0008, and rOverride forces one radius -- so mite, ravager, lurker,
+//    streak, sentry and splitjaw all reduce to the same 992-ink-pixel stamp. Bloat differs
+//    only because laserProof adds a ring.
+
+// The banner's own numbers, read from drawWarning(): bh = clamp(H*0.10, 42, 74) and the
+// stamp is ss = bh*0.92. Recomputed here from the live H so the sheet shows the size the
+// player actually gets on THIS viewport, not a guess.
+function auditAlienStampSize() {
+  const bh = clamp(H * 0.10, 42, 74);
+  return Math.round(bh * 0.92);
+}
+
+// The banner backdrop, composited the way drawWarning does it: rgba(120,0,0,.75) laid
+// over the tank at the banner's pulsing globalAlpha. glowP runs 0.20..0.90; we show peak
+// glow, which is the BEST case for legibility -- it only gets worse from here.
+const AUDIT_BANNER_TANK = [35, 90, 140];
+function auditBannerFill(glow) {
+  const a = 0.75 * glow;
+  const c = [0, 1, 2].map(i => Math.round(120 * (i === 0 ? 1 : 0) * a + AUDIT_BANNER_TANK[i] * (1 - a)));
+  return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')';
+}
+
+// WCAG relative luminance + contrast ratio, so the sheet can state a number rather than
+// an opinion. 3:1 is the WCAG 2.2 floor for a non-text graphical object.
+function auditRelLum(r, g, b) {
+  const f = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+  return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+}
+function auditContrast(rgbA, rgbB) {
+  const a = auditRelLum(rgbA[0], rgbA[1], rgbA[2]);
+  const b = auditRelLum(rgbB[0], rgbB[1], rgbB[2]);
+  const hi = Math.max(a, b), lo = Math.min(a, b);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+function auditSheetAlien() {
+  const kinds = Object.keys(ALIENS);
+  const ss = auditAlienStampSize();
+
+  // Fingerprint every silhouette first, so the sheet can label identical ones as identical
+  // rather than leaving a reader to eyeball 7 near-black shapes.
+  const fp = {};
+  const scratch = document.createElement('canvas');
+  scratch.width = scratch.height = ss;
+  const sg = scratch.getContext('2d', { willReadFrequently: true });
+  for (const k of kinds) {
+    sg.clearRect(0, 0, ss, ss);
+    sg.drawImage(alienSil(k, ss), 0, 0);
+    const d = sg.getImageData(0, 0, ss, ss).data;
+    let ink = 0, x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1;
+    for (let y = 0; y < ss; y++) {
+      for (let x = 0; x < ss; x++) {
+        if (d[(y * ss + x) * 4 + 3] > 16) {
+          ink++;
+          if (x < x0) x0 = x; if (x > x1) x1 = x;
+          if (y < y0) y0 = y; if (y > y1) y1 = y;
+        }
+      }
+    }
+    fp[k] = ink + ':' + x0 + ',' + y0 + ',' + (x1 - x0) + ',' + (y1 - y0);
+  }
+  // Group kinds by identical fingerprint.
+  const groups = {};
+  for (const k of kinds) (groups[fp[k]] = groups[fp[k]] || []).push(k);
+  for (const sig of Object.keys(groups)) {
+    const g2 = groups[sig];
+    if (g2.length > 1) {
+      ArtAudit.warn('alien', g2.join('+'), 'SILHOUETTE_IDENTICAL',
+        g2.length + ' aliens share a pixel-identical banner silhouette (' +
+        g2.join(', ') + ') - the INCOMING banner cannot distinguish them',
+        { ink: sig.split(':')[0], kinds: g2 });
+    }
+  }
+
+  // Contrast of the stamp fill against the banner at its most legible moment.
+  const peak = auditBannerFill(0.90);
+  const pm = peak.match(/\d+/g).map(Number);
+  const cr = auditContrast([42, 0, 8], pm);
+  if (cr < 3) {
+    ArtAudit.warn('alien', 'banner', 'SILHOUETTE_CONTRAST',
+      'stamp #2a0008 on the banner is ' + cr.toFixed(2) + ':1 at PEAK glow (WCAG floor 3:1)',
+      { ratio: +cr.toFixed(2), backdrop: peak });
+  }
+
+  // Columns: the frames drawAlien can genuinely produce, then the two silhouette views.
+  const MODES = ['idle', 'hurt', 'phase', 'dying', 'sil/banner', 'sil/grey'];
+  const items = [];
+  for (const k of kinds) for (const m of MODES) items.push({ kind: k, mode: m });
+
+  return auditSheet('alien', 'ALIEN SHEET - 7 aliens x ' + MODES.length + ' frames',
+    'stamp ' + ss + 'px - drawAlien has NO bite pose (no eat field is read); "hurt" is the only action frame it owns',
+    items,
+    function (g, it, cw, ch) {
+      const k = it.kind, d = ALIENS[k];
+      const cx = cw / 2, cy = ch / 2 - 8;
+      const r = Math.min(cw, ch - 30) * 0.30;
+
+      if (it.mode === 'sil/banner' || it.mode === 'sil/grey') {
+        const box = Math.min(cw - 16, ch - 40);
+        const bx = cx - box / 2, by = cy - box / 2;
+        if (it.mode === 'sil/banner') {
+          g.fillStyle = auditBannerFill(0.90);
+          g.fillRect(bx, by, box, box);
+          g.strokeStyle = '#ff5a5a'; g.lineWidth = 1.5;
+          g.strokeRect(bx, by, box, box);
+        } else {
+          g.fillStyle = '#8a8a8a';
+          g.fillRect(bx, by, box, box);
+        }
+        const sz = Math.min(box - 6, ss);
+        g.drawImage(alienSil(k, ss), cx - sz / 2, cy - sz / 2, sz, sz);
+        auditBBox(g, cx - sz / 2, cy - sz / 2, sz, sz, 'rgba(95,255,143,.5)');
+        const dupe = groups[fp[k]].length > 1;
+        auditLabel(g, cw, ch, k, it.mode === 'sil/banner' ? cr.toFixed(2) + ':1 vs banner'
+                                                          : (dupe ? 'IDENTICAL x' + groups[fp[k]].length : 'unique'),
+                   dupe && it.mode === 'sil/grey' ? '#ff8f8f' : null);
+        ArtAudit.row('alien', k + '/' + it.mode, dupe ? 'shared silhouette' : 'unique', !dupe);
+        return;
+      }
+
+      // A throwaway alien literal. maxHp 0 marks a portrait, which suppresses the health
+      // bar (drawAlien's own convention); nothing here touches Aliens.live.
+      const a = { kind: k, x: cx, y: cy, hp: 0, maxHp: 0, hpGhost: 0,
+                  dying: 0, hurt: 0, wob: 1.3, phase: 0, rOverride: r };
+      let note = '';
+      if (it.mode === 'hurt')  { a.hurt = 1; note = 'hit flash (white)'; }
+      if (it.mode === 'dying') { a.dying = 0.55; note = 'death fade+scale'; }
+      if (it.mode === 'phase') {
+        if (d.phases) { a.phase = 1; note = 'vulnerable phase'; }
+        else { note = 'N/A - no phases'; }
+      }
+      if (it.mode === 'idle') note = 'r=' + d.r + ' hp=' + d.hp;
+
+      if (it.mode === 'phase' && !d.phases) {
+        g.fillStyle = 'rgba(255,255,255,.10)';
+        g.font = "700 10px 'Trebuchet MS',sans-serif"; g.textAlign = 'center';
+        g.fillText('N/A', cx, cy);
+      } else {
+        drawAlien(g, a);
+        const bb = auditInkBBox(g, 0, 0, cw, ch - 26);
+        if (bb) auditBBox(g, bb.x, bb.y, bb.w, bb.h);
+      }
+      auditLabel(g, cw, ch, k, note);
+      ArtAudit.row('alien', k + '/' + it.mode, note, true);
+    },
+    { cellW: 128, cellH: 140 });
+}
+
+// ---- PET SHEET ----
+// All 35 pets: the in-tank sprite the tank actually draws, beside the reward medallion
+// with its circle, centre crosshair and the emblem's measured bounding box.
+//
+// The medallion numbers are read straight off drawPetPortrait() -- a 192x192 canvas,
+// translate(96,96), arc(0,0,86) and fillText(emblem, 0, 6) in '96px serif'. Every emblem
+// is MEASURED at that true size on its own offscreen canvas and only then scaled into the
+// cell for display, so the offsets and fill ratios below are the real ones rather than
+// cell-relative fictions.
+//
+// That y+6 in the shipped code is a hand-added nudge fighting the fact that
+// textBaseline='middle' does not vertically centre an emoji -- most glyphs render high of
+// the nominal centre, so +6 pulls them back. It is right for the 34 glyphs that sit high
+// and actively wrong for the one that sits low.
+const AUDIT_MEDALLION = { CANVAS: 192, CX: 96, CY: 96, R: 86, D: 172, DY: 6, FONT: '96px serif' };
+
+// Perceptual near-duplicate threshold. The 595 emblem pairs span a shape distance of
+// roughly 0.16 to 0.63 with no natural gap, so there is no threshold that cleanly splits
+// "same" from "different" -- this value is a REPORTING cut, deliberately low, chosen to
+// surface only the handful of tightest pairs for a human to judge. The computed distances
+// for the closest pairs go into the report so it can be retuned against evidence.
+const AUDIT_EMBLEM_NEAR = 0.20;
+
+// Render one emblem at true medallion size and measure what it actually inked.
+function auditMeasureEmblem(glyph) {
+  const M = AUDIT_MEDALLION;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = M.CANVAS;
+  const g = cv.getContext('2d', { willReadFrequently: true });
+  g.font = M.FONT; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(glyph, M.CX, M.CY + M.DY);
+  const bb = auditInkBBox(g, 0, 0, M.CANVAS, M.CANVAS);
+  return { canvas: cv, bb: bb };
+}
+
+// A small scale-normalised grayscale signature, cropped to the glyph's own ink so shape
+// is compared independently of how much of the em box a glyph happens to fill.
+function auditEmblemSignature(cv, bb) {
+  const N = 16;
+  const s = document.createElement('canvas');
+  s.width = s.height = N;
+  const sg = s.getContext('2d', { willReadFrequently: true });
+  sg.drawImage(cv, bb.x, bb.y, bb.w, bb.h, 0, 0, N, N);
+  const p = sg.getImageData(0, 0, N, N).data;
+  const out = [];
+  for (let i = 0; i < N * N; i++) {
+    const a = p[i * 4 + 3] / 255;
+    out.push(a * (0.299 * p[i * 4] + 0.587 * p[i * 4 + 1] + 0.114 * p[i * 4 + 2]) / 255);
+  }
+  return out;
+}
+
+function auditSheetPet() {
+  const M = AUDIT_MEDALLION;
+  const measured = {};
+  const sigs = {};
+
+  for (const pet of PETS) {
+    const glyph = PET_EMBLEM[pet.id];
+    // A pet with no emblem key would silently take the fallback fish at every call site.
+    if (!glyph) {
+      ArtAudit.warn('pet', pet.id, 'EMBLEM_MISSING',
+        'no PET_EMBLEM entry - every call site falls back to the generic fish glyph');
+      continue;
+    }
+    const m = auditMeasureEmblem(glyph);
+    if (!m.bb) {
+      ArtAudit.warn('pet', pet.id, 'EMBLEM_MISSING',
+        'emblem "' + glyph + '" rendered zero pixels - the font has no glyph for it');
+      continue;
+    }
+    const geom = auditEmblemGeom(m.bb, M.CX, M.CY, M.D);
+    measured[pet.id] = { glyph: glyph, canvas: m.canvas, bb: m.bb, geom: geom };
+    sigs[pet.id] = auditEmblemSignature(m.canvas, m.bb);
+
+    if (geom.badOffset) {
+      ArtAudit.warn('pet', pet.id, 'EMBLEM_OFFSET',
+        'bbox centre is ' + geom.off.toFixed(1) + 'px off medallion centre (' +
+        (geom.offPct * 100).toFixed(2) + '% of diameter, limit ' +
+        (AUDIT_EMBLEM.OFFSET_MAX * 100) + '%)',
+        { off: +geom.off.toFixed(2), dy: +geom.offY.toFixed(2) });
+    }
+    if (geom.badOverflow) {
+      ArtAudit.warn('pet', pet.id, 'EMBLEM_OVERFLOW',
+        'bbox reaches ' + geom.reach.toFixed(1) + 'px from centre, outside r=' + M.R);
+    }
+    if (geom.badFill) {
+      ArtAudit.warn('pet', pet.id, 'EMBLEM_FILL',
+        'fills ' + (geom.fill * 100).toFixed(1) + '% of the medallion (band ' +
+        (AUDIT_EMBLEM.FILL_LO * 100).toFixed(0) + '-' + (AUDIT_EMBLEM.FILL_HI * 100).toFixed(0) + '%)',
+        { fill: +(geom.fill * 100).toFixed(1) });
+    }
+  }
+
+  // --- duplicate emblems, in two distinct layers ---
+  // (a) EXACT: identical codepoint sequence. This is the closest honest reading of "the
+  //     same draw path" for glyphs, which have no path to compare.
+  const byCp = {};
+  for (const id of Object.keys(measured)) {
+    const cp = Array.from(measured[id].glyph).map(c => c.codePointAt(0).toString(16)).join('-');
+    (byCp[cp] = byCp[cp] || []).push(id);
+  }
+  for (const cp of Object.keys(byCp)) {
+    if (byCp[cp].length > 1) {
+      ArtAudit.warn('pet', byCp[cp].join('+'), 'EMBLEM_DUPLICATE_EXACT',
+        'these pets share an identical emblem glyph: ' + byCp[cp].join(', '));
+    }
+  }
+  // (b) NEAR: rendered-pixel signature, which catches lookalikes the codepoint test cannot.
+  const ids = Object.keys(measured), near = [];
+  for (let i = 0; i < ids.length; i++) {
+    for (let j = i + 1; j < ids.length; j++) {
+      const A = sigs[ids[i]], B = sigs[ids[j]];
+      let s = 0;
+      for (let k = 0; k < A.length; k++) s += (A[k] - B[k]) * (A[k] - B[k]);
+      near.push({ a: ids[i], b: ids[j], d: Math.sqrt(s / A.length) });
+    }
+  }
+  near.sort((x, y) => x.d - y.d);
+  for (const n of near) {
+    if (n.d >= AUDIT_EMBLEM_NEAR) break;
+    ArtAudit.warn('pet', n.a + '+' + n.b, 'EMBLEM_DUPLICATE_NEAR',
+      'emblems are perceptually close (shape distance ' + n.d.toFixed(3) +
+      ', reporting cut ' + AUDIT_EMBLEM_NEAR + ')', { distance: +n.d.toFixed(4) });
+  }
+  // Always publish the ten closest pairs so the cut above can be retuned against evidence
+  // rather than reasserted.
+  ArtAudit.closestEmblemPairs = near.slice(0, 10)
+    .map(n => n.a + '/' + n.b + ' ' + measured[n.a].glyph + measured[n.b].glyph +
+              ' d=' + n.d.toFixed(3));
+
+  // --- in-tank art coverage ---
+  const noArt = PETS.filter(p => !PET_ART[p.id]).map(p => p.id);
+  if (noArt.length) {
+    ArtAudit.warn('pet', noArt.length + ' pets', 'SPRITE_MISSING',
+      noArt.length + ' of ' + PETS.length + ' pets have no PET_ART entry and draw nothing ' +
+      'in the tank: ' + noArt.join(', '), { pets: noArt });
+  }
+
+  return auditSheet('pet', 'PET SHEET - ' + PETS.length + ' pets',
+    'medallion measured at true size (r=' + M.R + ', ' + M.FONT + ', drawn at y+' + M.DY +
+    ') then scaled to fit - left: in-tank art, right: emblem',
+    PETS.slice(),
+    function (g, pet, cw, ch) {
+      const half = cw / 2;
+
+      // LEFT: the in-tank sprite, drawn by the game's own PET_ART entry.
+      const art = PET_ART[pet.id];
+      if (art) {
+        const row = PET_BEHAVIOR[pet.id];
+        try {
+          g.save();
+          drawPetArtSafely(g, art, pet, half / 2, ch / 2 - 12, row ? row.params : {});
+          g.restore();
+        } catch (e) {
+          g.fillStyle = '#ff6a6a'; g.font = "700 8px 'Trebuchet MS',sans-serif";
+          g.textAlign = 'center'; g.fillText('art threw', half / 2, ch / 2);
+        }
+      } else {
+        g.strokeStyle = 'rgba(255,120,120,.35)'; g.lineWidth = 1;
+        g.beginPath(); g.moveTo(8, 14); g.lineTo(half - 8, ch - 40); g.stroke();
+        g.beginPath(); g.moveTo(half - 8, 14); g.lineTo(8, ch - 40); g.stroke();
+        g.fillStyle = '#ff8f8f'; g.font = "700 8px 'Trebuchet MS',sans-serif";
+        g.textAlign = 'center';
+        g.fillText('NO ART', half / 2, ch / 2 - 10);
+        g.fillStyle = '#8fb4d0';
+        g.fillText('inert', half / 2, ch / 2 + 2);
+      }
+
+      // RIGHT: the medallion, scaled from the true-size render so the overlay geometry
+      // stays in proportion with the measurement.
+      const m = measured[pet.id];
+      const box = Math.min(half - 10, ch - 42);
+      const mx = half + half / 2, my = ch / 2 - 12;
+      const k = box / M.CANVAS;             // display scale
+      g.save();
+      g.fillStyle = 'rgba(255,211,90,.14)';
+      g.beginPath(); g.arc(mx, my, M.R * k, 0, TAU); g.fill();
+      g.strokeStyle = 'rgba(255,211,90,.45)'; g.lineWidth = 1;
+      g.beginPath(); g.arc(mx, my, M.R * k, 0, TAU); g.stroke();
+      if (m) {
+        g.drawImage(m.canvas, mx - M.CX * k, my - M.CY * k, M.CANVAS * k, M.CANVAS * k);
+        // the emblem's real bbox, mapped into display space
+        auditBBox(g, mx + (m.bb.x - M.CX) * k, my + (m.bb.y - M.CY) * k,
+                  m.bb.w * k, m.bb.h * k,
+                  (m.geom.badOffset || m.geom.badFill) ? 'rgba(255,143,143,.95)'
+                                                       : 'rgba(95,255,143,.8)');
+      }
+      // centre crosshair -- the reference the offset is measured against
+      g.strokeStyle = 'rgba(255,255,255,.55)'; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(mx - 6, my + 0.5); g.lineTo(mx + 6, my + 0.5); g.stroke();
+      g.beginPath(); g.moveTo(mx + 0.5, my - 6); g.lineTo(mx + 0.5, my + 6); g.stroke();
+      g.restore();
+
+      const flag = m ? (m.geom.badOffset ? 'off ' + m.geom.off.toFixed(1) + 'px'
+                     : m.geom.badFill ? 'fill ' + (m.geom.fill * 100).toFixed(0) + '%'
+                     : 'ok ' + (m.geom.fill * 100).toFixed(0) + '%')
+                     : 'NO EMBLEM';
+      const bad = !m || m.geom.badOffset || m.geom.badFill || !art;
+      auditLabel(g, cw, ch, pet.id, (art ? '' : 'no art / ') + flag, bad ? '#ff8f8f' : null);
+      ArtAudit.row('pet', pet.id, (art ? 'art' : 'NO ART') + ', ' + flag, !bad);
+    },
+    { cellW: 176, cellH: 132 });
+}
+
+// PET_ART entries translate to p.x,p.y and scale by p.dir themselves, and read a handful
+// of live-pet fields (p.hiding, p.lit, p.t, ...). A throwaway pet carries generous
+// defaults so an entry reading a field we did not think of gets 0 rather than undefined.
+function drawPetArtSafely(g, art, pet, x, y, params) {
+  const p = { id: pet.id, x: x, y: y, dir: 1, t: 0, lit: 0, hiding: 0, phase: 0,
+              charge: 0, open: 0, held: 0, cool: 0, target: null, vx: 0, vy: 0,
+              alive: true, active: true };
+  art(g, p, params || {});
+}
+
+// ---- MAP SHEET ----
+// All 35 stage cards in all three states. The thumbnail is the REAL one -- drawThumb, the
+// same call buildMap makes -- so the art is genuine; the card furniture around it is
+// redrawn in canvas rather than screenshotted from the DOM.
+//
+// WHY REDRAW INSTEAD OF SCREENSHOTTING THE REAL CARDS: a DOM capture is not reproducible
+// here. .stageCard.next carries `animation: nextGlow 1.4s infinite alternate` plus a
+// nextPulse scale under 899px, so a screenshot catches a random animation phase; and the
+// card's width is viewport-dependent three separate ways (a clamp, a media query, and a
+// vw-based glyph size), so a capture at an arbitrary width shows an arbitrary card. The
+// redraw is fixed-size and deterministic.
+//
+// APPROXIMATIONS, stated rather than hidden -- an approximation presented as the real
+// thing is the worst outcome for an audit sheet:
+//   * the pet glyph's CSS size is clamp(22px, 4.5vw, 34px); the sheet pins it to 28px,
+//     the mid of that range. On a real phone it is smaller, on a wide desktop larger.
+//   * the locked silhouette uses ctx.filter 'brightness(0) opacity(.8)' -- the exact CSS
+//     filter string from .stageCard .petSil, so it matches, but ctx.filter is a Chrome/
+//     Firefox feature and silently no-ops elsewhere, which would show a colour glyph
+//     where the game shows a black one.
+//   * text-shadow on the card text is not reproduced.
+// Everything else -- thumb, label, badges, pips, borders -- is drawn to the real values.
+
+const AUDIT_CARD = { W: 150, THUMB_W: 150, THUMB_H: 88, PET_FONT: '28px serif' };
+
+function auditSheetMap() {
+  // The three states buildMap can produce, plus the fourth it can produce that has no
+  // name in the code: a stage that is neither locked, nor done, nor the "next" one.
+  const STATES = [
+    { key: 'locked', lbl: 'locked' },
+    { key: 'next',   lbl: 'next (PLAY)' },
+    { key: 'done',   lbl: 'cleared' },
+  ];
+
+  // THE EMPTY PET SLOT IS BY DESIGN, NOT A BUG -- and that is the finding.
+  // buildMap gives a locked card a .petSil and a done card a .petEmb, but the `next` card
+  // branch appends only a .playTag: it has no pet element at all. Neither does the unnamed
+  // fourth state (canvas + label only). So on the one card the player is actually being
+  // pointed at, the pet it hatches is invisible -- the card that most wants to advertise
+  // its reward is the only one that does not. Reported ONCE as a design finding rather
+  // than as 35 identical warnings, which would bury it.
+  ArtAudit.warn('map', 'next cards', 'PET_SLOT_EMPTY',
+    'the "next" card branch appends only .playTag - it renders NO pet element, so the ' +
+    'stage the player is being sent to is the one card that never shows its reward ' +
+    '(locked shows .petSil, cleared shows .petEmb). Same for the unnamed 4th state ' +
+    '(neither locked, done, nor next), which draws canvas + label only.',
+    { statesWithPet: ['locked', 'done'], statesWithoutPet: ['next', 'unnamed-4th'] });
+
+  const items = [];
+  for (const st of STATES) {
+    for (let t = 0; t < 7; t++) {
+      for (let l = 0; l < 5; l++) items.push({ t: t, l: l, st: st });
+    }
+  }
+
+  return auditSheet('map', 'MAP SHEET - 35 stages x 3 states (' + items.length + ' cards)',
+    'real drawThumb art, card furniture redrawn deterministically - pet glyph pinned 28px (CSS is 22-34px viewport-dependent)',
+    items,
+    function (g, it, cw, ch) {
+      const t = it.t, l = it.l, state = it.st.key;
+      const idx = t * 5 + l;
+      const pet = petAt(t, l);
+      const cardW = Math.min(AUDIT_CARD.W, cw - 8);
+      const th = Math.round(cardW * AUDIT_CARD.THUMB_H / AUDIT_CARD.THUMB_W);
+      const ox = (cw - cardW) / 2, oy = 8;
+
+      // --- the real thumbnail ---
+      // drawThumb paints in absolute 0..w/0..h and never translates, so it must be wrapped.
+      g.save();
+      g.beginPath(); g.rect(ox, oy, cardW, th); g.clip();
+      g.translate(ox, oy);
+      try {
+        drawThumb(g, cardW, th, t);
+      } catch (e) {
+        g.fillStyle = '#402028'; g.fillRect(0, 0, cardW, th);
+      }
+      g.restore();
+      // drawThumb leaves fillStyle set to its vignette gradient; reset every text-affecting
+      // piece of state before drawing card furniture or the label paints with a gradient.
+      g.fillStyle = '#fff'; g.strokeStyle = '#fff'; g.globalAlpha = 1;
+      g.filter = 'none'; g.textAlign = 'center'; g.textBaseline = 'alphabetic';
+
+      // locked cards are greyed by CSS: filter grayscale(1) brightness(.48) on the canvas
+      if (state === 'locked') {
+        g.save();
+        g.fillStyle = 'rgba(10,14,20,.52)';
+        g.fillRect(ox, oy, cardW, th);
+        g.restore();
+      }
+
+      // --- border: the real values. There is NO .stageCard.done rule in the CSS, so a
+      // cleared card's border is the same default as a bare one; only next is special.
+      g.strokeStyle = state === 'locked' ? '#3a3f46'
+                    : state === 'next'   ? '#ffd35a'
+                                         : '#2a4a66';
+      g.lineWidth = 2;
+      g.strokeRect(ox + 1, oy + 1, cardW - 2, th - 2);
+
+      // --- the pet slot: silhouette when locked, full colour when cleared, ABSENT on next
+      const glyph = PET_EMBLEM[pet.id] || '🐠';
+      if (state === 'locked' || state === 'done') {
+        g.save();
+        g.font = AUDIT_CARD.PET_FONT; g.textAlign = 'center'; g.textBaseline = 'middle';
+        if (state === 'locked') g.filter = 'brightness(0) opacity(0.8)';
+        g.fillText(glyph, ox + cardW / 2, oy + th * 0.06 + 16);
+        g.restore();
+        g.filter = 'none';
+      } else {
+        // Draw the hole the game leaves, so the sheet shows an absence rather than
+        // silently looking fine.
+        g.save();
+        g.strokeStyle = 'rgba(255,120,120,.5)'; g.lineWidth = 1;
+        g.setLineDash([3, 3]);
+        g.strokeRect(ox + cardW / 2 - 16, oy + th * 0.06 + 2, 32, 28);
+        g.setLineDash([]);
+        g.fillStyle = 'rgba(255,143,143,.85)';
+        g.font = "700 7px 'Trebuchet MS',sans-serif"; g.textAlign = 'center';
+        g.fillText('no pet', ox + cardW / 2, oy + th * 0.06 + 20);
+        g.restore();
+      }
+
+      // --- state furniture ---
+      g.font = "700 9px 'Trebuchet MS',sans-serif"; g.textAlign = 'left';
+      if (state === 'locked') {
+        g.fillStyle = '#fff'; g.fillText('🔒', ox + 4, oy + 12);
+        g.fillStyle = '#cfe4f5'; g.font = "700 7px 'Trebuchet MS',sans-serif";
+        g.textAlign = 'center';
+        const hl = 'Hatches: ' + pet.name;
+        g.fillText(hl.length > 24 ? hl.slice(0, 23) + '…' : hl, ox + cardW / 2, oy + th - 6);
+      } else if (state === 'done') {
+        g.fillStyle = '#cfe4f5'; g.font = "700 8px 'Trebuchet MS',sans-serif";
+        g.textAlign = 'right';
+        g.fillText('⏱' + fmtClock(STAR_PAR[idx] || 120), ox + cardW - 4, oy + 12);
+        // star pips: two of three lit, a representative cleared card
+        g.textAlign = 'center'; g.font = "10px 'Trebuchet MS',sans-serif";
+        for (let s = 0; s < 3; s++) {
+          g.fillStyle = s < 2 ? '#ffd35a' : '#39536b';
+          g.fillText('★', ox + cardW / 2 + (s - 1) * 11, oy + th - 5);
+        }
+      } else {
+        g.fillStyle = '#ffd35a'; g.font = "800 9px 'Trebuchet MS',sans-serif";
+        g.textAlign = 'center';
+        g.fillText('PLAY', ox + cardW / 2, oy + th - 6);
+      }
+
+      // --- the stage label ---
+      g.fillStyle = state === 'locked' ? '#7f8a94' : '#cfe4f5';
+      g.font = "800 10px 'Trebuchet MS',sans-serif"; g.textAlign = 'center';
+      g.fillText((t + 1) + '-' + (l + 1), ox + cardW / 2, oy + th + 13);
+
+      auditLabel(g, cw, ch, (t + 1) + '-' + (l + 1) + ' ' + pet.id, it.st.lbl,
+                 state === 'next' ? '#ff8f8f' : null);
+      ArtAudit.row('map', (t + 1) + '-' + (l + 1) + '/' + state,
+                   state === 'next' ? 'no pet slot' : 'pet shown', state !== 'next');
+    },
+    { cellW: 166, cellH: 148 });
+}
+
 // ============ START ============
-Input.init();
-Dbg.init();
-Ads.init();
-if (BUILD_FLAGS.dev && QS.get('audition') === '1') initAudition();
+
+// ---- Native shell bootstrap (Capacitor, native-1) ----
+// Runs once, before the first frame. Hides the status bar / goes immersive, and
+// explicitly does NOT lock orientation -- both portrait and landscape stay allowed
+// (matches AndroidManifest, which carries no android:screenOrientation override).
+if (typeof Capacitor !== 'undefined' && Capacitor.isNativePlatform && Capacitor.isNativePlatform()) {
+  try {
+    const { StatusBar, ScreenOrientation } = Capacitor.Plugins;
+    StatusBar.hide();
+    StatusBar.setOverlaysWebView({ overlay: true });
+    // No orientation lock by design -- if the plugin only exposes lock(), simply
+    // never calling it leaves both orientations allowed; unlock() is a no-op then.
+    if (ScreenOrientation.unlock) ScreenOrientation.unlock();
+  } catch (e) {}
+}
+
 resize();
-Demo.start();
-// Queues via _pendingPlay until the first real gesture unlocks the context (see
-// Snd.init's onstatechange -> Music._flushPending) — audible the instant the player
-// taps anything, never silently dropped.
-if (Music.on) Music.play('menu', { crossfadeMs: 1500 });
-requestAnimationFrame(frame);
-requestAnimationFrame(runBootAudit);   // after the boot DOM/state settles, before the first real frame's work
+if (SHOW_ICON) {
+  // Store-asset render mode: skip the game boot (Demo/frame loop/menu music) entirely
+  // so the icon canvas is the only thing drawn — see initIconRender() above.
+  initIconRender();
+} else if (SHOW_AUDIT) {
+  // Art-audit contact sheets: same contract as ?icon=1 — skip Input/Dbg/Ads/Demo/frame
+  // and the menu music entirely, so nothing animates, no AudioContext is ever built, the
+  // live pools stay empty and Game.time stays 0 (its only writer is frame()). That is
+  // what makes the sheets byte-reproducible. Input.init() is skipped deliberately, not
+  // incidentally: its contextmenu preventDefault would block right-click-saving a sheet.
+  initArtAudit();
+} else {
+  Input.init();
+  Dbg.init();
+  Ads.init();
+  if (BUILD_FLAGS.dev && QS.get('audition') === '1') initAudition();
+  Demo.start();
+  // Queues via _pendingPlay until the first real gesture unlocks the context (see
+  // Snd.init's onstatechange -> Music._flushPending) — audible the instant the player
+  // taps anything, never silently dropped.
+  if (Music.on) Music.play('menu', { crossfadeMs: 1500 });
+  requestAnimationFrame(frame);
+  requestAnimationFrame(runBootAudit);   // after the boot DOM/state settles, before the first real frame's work
+}
 </script>
