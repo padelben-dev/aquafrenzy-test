@@ -169,6 +169,10 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
   position:absolute;left:0;right:0;bottom:15px;font-size:11px;letter-spacing:2px;
   pointer-events:none;text-shadow:0 1px 2px #000;
 }
+/* Phase 7B: every card now carries its pet NAME (or ??? while unhatched), and on a
+   cleared card the star pips already occupy the row just above the label. Lift the name
+   clear of them. Cleared cards are the only ones with pips, so only they need the shift. */
+.stageCard.done .hatchLine{bottom:30px}
 .stageCard .starPips span{color:#39536b}
 .stageCard .starPips span.on{color:#ffd35a}
 /* Pet select on the stage brief: one chip per hatched pet + NONE, gold ring on the
@@ -201,10 +205,12 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
 #resStars .st small{
   display:block;font-size:9px;font-weight:800;letter-spacing:.5px;color:#cfe4f5;margin-top:3px;
 }
+/* Phase 7B: the next card now carries a pet silhouette at top:6% like every other card,
+   and PLAY at 40% sat on top of it. Moved below the silhouette and above the ??? line. */
 .stageCard .playTag{
-  position:absolute;left:50%;top:40%;transform:translate(-50%,-50%);
+  position:absolute;left:50%;top:57%;transform:translate(-50%,-50%);
   font-size:clamp(12px,2.6vw,15px);font-weight:900;letter-spacing:2px;color:#3a1a00;
-  background:linear-gradient(#ffd980,#f5a623);border-radius:14px;padding:3px 12px;
+  background:linear-gradient(#ffd980,#f5a623);border-radius:14px;padding:1px 12px;
   box-shadow:0 2px 8px rgba(0,0,0,.6);pointer-events:none;
 }
 /* Phone-first map (<900px): one tank per screen, a swipe snaps tank to tank, and the
@@ -730,7 +736,11 @@ const SHOW_ICON = BUILD_FLAGS.dev && QS.get('icon') === '1';
 // ?icon=1 / ?debug=1 / ?audition=1 — dead in any build with BUILD_FLAGS.dev=false.
 // Diagnostic only: changes no gameplay, economy or balance. See initArtAudit().
 const SHOW_AUDIT = BUILD_FLAGS.dev && QS.get('audit') === 'art';
-const GAME_BUILD = 49;
+// ?wipe=1 (dev only): clear the save key before Save.load() runs, so a test starts from a
+// genuinely fresh profile. Deliberately NOT a migration and NOT a grant — it deletes, and
+// only when a human asks for it on a dev build.
+const WIPE_SAVE = BUILD_FLAGS.dev && QS.get('wipe') === '1';
+const GAME_BUILD = 51;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -2512,6 +2522,7 @@ const Save = {
   },
   wipe()  { if (this._writeTimer) { clearTimeout(this._writeTimer); this._writeTimer = null; } Storage.removeSync(SAVE_KEY); },
 };
+if (WIPE_SAVE) { Save.wipe(); console.warn('[wipe] ?wipe=1 - save key cleared before load'); }
 Save.load();
 
 // ============ CANVAS SETUP ============
@@ -7849,9 +7860,9 @@ function drawPetPortrait(id) {
   g.save(); g.translate(96, 96);
   g.fillStyle = 'rgba(255,211,90,.14)';
   g.beginPath(); g.arc(0, 0, 86, 0, TAU); g.fill();
-  const emblem = PET_EMBLEM[id] || '🐠';
-  g.font = '96px serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
-  g.fillText(emblem, 0, 6);
+  // Normalised: measured ink, centred on the medallion, scaled to EMBLEM_FILL of its
+  // diameter. Replaces a fixed 96px and a hardcoded y+6 fudge — see drawEmblem.
+  drawEmblem(g, id, 0, 0, 172);
   g.restore();
 }
 
@@ -8138,12 +8149,18 @@ function buildMap() {
         card.appendChild(d);
         return d;
       };
+      // Hatched-ness, not lock state, decides silhouette vs full colour: a pet you own
+      // reads in colour wherever it appears, and one you do not is a shape and a "???".
+      const hatched = Save.data.pets.includes(petHere.id);
+      const petEl = el(hatched ? 'petEmb' : 'petSil', PET_EMBLEM[petHere.id] || '🐠');
+      // Equalise apparent size across the 35 glyphs (see sizeEmblemEl): the emoji differ
+      // by up to 2.4x in inked width at one font size, so a shared font-size does not
+      // give a shared apparent size.
+      sizeEmblemEl(petEl, petHere.id, 34);
+      el('hatchLine', hatched ? petHere.name : '???');
       if (locked) {
-        el('petSil', PET_EMBLEM[petHere.id] || '🐠');
-        el('hatchLine', 'Hatches: ' + petHere.name);
         el('lockBadge', '🔒');
       } else if (done) {
-        el('petEmb', PET_EMBLEM[petHere.id] || '🐠');
         const bt = (Save.data.best || {})[idx];
         if (bt != null) el('timeBadge', '⏱' + fmtClock(bt));
         else el('doneIco', '✔');
@@ -8494,8 +8511,9 @@ function showHatch(pet, r) {
       g.globalAlpha = 1;
       // the pet swims in from the left and settles into a bob
       const px = lerp(-140, 0, e), py = Math.sin(t * 2.4) * 6 * e;
-      g.font = '104px serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
-      g.fillText(PET_EMBLEM[pet.id] || '🐠', px, py + 4);
+      // Same normalisation as the portrait, so the pet that swims out of the egg is the
+      // same size and centring as the one on the results medallion.
+      drawEmblem(g, pet.id, px, py, 186);
     }
     g.restore();
     hatchRaf = requestAnimationFrame(draw);
@@ -10999,6 +11017,9 @@ const Ads = {
     const A = CFG.ADS;
     const lost  = (Game.stat ? Game.stat.lost : 0) - snap.lost0;
     const alive = Fishes.live.filter(f => f.alive && f.dying <= 0).length;
+    // "still the fish we snapshotted, and still swimming" -- alive, not dying, and the
+    // SAME spawn (uid), because the pools recycle objects and a reused body is a
+    // different fish. Shared by _waveEnd and grant-time revalidation -- keep in sync.
     const dead  = snap.fish.filter(s => !(s.ref.alive && s.ref.dying <= 0 && s.ref.uid === s.uid));
     if (!this.available('rewarded')) return;
     if (Game.tank < A.SECOND_CHANCE_FROM_TANK) return;
@@ -11042,6 +11063,16 @@ const Ads = {
       const cur = roster.get(s.uid);
       return !cur || !(cur.alive && cur.dying <= 0);
     });
+    // Everything on the list came back on its own while the ad played (Vesper, most
+    // likely). The player watched it, so the cap is already spent -- `rewarded()` counts
+    // the completion before we get here -- and a silent no-op would read as a broken
+    // reward. Tell them what happened instead of quietly giving nothing.
+    if (!pending.length) {
+      floatText(W / 2, TANK_TOP + 60, 'They made it back on their own', '#ffd35a');
+      this.log('rew_granted_empty', { placement: AD_PLACEMENTS.SECOND_CHANCE,
+                                      stage: this.stage(), offered: dead.length });
+      return;
+    }
     let alive = Fishes.live.filter(f => f.alive && f.dying <= 0).length, n = 0;
     for (const s of pending) {
       if (alive >= A.SECOND_CHANCE_MAX_FISH) break;
@@ -11266,6 +11297,183 @@ function initIconRender() {
 }
 
 
+
+// ============ PHASE 7B — EMBLEM NORMALISATION + PET INDEX ASSERTIONS ============
+// Three things live here, all of them about ONE fact: petAt(t, l) is the single source of
+// truth for which pet belongs to which stage, and an emoji glyph is not a controllable
+// piece of art until it has been measured.
+
+// ---- emblem normalisation ----
+// Emoji do not share a common box. Measured at one font size the 35 emblems' inked
+// heights range over ~40% and their widths over ~2.4x, and `textBaseline:'middle'` does
+// not vertically centre them: 34 of 35 render high of the nominal centre, one (the
+// turtle) renders low. drawPetPortrait used to fight that with a hardcoded `y + 6`, which
+// is right for the 34 and is exactly why the turtle was the one glyph failing the audit's
+// 4% offset check.
+//
+// So: measure each glyph's real inked box once, then draw it scaled and offset so the INK
+// — not the font box — is centred on the medallion and fills a fixed fraction of it.
+// Everything downstream (portrait, hatch ceremony, audit sheet) goes through drawEmblem.
+const EMBLEM_FILL = 0.72;      // ink's long side, as a fraction of medallion diameter
+const EMBLEM_REF  = 100;       // reference font size the cache is measured at
+const _emblemCache = new Map();
+let _emblemCanvas = null;
+
+// Ink bbox of one glyph at EMBLEM_REF px, expressed relative to the fillText origin with
+// textAlign:'center' + textBaseline:'middle'. Cached: the scan is ~40k pixel reads.
+function emblemMetrics(glyph) {
+  if (_emblemCache.has(glyph)) return _emblemCache.get(glyph);
+  if (!_emblemCanvas) {
+    _emblemCanvas = document.createElement('canvas');
+    _emblemCanvas.width = _emblemCanvas.height = EMBLEM_REF * 3;
+  }
+  const S3 = EMBLEM_REF * 3, mid = S3 / 2;
+  const g = _emblemCanvas.getContext('2d', { willReadFrequently: true });
+  g.clearRect(0, 0, S3, S3);
+  g.font = EMBLEM_REF + 'px serif';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(glyph, mid, mid);
+  const d = g.getImageData(0, 0, S3, S3).data;
+  let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1;
+  for (let y = 0; y < S3; y++) {
+    for (let x = 0; x < S3; x++) {
+      if (d[(y * S3 + x) * 4 + 3] > 8) {
+        if (x < x0) x0 = x; if (x > x1) x1 = x;
+        if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+    }
+  }
+  // A glyph the font cannot render inks nothing; fall back to a nominal centred box so a
+  // missing glyph still draws SOMETHING rather than throwing or vanishing silently.
+  const m = (x1 < 0)
+    ? { w: EMBLEM_REF, h: EMBLEM_REF, dx: 0, dy: 0, empty: true }
+    : { w: x1 - x0 + 1, h: y1 - y0 + 1,
+        dx: (x0 + x1) / 2 - mid,     // ink centre relative to the draw origin
+        dy: (y0 + y1) / 2 - mid,
+        empty: false };
+  _emblemCache.set(glyph, m);
+  return m;
+}
+
+// Draw a pet's emblem with its INK centred on (cx, cy) and scaled so the ink's long side
+// is EMBLEM_FILL of D. Never overflows: the long side is what is fitted, so the short
+// side is smaller by construction.
+function drawEmblem(g, id, cx, cy, D) {
+  const glyph = PET_EMBLEM[id] || '🐠';
+  const m = emblemMetrics(glyph);
+  const long = Math.max(m.w, m.h) || EMBLEM_REF;
+  let size = EMBLEM_REF * (EMBLEM_FILL * D) / long;
+  // "Fill 72% of the diameter" and "never overflow the circle" are in tension: a SQUARE
+  // glyph scaled so its side is 0.72D has a half-diagonal of 0.509D, which is outside the
+  // circle. Measured, today's worst glyph reaches 85.6 of the 86 radius — it fits, but by
+  // luck of aspect ratio, and one squarer emoji would break it. So clamp: if the ink's own
+  // half-diagonal would leave the circle, shrink until it does not. Wide or tall glyphs
+  // keep the full 72%; only near-square ones give a little back, which is the correct
+  // trade — overflow is a visible defect, 68% instead of 72% is not.
+  const halfDiag = Math.hypot(m.w, m.h) / 2 * (size / EMBLEM_REF);
+  if (halfDiag > D / 2) size *= (D / 2) / halfDiag;
+  g.save();
+  g.font = size + 'px serif';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  // Undo the glyph's own off-centre ink by shifting the origin the other way.
+  g.fillText(glyph, cx - m.dx * size / EMBLEM_REF, cy - m.dy * size / EMBLEM_REF);
+  g.restore();
+  return size;
+}
+
+// The same normalisation for a DOM element (the map cards use text, not canvas). We
+// cannot reposition ink inside a text node, but we CAN equalise apparent size, which is
+// where most of the visual inconsistency lives.
+function sizeEmblemEl(el, id, box) {
+  const glyph = PET_EMBLEM[id] || '🐠';
+  const m = emblemMetrics(glyph);
+  const long = Math.max(m.w, m.h) || EMBLEM_REF;
+  el.style.fontSize = Math.round(EMBLEM_REF * (EMBLEM_FILL * box) / long) + 'px';
+  el.style.lineHeight = box + 'px';
+}
+
+// ---- pet index assertions (FIX 1) ----
+// petAt is the ONLY thing allowed to map a stage to a pet. This asserts that at boot, so
+// a future edit that reintroduces a second mapping fails loudly instead of shipping a
+// wrong award. Reports rather than throws: a broken assertion must not brick the game.
+function assertPetIndex() {
+  const problems = [];
+  const stages = LEVELS.reduce((n, row) => n + row.length, 0);
+
+  if (PETS.length !== 35) problems.push('PETS.length is ' + PETS.length + ', expected 35');
+  if (stages !== 35) problems.push('LEVELS holds ' + stages + ' stages, expected 35');
+
+  // Bijection: every stage maps to a distinct pet, and every pet is reachable.
+  const seen = new Map();
+  for (let t = 0; t < LEVELS.length; t++) {
+    for (let l = 0; l < LEVELS[t].length; l++) {
+      const p = petAt(t, l);
+      const label = (t + 1) + '-' + (l + 1);
+      if (!p) { problems.push(label + ' maps to no pet'); continue; }
+      if (seen.has(p.id)) problems.push('pet ' + p.id + ' is claimed by both ' + seen.get(p.id) + ' and ' + label);
+      seen.set(p.id, label);
+      if (!PET_EMBLEM[p.id]) problems.push('pet ' + p.id + ' (' + label + ') has no PET_EMBLEM');
+      // The three surfaces that name a stage's pet must agree with petAt, by construction.
+      // stageName is what the Aquapedia prints; petAt(t,l) must round-trip through it.
+      const idx = stageIdx(t, l);
+      if (PETS[idx] !== p) problems.push(label + ': PETS[' + idx + '] disagrees with petAt');
+      if (stageName(idx) !== 'Tank ' + label) {
+        problems.push(label + ': stageName(' + idx + ') = "' + stageName(idx) + '"');
+      }
+    }
+  }
+  if (seen.size !== PETS.length) {
+    problems.push('only ' + seen.size + ' of ' + PETS.length + ' pets are reachable from a stage');
+  }
+  return problems;
+}
+
+// ---- save integrity (report only, never migrate) ----
+// An id in Save.data.pets that is not a real pet means a save written by a different
+// build, or a hand-edited save. We say so and stop: auto-granting or auto-dropping would
+// destroy the evidence and could silently hand the player pets they never earned.
+function checkSaveIntegrity() {
+  const valid = new Set(PETS.map(p => p.id));
+  const owned = (Save.data && Save.data.pets) || [];
+  const bad = owned.filter(id => !valid.has(id));
+  const dupes = owned.filter((id, i) => owned.indexOf(id) !== i);
+  if (bad.length) {
+    console.warn('[save-check] Save.data.pets holds ' + bad.length +
+                 ' id(s) that are not pets in this build:', bad,
+                 '- NOT auto-migrated. Use ?wipe=1 to clear the save for a clean test.');
+  }
+  if (dupes.length) {
+    console.warn('[save-check] Save.data.pets holds duplicate id(s):', dupes);
+  }
+  if (Save.data && Save.data.pet && !valid.has(Save.data.pet)) {
+    console.warn('[save-check] equipped pet "' + Save.data.pet + '" is not a valid pet id');
+  }
+  return { invalid: bad, duplicates: dupes };
+}
+
+// Runs both checks and publishes them. Called from the boot sequence.
+function runPetAudit() {
+  const problems = assertPetIndex();
+  const save = checkSaveIntegrity();
+  const report = {
+    build: GAME_BUILD,
+    pets: PETS.length,
+    stages: LEVELS.reduce((n, r) => n + r.length, 0),
+    emblems: PETS.filter(p => PET_EMBLEM[p.id]).length,
+    bijection: problems.length === 0,
+    problems: problems,
+    save: save,
+    pass: problems.length === 0 && save.invalid.length === 0 && save.duplicates.length === 0,
+  };
+  if (report.pass) {
+    console.log('[pet-audit] PASS - petAt is a bijection over all ' + report.stages +
+                ' stages, ' + report.emblems + '/' + report.pets + ' emblems present');
+  } else {
+    console.warn('[pet-audit] FAIL', report);
+  }
+  window.__petAudit = report;
+  return report;
+}
 // ============ ART AUDIT (?audit=art, dev-only) ============
 
 // ============ PHASE 7A — ART & STATE AUDIT HARNESS (?audit=art) ============
@@ -11418,15 +11626,18 @@ function auditInkBBox(g, x, y, w, h) {
 // coordinate space as the bbox. Shared by the pet sheet; kept here because the three
 // thresholds are one rule, not three.
 const AUDIT_EMBLEM = { OFFSET_MAX: 0.04, FILL_LO: 0.55, FILL_HI: 0.85 };
-function auditEmblemGeom(bb, mcx, mcy, D) {
+function auditEmblemGeom(bb, mcx, mcy, D, inkReach) {
   const offX = bb.cx - mcx, offY = bb.cy - mcy;
   const off = Math.sqrt(offX * offX + offY * offY);
   const fill = Math.max(bb.w, bb.h) / D;
-  // Worst-case reach from the medallion centre to a bbox corner: if that exceeds the
-  // radius the glyph's box leaves the circle.
+  // Reach = the furthest INKED pixel from the medallion centre, measured, not the furthest
+  // corner of the bounding box. A bbox corner holds no ink for any glyph that is not a
+  // filled rectangle, so testing the corner answers a question nobody asked and fails
+  // every wide-or-tall glyph that is comfortably inside the circle. Falls back to the
+  // corner only if a caller has not measured the ink.
   const dx = Math.max(Math.abs(bb.x - mcx), Math.abs(bb.x + bb.w - mcx));
   const dy = Math.max(Math.abs(bb.y - mcy), Math.abs(bb.y + bb.h - mcy));
-  const reach = Math.sqrt(dx * dx + dy * dy);
+  const reach = inkReach != null ? inkReach : Math.sqrt(dx * dx + dy * dy);
   return {
     offX: offX, offY: offY, off: off, offPct: off / D,
     fill: fill, reach: reach,
@@ -11907,15 +12118,35 @@ const AUDIT_MEDALLION = { CANVAS: 192, CX: 96, CY: 96, R: 86, D: 172, DY: 6, FON
 const AUDIT_EMBLEM_NEAR = 0.20;
 
 // Render one emblem at true medallion size and measure what it actually inked.
-function auditMeasureEmblem(glyph) {
+function auditMeasureEmblem(id) {
   const M = AUDIT_MEDALLION;
   const cv = document.createElement('canvas');
   cv.width = cv.height = M.CANVAS;
   const g = cv.getContext('2d', { willReadFrequently: true });
-  g.font = M.FONT; g.textAlign = 'center'; g.textBaseline = 'middle';
-  g.fillText(glyph, M.CX, M.CY + M.DY);
+  // Call the REAL renderer the game uses (drawEmblem, via drawPetPortrait), not a local
+  // copy of its geometry. A harness that re-derives what it is auditing silently stops
+  // auditing the moment the product changes -- which is exactly what happened between
+  // 7A and 7B, when the medallion was normalised and this sheet kept reporting the old
+  // numbers because it was still measuring its own hardcoded 96px-at-y+6 copy.
+  g.save(); g.translate(M.CX, M.CY);
+  drawEmblem(g, id, 0, 0, M.D);
+  g.restore();
   const bb = auditInkBBox(g, 0, 0, M.CANVAS, M.CANVAS);
-  return { canvas: cv, bb: bb };
+  // Furthest inked pixel from the medallion centre -- the honest overflow measure.
+  let inkReach = 0;
+  if (bb) {
+    const d = g.getImageData(0, 0, M.CANVAS, M.CANVAS).data;
+    for (let y = bb.y; y < bb.y + bb.h; y++) {
+      for (let x = bb.x; x < bb.x + bb.w; x++) {
+        if (d[(y * M.CANVAS + x) * 4 + 3] > 8) {
+          const r = Math.sqrt((x + 0.5 - M.CX) * (x + 0.5 - M.CX) +
+                              (y + 0.5 - M.CY) * (y + 0.5 - M.CY));
+          if (r > inkReach) inkReach = r;
+        }
+      }
+    }
+  }
+  return { canvas: cv, bb: bb, inkReach: inkReach };
 }
 
 // A small scale-normalised grayscale signature, cropped to the glyph's own ink so shape
@@ -11948,13 +12179,13 @@ function auditSheetPet() {
         'no PET_EMBLEM entry - every call site falls back to the generic fish glyph');
       continue;
     }
-    const m = auditMeasureEmblem(glyph);
+    const m = auditMeasureEmblem(pet.id);
     if (!m.bb) {
       ArtAudit.warn('pet', pet.id, 'EMBLEM_MISSING',
         'emblem "' + glyph + '" rendered zero pixels - the font has no glyph for it');
       continue;
     }
-    const geom = auditEmblemGeom(m.bb, M.CX, M.CY, M.D);
+    const geom = auditEmblemGeom(m.bb, M.CX, M.CY, M.D, m.inkReach);
     measured[pet.id] = { glyph: glyph, canvas: m.canvas, bb: m.bb, geom: geom };
     sigs[pet.id] = auditEmblemSignature(m.canvas, m.bb);
 
@@ -11967,7 +12198,7 @@ function auditSheetPet() {
     }
     if (geom.badOverflow) {
       ArtAudit.warn('pet', pet.id, 'EMBLEM_OVERFLOW',
-        'bbox reaches ' + geom.reach.toFixed(1) + 'px from centre, outside r=' + M.R);
+        'ink reaches ' + geom.reach.toFixed(1) + 'px from centre, outside r=' + M.R);
     }
     if (geom.badFill) {
       ArtAudit.warn('pet', pet.id, 'EMBLEM_FILL',
@@ -12023,8 +12254,8 @@ function auditSheetPet() {
   }
 
   return auditSheet('pet', 'PET SHEET - ' + PETS.length + ' pets',
-    'medallion measured at true size (r=' + M.R + ', ' + M.FONT + ', drawn at y+' + M.DY +
-    ') then scaled to fit - left: in-tank art, right: emblem',
+    'measured through the REAL drawEmblem at r=' + M.R + ' (ink centred, ' +
+    (EMBLEM_FILL * 100).toFixed(0) + '% fill target, no-overflow clamp) - left: in-tank art, right: emblem',
     PETS.slice(),
     function (g, pet, cw, ch) {
       const half = cw / 2;
@@ -12139,12 +12370,36 @@ function auditSheetMap() {
   // pointed at, the pet it hatches is invisible -- the card that most wants to advertise
   // its reward is the only one that does not. Reported ONCE as a design finding rather
   // than as 35 identical warnings, which would bury it.
-  ArtAudit.warn('map', 'next cards', 'PET_SLOT_EMPTY',
-    'the "next" card branch appends only .playTag - it renders NO pet element, so the ' +
-    'stage the player is being sent to is the one card that never shows its reward ' +
-    '(locked shows .petSil, cleared shows .petEmb). Same for the unnamed 4th state ' +
-    '(neither locked, done, nor next), which draws canvas + label only.',
-    { statesWithPet: ['locked', 'done'], statesWithoutPet: ['next', 'unnamed-4th'] });
+  // Real check, not a hardcoded claim: build the actual map DOM and count cards whose pet
+  // element is missing. Presence is structural, so this works while #mapScreen is hidden
+  // (sizes would not, which is a different check).
+  try {
+    const savedPets = Save.data.pets.slice();
+    const savedT = Save.data.tank, savedL = Save.data.level;
+    // A mid-campaign profile exercises all three card states at once.
+    Save.data.pets = [];
+    for (let i = 0; i < 7; i++) Save.data.pets.push(petAt(Math.floor(i / 5), i % 5).id);
+    Save.data.tank = 1; Save.data.level = 2;
+    buildMap();
+    const cards = document.querySelectorAll('#mapList .stageCard');
+    const missing = [];
+    cards.forEach(c => {
+      if (!c.querySelector('.petSil') && !c.querySelector('.petEmb')) {
+        const lbl = c.querySelector('.lbl');
+        missing.push(lbl ? lbl.textContent : '?');
+      }
+    });
+    ArtAudit.row('map', 'buildMap pet slots', cards.length + ' cards, ' +
+                 missing.length + ' without a pet element', missing.length === 0);
+    if (missing.length) {
+      ArtAudit.warn('map', missing.join(','), 'PET_SLOT_EMPTY',
+        missing.length + ' of ' + cards.length + ' real map cards render no pet element: ' +
+        missing.join(', '), { missing: missing });
+    }
+    Save.data.pets = savedPets; Save.data.tank = savedT; Save.data.level = savedL;
+  } catch (e) {
+    ArtAudit.warn('map', '-', 'PET_SLOT_CHECK_FAILED', 'could not inspect buildMap: ' + e.message);
+  }
 
   const items = [];
   for (const st of STATES) {
@@ -12272,6 +12527,11 @@ if (typeof Capacitor !== 'undefined' && Capacitor.isNativePlatform && Capacitor.
     if (ScreenOrientation.unlock) ScreenOrientation.unlock();
   } catch (e) {}
 }
+
+// Pet-index + save-integrity audit. Runs on every route, before any screen is built, so
+// a bad index or a foreign save is reported once at boot rather than discovered by a
+// player receiving the wrong pet.
+runPetAudit();
 
 resize();
 if (SHOW_ICON) {
