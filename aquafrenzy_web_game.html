@@ -740,7 +740,21 @@ const SHOW_AUDIT = BUILD_FLAGS.dev && QS.get('audit') === 'art';
 // genuinely fresh profile. Deliberately NOT a migration and NOT a grant — it deletes, and
 // only when a human asks for it on a dev build.
 const WIPE_SAVE = BUILD_FLAGS.dev && QS.get('wipe') === '1';
-const GAME_BUILD = 54;
+// ?shot=<name> (store-screenshot capture harness): jumps straight to a named screen with
+// fully staged, deterministic state — no adb/APK, no timing-dependent waits. Gated exactly
+// like ?icon=1 / ?debug=1 / ?audition=1 / ?audit=art — dead in any build with
+// BUILD_FLAGS.dev=false. See initShotMode() near the other dev-route initializers.
+const SHOT = BUILD_FLAGS.dev ? QS.get('shot') : null;
+// Halts frame()'s dt-driven physics/animation the instant a ?shot= screen is staged, while
+// rendering keeps happening every frame off dt=0 — so a capture tool has no race to lose,
+// the frame it screenshots is the frame it will always be.
+let SHOT_FROZEN = false;
+// ?audio=test (Phase 7F sound board): every registered cue as a labelled button, with the
+// output chain live on sliders, a x10 repeat per sound and a stack test. Exists so the mix
+// is tuned by ear on a real device instead of by reading numbers here. Gated exactly like
+// ?icon=1 / ?audit=art / ?debug=1 -- dead in any build with BUILD_FLAGS.dev=false.
+const SHOW_AUDIOTEST = BUILD_FLAGS.dev && QS.get('audio') === 'test';
+const GAME_BUILD = 56;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -802,6 +816,20 @@ function mixHex(a, b, t) {
 }
 
 // ============ AUDIO ENGINE (procedural, zero asset files) ============
+// Phase 7F output-chain constants. Deliberately named and hoisted so ?audio=test can
+// show and change them live -- the whole point of the board is that these get tuned by ear
+// on a real iPhone, not guessed here.
+const SND_MASTER_GAIN   = 0.50;   // was 0.26; the limiter is what makes this safe
+const SND_TONE_LP_HZ    = 5000;   // roll off the fizz a small driver turns into harshness
+const SND_TONE_SHELF_HZ = 3200;   // corner of the 2-5kHz presence peak
+const SND_TONE_SHELF_DB = -4;     // take the edge off that peak
+
+// Phase 7F: every repeatable cue gets a small random detune so the same event twice in a
+// row is not the same waveform twice in a row. +/-15 cents is under the threshold where a
+// listener hears "out of tune" and well over the threshold where repetition stops fusing
+// into one fatiguing tone.
+const SFX_DETUNE_CENTS = 15;
+
 const Snd = {
   // Bus layout (Phase 9): master -> musicBus / sfxBus / uiBus, each its own gain so
   // the whole category can be balanced (or eventually slider-controlled, Phase 15)
@@ -818,8 +846,26 @@ const Snd = {
     if (!AC) return;
     this.ctx = new AC();
     this.master = this.ctx.createGain();
-    this.master.gain.value = 0.26;
-    this.master.connect(this.ctx.destination);
+    this.master.gain.value = SND_MASTER_GAIN;
+    // ---- Phase 7F output chain: tone shaping, then a brickwall limiter ----
+    this.toneLp = this.ctx.createBiquadFilter();
+    this.toneLp.type = 'lowpass';
+    this.toneLp.frequency.value = SND_TONE_LP_HZ;
+    this.toneLp.Q.value = 0.707;                 // Butterworth: no resonant bump at the corner
+    this.toneShelf = this.ctx.createBiquadFilter();
+    this.toneShelf.type = 'highshelf';
+    this.toneShelf.frequency.value = SND_TONE_SHELF_HZ;
+    this.toneShelf.gain.value = SND_TONE_SHELF_DB;
+    this.limiter = this.ctx.createDynamicsCompressor();
+    this.limiter.threshold.value = -6;
+    this.limiter.knee.value = 0;                 // hard knee = limiter, not compressor
+    this.limiter.ratio.value = 20;
+    this.limiter.attack.value = 0.003;
+    this.limiter.release.value = 0.12;
+    this.master.connect(this.toneLp);
+    this.toneLp.connect(this.toneShelf);
+    this.toneShelf.connect(this.limiter);
+    this.limiter.connect(this.ctx.destination);
     // Effects run on their own bus so the whole bank can be balanced UNDER the music
     // bed (Music.bus sits at 0.16-0.20) with one number instead of by re-tuning every
     // cue. The legacy ambient score (Music.bus) still connects to master directly and
@@ -853,10 +899,17 @@ const Snd = {
   },
   // Cheap sidechain: ramp musicDuck down `db` decibels then back up over `ms`, no
   // compressor node. Used by loud game SFX (alien bite, laser) and by stinger().
+  _duckFloor: 1, _duckUntil: 0,
   duckMusic(db, ms) {
     if (!this.musicDuck || !this.ctx) return;
     const t = this.ctx.currentTime;
     const floor = Math.pow(10, -db / 20);
+    // Phase 7F: with ducking now systematic, a shallow duck arriving under a deeper one
+    // that is still recovering would RAISE the music mid-dip -- audible as a pump. Deeper
+    // wins while it is still active; equal or shallower is ignored.
+    if (t < this._duckUntil && floor > this._duckFloor) return;
+    this._duckFloor = floor;
+    this._duckUntil = t + 0.03 + ms / 1000;
     this.musicDuck.gain.cancelScheduledValues(t);
     this.musicDuck.gain.setValueAtTime(this.musicDuck.gain.value, t);
     this.musicDuck.gain.linearRampToValueAtTime(floor, t + 0.03);
@@ -2250,7 +2303,7 @@ const TANK_SHOP = [
 const PETS = [
   { id:'tuck',    name:'Tuck the Snail',           desc:'Crawls the tank floor and collects any coins you miss. Hides while aliens are in the tank.' },
   { id:'barnaby', name:'Barnaby the Oyster',       desc:'Shuts his shell over any baby sunfin beside him when aliens arrive \u2014 two at a time, and you cannot feed them in there.' },
-  { id:'quill',   name:'Quill the Needlefish',     desc:'Attacks any alien in the tank, roughly as hard as a level 1 laser.' },
+  { id:'quill',   name:'Quill the Needlefish',     desc:'Attacks any alien in the tank. Each jab does exactly the damage of a level 1 laser.' },
   { id:'marigold',name:'Marigold the Nursefish',   desc:'Gives birth to a baby sunfin every 26 seconds. She will not breed during an alien attack.' },
   { id:'fennel',  name:'Fennel the Seahorse',      desc:'Spits a level 2 pellet at nearby hungry fish every 3 seconds — and it never counts against your food limit.' },
   { id:'dollop',  name:'Dollop the Jellyfish',     desc:'Swims the whole tank \u2014 floor to surface \u2014 collecting coins, and never hides when aliens arrive.' },
@@ -2523,6 +2576,23 @@ const Save = {
   wipe()  { if (this._writeTimer) { clearTimeout(this._writeTimer); this._writeTimer = null; } Storage.removeSync(SAVE_KEY); },
 };
 if (WIPE_SAVE) { Save.wipe(); console.warn('[wipe] ?wipe=1 - save key cleared before load'); }
+// ?shot= staged save injection: writes a known-good save directly through the same
+// Storage facade every real write already targets (SAVE_KEY), so shot mode needs no
+// adb/APK save-poking — just this in-page write, before Save.load() reads it back.
+// Matches the "15 stages cleared, several pets hatched" save store/README.md documents
+// for the native-capture pass (pets tuck..nettle, tank 3/level 0, full 3-star bitmask).
+if (SHOT === 'pedia' || SHOT === 'map' || SHOT === 'hatch' || SHOT === 'invasion' || SHOT === 'tank') {
+  const shotPetIds = PETS.slice(0, 15).map(p => p.id);
+  const shotStars = {}, shotPediaSeen = [];
+  for (let i = 0; i < 15; i++) { shotStars[i] = 7; shotPediaSeen.push('p:' + shotPetIds[i]); }
+  Storage.setSync(SAVE_KEY, JSON.stringify({
+    version: 1, tank: 3, level: 0, pets: shotPetIds, best: {}, pediaSeen: shotPediaSeen,
+    stars: shotStars, daily: { last: '', streak: 0, bestStreak: 0 }, pet: '',
+    audio: { music: 0.8, sfx: 1.0 },
+    ads: { lastMidTs: 0, winsSinceMid: 2, totals: { mid: 0, rew: 0, dismissed: 0 } },
+    haptics: true,
+  }));
+}
 Save.load();
 
 // ============ CANVAS SETUP ============
@@ -5250,8 +5320,10 @@ const PET_BEHAVIOR = {
   // against your food limit". ONE pellet, ONE fish, within reach: the tank's other
   // mouths are still the player's problem.
   fennel:   { bucket: 'feeder',    params: { interval: 3, tier: 1, range: 150, one: true } },
-  // defender — "roughly as hard as a level 1 laser". Damage is deliberately the laser's
-  // level-1 number, so he fades as alien HP climbs; see the report.
+  // defender — "exactly the damage of a level 1 laser". damage:1 IS the level-1 laser
+  // number (the laser fires hitAlien(target, Game.laser)), and alien HP is documented in
+  // level-1 laser hits, so the card doubles as the player's ruler for defender damage.
+  // Retuning laser tier 1 moves this row AND Quill's card — keep them in step.
   quill:    { bucket: 'defender',  params: { damage: 1, interval: 1.1, reach: 46,
                                              speed: 88, zone: 'any' } },
   // producer — "a baby sunfin every 26 seconds, will not breed during an alien attack".
@@ -8191,7 +8263,9 @@ if (SHOW_FPS) {
 let lastT = performance.now();
 function frame(now) {
   requestAnimationFrame(frame);
-  let dt = (now - lastT) / 1000;
+  // SHOT_FROZEN (?shot= capture harness): dt pinned to 0 so nothing simulated ever
+  // advances past the staged frame — rendering still runs every tick, only the sim does not.
+  let dt = SHOT_FROZEN ? 0 : (now - lastT) / 1000;
   lastT = now;
   if (dt > 0.05) dt = 0.05;      // clamp after a tab-switch stall
   Game.time += dt;
@@ -8789,7 +8863,10 @@ $('resultScreen').addEventListener('click', () => {
 // and the pet's portrait (same halo-and-emblem drawing the pedia and old win card
 // use) swims in from the left. All procedural, all on one 230px canvas.
 let hatchOpenT = 0, hatchRaf = 0, hatchSkip = null;
-function showHatch(pet, r) {
+// `freezeAtSeconds` (?shot=hatch only): when given, draw() is called exactly once at
+// t0 + freezeAtSeconds and never rescheduled via rAF — deterministically parks the
+// ceremony at that exact animation second instead of racing a setTimeout against it.
+function showHatch(pet, r, freezeAtSeconds) {
   hatchOpenT = performance.now();
   $('hatchName').textContent = pet.name;
   $('hatchTag').textContent  = `NEW PET: ${pet.name} — added to the Aquapedia`;
@@ -8843,8 +8920,9 @@ function showHatch(pet, r) {
       drawEmblem(g, pet.id, px, py, 186);
     }
     g.restore();
-    hatchRaf = requestAnimationFrame(draw);
+    if (freezeAtSeconds == null) hatchRaf = requestAnimationFrame(draw);
   };
+  if (freezeAtSeconds != null) { draw(t0 + freezeAtSeconds * 1000); return; }
   hatchRaf = requestAnimationFrame(draw);
 }
 $('hatchScreen').addEventListener('click', () => {
@@ -9819,6 +9897,39 @@ function musicGainTrim(id) { return MUSIC_GAIN_TRIM[id] ?? 1; }
   // steps forever through the same repeating pattern.
   const H = (len, entries) => { const a = Array(len).fill(null); for (const [i, ev] of entries) a[i] = ev; return a; };
   const tile = (bar, n) => { const out = []; for (let i = 0; i < n; i++) out.push(...bar); return out; };
+
+  // Phase 7F. tile() repeats a bar VERBATIM, which is why every track's true melodic
+  // period was one bar -- 2.2-3.3s depending on tempo, i.e. 42-54 repetitions of the same
+  // figure in a two-minute level. The declared `bars: 8` was never the period.
+  //
+  // tileVary tiles the same authored hook but mutates it on two of every four passes, so
+  // the phrase becomes A A' A A'' and the true period is FOUR bars instead of one. No new
+  // melody is written: the variations are derived from the hook itself.
+  //   pass 1 of 4: drop the last sounding note  -- a breath, so the phrase can land
+  //   pass 3 of 4: lift the last two notes one scale degree -- an answering cadence
+  // Both mutations are scale-degree operations, so they stay in key in every mode the
+  // tracks use (major, lydian, whole-tone, natural minor, pentatonic).
+  const tileVary = (bar, n) => {
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const v = i % 4;
+      if (v !== 1 && v !== 3) { out.push(...bar); continue; }
+      const copy = bar.slice();
+      const idx = [];
+      for (let k = 0; k < copy.length; k++) if (copy[k]) idx.push(k);
+      if (idx.length) {
+        if (v === 1) {
+          copy[idx[idx.length - 1]] = null;
+        } else {
+          for (const k of idx.slice(-2)) {
+            copy[k] = Object.assign({}, copy[k], { deg: copy[k].deg + 1 });
+          }
+        }
+      }
+      out.push(...copy);
+    }
+    return out;
+  };
   const hz = (root, scale, deg, oct = 0) => noteFreq({ root, scale }, { deg, oct });
 
   // Shared curve shapes for the tank tracks' 0.0/0.5/1.0 tiering: bass+pad always on
@@ -9853,7 +9964,7 @@ function musicGainTrim(id) { return MUSIC_GAIN_TRIM[id] ?? 1; }
       // "marimba-style FM bells" — the melody, a short pentatonic phrase.
       { name: 'bells', voice: 'fmBell', baseGain: 0.4, curve: ALWAYS,
         params: { ratio: 3, index: 90, attack: 0.003, decay: 0.5, sustain: 0.05, release: 0.3 },
-        pattern: tile(H(16, [[0, { deg: 0, oct: 1, len: 2, vel: 0.55 }], [3, { deg: 2, oct: 1, len: 2, vel: 0.5 }],
+        pattern: tileVary(H(16, [[0, { deg: 0, oct: 1, len: 2, vel: 0.55 }], [3, { deg: 2, oct: 1, len: 2, vel: 0.5 }],
                              [6, { deg: 4, oct: 1, len: 2, vel: 0.55 }], [10, { deg: 2, oct: 1, len: 2, vel: 0.45 }],
                              [13, { deg: 0, oct: 1, len: 2, vel: 0.5 }]]), 8) },
     ],
@@ -9870,7 +9981,7 @@ function musicGainTrim(id) { return MUSIC_GAIN_TRIM[id] ?? 1; }
         pattern: tile(H(16, [[0, { deg: 0, oct: 0, len: 16, vel: 0.4 }]]), 8) },
       { name: 'arpeggio', voice: 'pluck', baseGain: 0.4, curve: ALWAYS,
         params: { damping: 0.25, decay: 0.6 },
-        pattern: tile(H(16, [[0, { deg: 0, oct: 1, len: 2, vel: 0.5 }], [2, { deg: 1, oct: 1, len: 2, vel: 0.48 }],
+        pattern: tileVary(H(16, [[0, { deg: 0, oct: 1, len: 2, vel: 0.5 }], [2, { deg: 1, oct: 1, len: 2, vel: 0.48 }],
                              [4, { deg: 2, oct: 1, len: 2, vel: 0.5 }], [6, { deg: 3, oct: 1, len: 2, vel: 0.5 }],
                              [8, { deg: 4, oct: 1, len: 2, vel: 0.52 }], [11, { deg: 2, oct: 1, len: 2, vel: 0.45 }],
                              [14, { deg: 0, oct: 1, len: 2, vel: 0.4 }]]), 8) },
@@ -9889,7 +10000,7 @@ function musicGainTrim(id) { return MUSIC_GAIN_TRIM[id] ?? 1; }
         pattern: tile(H(16, [[0, { deg: 2, oct: 0, len: 16, vel: 0.35 }]]), 8) },
       { name: 'ukulele', voice: 'pluck', baseGain: 0.5, curve: MELODY_IN,
         params: { damping: 0.45, decay: 0.35 },
-        pattern: tile(H(16, [[0, { deg: 0, oct: 1, len: 2, vel: 0.6 }], [3, { deg: 2, oct: 1, len: 2, vel: 0.55 }],
+        pattern: tileVary(H(16, [[0, { deg: 0, oct: 1, len: 2, vel: 0.6 }], [3, { deg: 2, oct: 1, len: 2, vel: 0.55 }],
                              [6, { deg: 4, oct: 1, len: 2, vel: 0.6 }], [8, { deg: 4, oct: 1, len: 2, vel: 0.55 }],
                              [11, { deg: 2, oct: 1, len: 2, vel: 0.5 }], [14, { deg: 0, oct: 1, len: 2, vel: 0.5 }]]), 8) },
       { name: 'bubbles', voice: 'noise', baseGain: 0.3, curve: PERC_IN,
@@ -9910,7 +10021,7 @@ function musicGainTrim(id) { return MUSIC_GAIN_TRIM[id] ?? 1; }
         pattern: tile(H(16, [[0, { deg: 0, oct: 0, len: 16, vel: 0.45 }]]), 8) },
       { name: 'harp', voice: 'pluck', baseGain: 0.42, curve: MELODY_IN,
         params: { damping: 0.2, decay: 0.8 },
-        pattern: tile(H(32, [[0, { deg: 0, oct: 1, len: 4, vel: 0.5 }], [5, { deg: 2, oct: 1, len: 4, vel: 0.48 }],
+        pattern: tileVary(H(32, [[0, { deg: 0, oct: 1, len: 4, vel: 0.5 }], [5, { deg: 2, oct: 1, len: 4, vel: 0.48 }],
                              [10, { deg: 4, oct: 1, len: 4, vel: 0.5 }], [16, { deg: 6, oct: 1, len: 4, vel: 0.5 }],
                              [21, { deg: 4, oct: 1, len: 4, vel: 0.45 }], [26, { deg: 2, oct: 1, len: 4, vel: 0.42 }]]), 4) },
       { name: 'tick', voice: 'fmBell', baseGain: 0.18, curve: PERC_IN,
@@ -9931,7 +10042,7 @@ function musicGainTrim(id) { return MUSIC_GAIN_TRIM[id] ?? 1; }
         pattern: tile(H(32, [[0, { deg: 4, oct: 0, len: 32, vel: 0.3 }]]), 4) },
       { name: 'koto', voice: 'pluck', baseGain: 0.42, curve: MELODY_IN,
         params: { damping: 0.55, decay: 0.25 },
-        pattern: tile(H(16, [[2, { deg: 0, oct: 1, len: 1, vel: 0.55 }], [5, { deg: 1, oct: 1, len: 1, vel: 0.5 }],
+        pattern: tileVary(H(16, [[2, { deg: 0, oct: 1, len: 1, vel: 0.55 }], [5, { deg: 1, oct: 1, len: 1, vel: 0.5 }],
                              [9, { deg: 2, oct: 1, len: 1, vel: 0.55 }], [12, { deg: 1, oct: 1, len: 1, vel: 0.48 }]]), 8) },
       { name: 'woodblock', voice: 'noise', baseGain: 0.22, curve: PERC_IN,
         params: { lp: 1000, decay: 0.04 },
@@ -9952,7 +10063,7 @@ function musicGainTrim(id) { return MUSIC_GAIN_TRIM[id] ?? 1; }
         pattern: tile(H(16, [[0, { deg: 0, oct: -1, len: 16, vel: 0.35 }]]), 8) },
       { name: 'bellmelody', voice: 'fmBell', baseGain: 0.32, curve: MELODY_IN,
         params: { ratio: 2.8, index: 70, attack: 0.01, decay: 0.6, sustain: 0.1, release: 0.5 },
-        pattern: tile(H(16, [[3, { deg: 3, oct: 0, len: 3, vel: 0.55 }], [10, { deg: 1, oct: 0, len: 3, vel: 0.5 }]]), 8) },
+        pattern: tileVary(H(16, [[3, { deg: 3, oct: 0, len: 3, vel: 0.55 }], [10, { deg: 1, oct: 0, len: 3, vel: 0.5 }]]), 8) },
       { name: 'thump', voice: 'noise', baseGain: 0.4, curve: PERC_IN,
         params: { lp: 110, decay: 0.35, tone: 90 },
         pattern: tile(H(32, [[0, { deg: 0, vel: 0.6 }], [24, { deg: 0, vel: 0.5 }]]), 4) },
@@ -9974,7 +10085,7 @@ function musicGainTrim(id) { return MUSIC_GAIN_TRIM[id] ?? 1; }
       { name: 'tremolo', voice: 'tremolo', baseGain: 0.4,
         curve: x => x < 0.3 ? 0 : Math.min(1, (x - 0.3) / 0.3),   // hottest tank — melody arrives a touch earlier
         params: { wave: 'sawtooth', cutoff: 2600, tremRate: 8, tremDepth: 0.6, attack: 0.02, decay: 0.15, sustain: 0.7, release: 0.3 },
-        pattern: tile(H(16, [[2, { deg: 4, oct: 1, len: 3, vel: 0.6 }], [6, { deg: 3, oct: 1, len: 3, vel: 0.55 }],
+        pattern: tileVary(H(16, [[2, { deg: 4, oct: 1, len: 3, vel: 0.6 }], [6, { deg: 3, oct: 1, len: 3, vel: 0.55 }],
                              [10, { deg: 5, oct: 1, len: 3, vel: 0.6 }], [13, { deg: 4, oct: 1, len: 3, vel: 0.55 }]]), 8) },
       { name: 'perc', voice: 'noise', baseGain: 0.26, curve: PERC_IN,
         params: { lp: 2600, decay: 0.05 },
@@ -10074,10 +10185,12 @@ function musicGainTrim(id) { return MUSIC_GAIN_TRIM[id] ?? 1; }
       // "things just got busier" rather than just getting quieter.
       { name: 'melody', voice: 'pluck', baseGain: 0.45, curve: x => x < 0.4 ? 0 : (x - 0.4) / 0.6,
         params: { damping: 0.3, decay: 0.9 },
-        pattern: stepArray(16, i => {
+        // Phase 7F: a bare 16-step array loops at its OWN length (pattern[step % length]),
+        // so this was a one-bar melodic loop like every tiled layer. Wrapped to a 4-bar phrase.
+        pattern: tileVary(stepArray(16, i => {
           const hits = { 2: 0, 6: 2, 9: 3, 13: 4 };
           return (i in hits) ? { deg: hits[i], oct: 1, len: 2, vel: 0.75 } : null;
-        }) },
+        }), 4) },
       // Percussion: two voices sharing one layer (kick + hat), gain only half-scaled
       // by intensity so a beat is always audible even at floor.
       { name: 'perc', voice: 'noise', baseGain: 0.4, curve: x => 0.5 + 0.5 * x, multiVoice: true,
@@ -10735,8 +10848,29 @@ const Sfx = {
     this.activeTotal++;
     const bus = def.bus === 'ui' ? Snd.uiBus : Snd.sfxBus;
     const trim = ctx.createGain(); trim.gain.value = sfxGainTrim(id); trim.connect(bus);
+
+    // ---- Phase 7F: ducking is now a POLICY, not five hand-placed calls ----
+    // Every game cue dips the music a little; UI dips it less. The five existing explicit
+    // duckMusic() calls are deeper and still win via the depth guard above.
+    Snd.duckMusic(def.bus === 'ui' ? 1.2 : 2.5, def.bus === 'ui' ? 90 : 130);
+
+    // ---- Phase 7F: per-play detune, without touching a single build() ----
+    // Every build() creates its oscillators through ctx.createOscillator. Shadowing that
+    // one method on the instance for the duration of the (synchronous) build call means
+    // every oscillator comes back pre-detuned, and no sound definition changes. Deleting
+    // the shadow restores the prototype method. `finally` so a throwing build() cannot
+    // leave the patch installed.
+    const cents = (Math.random() * 2 - 1) * SFX_DETUNE_CENTS;
+    const realCreateOsc = ctx.createOscillator;
+    ctx.createOscillator = function () {
+      const o = realCreateOsc.call(ctx);
+      o.detune.value = cents;
+      return o;
+    };
     let dur = 0.2;
-    try { dur = def.build(ctx, trim, opts) || 0.2; } catch (e) { console.error('Sfx build failed:', id, e); }
+    try { dur = def.build(ctx, trim, opts) || 0.2; }
+    catch (e) { console.error('Sfx build failed:', id, e); }
+    finally { delete ctx.createOscillator; }
     // Hard stop at 2s regardless of `dur`: disconnecting `trim` silences every node
     // that build() connected through it in one shot, so even a future build() that
     // mis-schedules its own o.stop() can never produce an actually-stuck note.
@@ -11814,6 +11948,236 @@ function runPetAudit() {
   }
   window.__petAudit = report;
   return report;
+}
+
+// ============ PHASE 7F — ?audio=test SOUND BOARD ============
+// A dev-only bench for auditioning the whole SFX bank ON THE DEVICE, one sound at a time,
+// with the output chain live under your thumb. It exists because the mix has to be tuned by
+// ear on a real iPhone speaker, and every previous audio pass was tuned by reading numbers.
+//
+// Four things it does that a single tap cannot:
+//   REPEAT x10 fires a cue at its own real minInterval. Repetition fatigue and missing
+//     detune are invisible on one tap; this is the control that makes coinFloorTick
+//     obviously wrong.
+//   STACK fires a three-alien wave's worth of cues inside one frame, which is the only way
+//     to hear the limiter working (or not).
+//   MEASURE offline-renders every sound and reports its peak level and a dominant-frequency
+//     estimate, so the lane assignment for the next pass comes from measurement rather than
+//     from anybody's memory of what a sound "sounds like".
+//   The sliders write straight into the live graph, so a value you like is a value you can
+//     read off the screen and tell me.
+
+function audioTestMeasure(id) {
+  // Render one sound offline and report peak level + a dominant-frequency estimate.
+  // Zero-crossing rate is a crude estimator, but for these short, mostly single-oscillator
+  // cues it is honest enough to sort a lane by -- and it is MEASURED, not a table someone
+  // has to keep in sync with the synthesis.
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const def = Sfx.defs[id];
+  if (!OAC || !def) return Promise.resolve(null);
+  const sr = 44100, octx = new OAC(1, Math.ceil(sr * 2.2), sr);
+  const dest = octx.createGain();
+  dest.gain.value = sfxGainTrim(id);
+  dest.connect(octx.destination);
+  try { def.build(octx, dest, {}); } catch (e) { return Promise.resolve(null); }
+  return octx.startRendering().then(buf => {
+    const d = buf.getChannelData(0);
+    let peak = 0;
+    for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > peak) peak = a; }
+    if (peak < 1e-5) return { id: id, peak: 0, db: -Infinity, hz: 0 };
+    // Count zero crossings only where the signal is actually sounding, so the silent tail
+    // does not drag the estimate down.
+    const gate = peak * 0.15;
+    let cross = 0, n = 0, prev = 0;
+    for (let i = 0; i < d.length; i++) {
+      if (Math.abs(d[i]) < gate) continue;
+      n++;
+      if (prev !== 0 && ((d[i] >= 0) !== (prev >= 0))) cross++;
+      prev = d[i];
+    }
+    const hz = n > 1 ? (cross / 2) / (n / sr) : 0;
+    return { id: id, peak: peak, db: 20 * Math.log10(peak), hz: hz };
+  }).catch(() => null);
+}
+
+function initAudioTest() {
+  const LANES = [
+    ['coins',  'COINS'], ['ui', 'UI'], ['fish', 'FISH'], ['food', 'FOOD'],
+    ['pets',   'PETS'],  ['aliens', 'ALIENS'], ['laser', 'LASER'], ['oyster', 'OYSTER'],
+  ];
+  const css = document.createElement('style');
+  css.textContent = [
+    '#atRoot{position:fixed;inset:0;z-index:9999;overflow:auto;background:#071A26;color:#E6EFF2;',
+    "  font:600 13px/1.4 'Trebuchet MS',system-ui,sans-serif;padding:10px 10px 60px;-webkit-overflow-scrolling:touch}",
+    '#atRoot h1{font-size:15px;margin:0 0 8px;color:#E8A21A;letter-spacing:.06em}',
+    '#atRoot h2{font-size:11px;margin:16px 0 6px;color:#7FC3E8;letter-spacing:.14em}',
+    '#atUnlock{width:100%;min-height:52px;margin-bottom:10px;border:2px solid #E8A21A;border-radius:10px;',
+    '  background:#2A2110;color:#E8A21A;font:800 15px sans-serif;letter-spacing:.1em}',
+    '#atUnlock.on{border-color:#5FD0A0;color:#5FD0A0;background:#0d2a1f}',
+    '.atCtl{display:flex;align-items:center;gap:8px;margin:6px 0}',
+    '.atCtl label{flex:0 0 108px;font-size:11px;color:#A3BAC4}',
+    '.atCtl input{flex:1;min-height:32px}',
+    '.atCtl b{flex:0 0 74px;text-align:right;font-family:ui-monospace,monospace;font-size:12px;color:#E8A21A}',
+    '.atGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px}',
+    '.atCell{display:flex;gap:4px}',
+    '.atBtn{flex:1;min-height:46px;border:1px solid #1B4055;border-radius:8px;background:#0C2837;',
+    '  color:#E6EFF2;font:600 11px sans-serif;padding:4px 6px;text-align:left;overflow:hidden}',
+    '.atBtn:active{background:#16455e}',
+    '.atBtn small{display:block;color:#748C97;font-size:10px;font-family:ui-monospace,monospace}',
+    '.atRep{flex:0 0 40px;min-height:46px;border:1px solid #1B4055;border-radius:8px;',
+    '  background:#0a2231;color:#7FC3E8;font:700 11px sans-serif}',
+    '.atWide{width:100%;min-height:48px;margin:6px 0;border:1px solid #7FC3E8;border-radius:8px;',
+    '  background:#0B2A3A;color:#7FC3E8;font:800 13px sans-serif;letter-spacing:.08em}',
+    '#atLog{font-family:ui-monospace,monospace;font-size:11px;color:#A8B85B;white-space:pre;',
+    '  background:#051520;border-radius:6px;padding:8px;margin-top:8px;overflow-x:auto;min-height:40px}',
+  ].join('');
+  document.head.appendChild(css);
+
+  // Take the screen: every overlay in this game sits at z-index 50, and the boot has
+  // already put the start screen up by the time this route runs.
+  const screens = document.querySelectorAll('.overlay');
+  for (let i = 0; i < screens.length; i++) screens[i].classList.add('hidden');
+  const gameCv = document.getElementById('game');
+  if (gameCv) gameCv.style.display = 'none';
+  const hb = document.getElementById('hudBtns');
+  if (hb) hb.classList.remove('show');
+
+  const root = document.createElement('div');
+  root.id = 'atRoot';
+  document.body.appendChild(root);
+  const el = (tag, cls, txt) => { const e = document.createElement(tag);
+    if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
+
+  root.appendChild(el('h1', null, 'AQUA FRENZY · SOUND BOARD · build ' + GAME_BUILD));
+
+  // iOS will not start a context outside a real gesture, so the board opens locked and the
+  // first button IS the gesture. Everything else stays inert until this is pressed.
+  const unlock = el('button', null, 'TAP TO UNLOCK AUDIO');
+  unlock.id = 'atUnlock';
+  unlock.onclick = () => {
+    Snd.unlock(); Snd.resume();
+    setTimeout(() => {
+      const ok = Snd.running();
+      unlock.textContent = ok ? 'AUDIO RUNNING — ctx ' + Snd.ctx.sampleRate + 'Hz' : 'STILL SUSPENDED — TAP AGAIN';
+      unlock.classList.toggle('on', ok);
+    }, 120);
+  };
+  root.appendChild(unlock);
+
+  const log = el('div', null, 'ready.');
+  log.id = 'atLog';
+
+  // ---- live output-chain controls ----
+  root.appendChild(el('h2', null, 'OUTPUT CHAIN — LIVE'));
+  const ctl = (label, min, max, step, get, set, fmt) => {
+    const row = el('div', 'atCtl');
+    row.appendChild(el('label', null, label));
+    const i = document.createElement('input');
+    i.type = 'range'; i.min = min; i.max = max; i.step = step;
+    const out = el('b');
+    const paint = () => { out.textContent = fmt(get()); };
+    i.value = get();
+    i.oninput = () => { set(parseFloat(i.value)); paint(); };
+    paint();
+    row.appendChild(i); row.appendChild(out);
+    root.appendChild(row);
+  };
+  ctl('master', 0, 1, 0.01,
+      () => (Snd.master ? Snd.master.gain.value : SND_MASTER_GAIN),
+      v => { if (Snd.master) Snd.master.gain.value = v; },
+      v => v.toFixed(2));
+  ctl('lowpass Hz', 1000, 12000, 100,
+      () => (Snd.toneLp ? Snd.toneLp.frequency.value : SND_TONE_LP_HZ),
+      v => { if (Snd.toneLp) Snd.toneLp.frequency.value = v; },
+      v => Math.round(v) + ' Hz');
+  ctl('shelf dB', -12, 0, 0.5,
+      () => (Snd.toneShelf ? Snd.toneShelf.gain.value : SND_TONE_SHELF_DB),
+      v => { if (Snd.toneShelf) Snd.toneShelf.gain.value = v; },
+      v => v.toFixed(1) + ' dB');
+  ctl('limit thresh', -24, 0, 0.5,
+      () => (Snd.limiter ? Snd.limiter.threshold.value : -6),
+      v => { if (Snd.limiter) Snd.limiter.threshold.value = v; },
+      v => v.toFixed(1) + ' dB');
+
+  // ---- whole-bank actions ----
+  const stack = el('button', 'atWide', 'STACK TEST — a 3-alien wave in one frame');
+  stack.onclick = () => {
+    Snd.unlock();
+    // What actually happens when a wave lands and the player is collecting: three alien
+    // cues, a bite, two coins, a tick and a tap, all inside one frame. If the limiter is
+    // doing its job this is loud but not distorted.
+    const burst = ['alienSpawn_mite', 'alienSpawn_ravager', 'alienSpawn_streak', 'alienBite',
+                   'coinGold', 'coinDiamond', 'coinFloorTick', 'uiTap', 'laserFire'];
+    for (const id of burst) if (Sfx.defs[id]) Sfx.play(id);
+    log.textContent = 'STACK: fired ' + burst.length + ' cues in one frame.\n' +
+      'Global cap is ' + Sfx.MAX_CONCURRENT + ', so some were refused by design.';
+  };
+  root.appendChild(stack);
+
+  const measure = el('button', 'atWide', 'MEASURE ALL — offline render, peak + dominant Hz');
+  measure.onclick = async () => {
+    measure.textContent = 'MEASURING…';
+    const ids = Object.keys(Sfx.defs);
+    const out = [];
+    for (const id of ids) { const r = await audioTestMeasure(id); if (r) out.push(r); }
+    out.sort((a, b) => b.hz - a.hz);
+    const pad = (s, n) => (String(s) + '                    ').slice(0, n);
+    log.textContent = pad('ID', 20) + pad('PEAK dBFS', 11) + 'DOMINANT Hz\n' +
+      out.map(r => pad(r.id, 20) + pad(r.db === -Infinity ? 'silent' : r.db.toFixed(1), 11) +
+                   Math.round(r.hz)).join('\n');
+    measure.textContent = 'MEASURE ALL — ' + out.length + ' sounds';
+  };
+  root.appendChild(measure);
+  root.appendChild(log);
+
+  // ---- the bank, grouped by lane ----
+  const seen = Object.create(null);
+  const addGroup = (key, title) => {
+    const ids = (Sfx.groups[key] || []).slice().sort();
+    if (!ids.length) return;
+    root.appendChild(el('h2', null, title + '  ·  ' + ids.length));
+    const grid = el('div', 'atGrid');
+    for (const id of ids) {
+      seen[id] = 1;
+      const def = Sfx.defs[id];
+      const cell = el('div', 'atCell');
+      const b = el('button', 'atBtn');
+      b.appendChild(document.createTextNode(id));
+      b.appendChild(el('small', null, 'x' + def.maxVoices + '  ' + def.minInterval + 's  ' + def.bus));
+      b.onclick = () => { Snd.unlock(); Sfx.play(id); log.textContent = 'play  ' + id; };
+      const rep = el('button', 'atRep', '×10');
+      // Fires at the sound's OWN minInterval plus a hair, so the anti-stack window does not
+      // silently swallow the repeats and hide the very fatigue we are testing for.
+      rep.onclick = () => {
+        Snd.unlock();
+        const gap = Math.max(60, def.minInterval * 1000 + 20);
+        let i = 0;
+        const tick = () => { if (i++ >= 10) return; Sfx.play(id); setTimeout(tick, gap); };
+        tick();
+        log.textContent = 'repeat x10  ' + id + '  @' + Math.round(gap) + 'ms';
+      };
+      cell.appendChild(b); cell.appendChild(rep);
+      grid.appendChild(cell);
+    }
+    root.appendChild(grid);
+  };
+  for (const [k, t] of LANES) addGroup(k, t);
+  // Anything registered under a category the list above does not name still gets a home,
+  // so a sound added later cannot silently go missing from the bench.
+  const rest = Object.keys(Sfx.defs).filter(id => !seen[id]).sort();
+  if (rest.length) {
+    root.appendChild(el('h2', null, 'OTHER  ·  ' + rest.length));
+    const grid = el('div', 'atGrid');
+    for (const id of rest) {
+      const cell = el('div', 'atCell');
+      const b = el('button', 'atBtn', id);
+      b.onclick = () => { Snd.unlock(); Sfx.play(id); log.textContent = 'play  ' + id; };
+      cell.appendChild(b); grid.appendChild(cell);
+    }
+    root.appendChild(grid);
+  }
+
+  window.__audioTest = { measure: audioTestMeasure, ids: Object.keys(Sfx.defs) };
 }
 // ============ ART AUDIT (?audit=art, dev-only) ============
 
@@ -12911,6 +13275,74 @@ function auditSheetMap() {
     { cellW: 166, cellH: 148 });
 }
 
+// ============ SHOT CAPTURE HARNESS (?shot=<name>, dev-only) ============
+// Jumps straight to a named screen with deterministic staged state, for store-screenshot
+// capture without adb/APK or timing-dependent waits. Unlike ?icon=1/?audit=art (which skip
+// Input/Ads/Demo/frame entirely), a shot screen is a REAL screen from the real game — the
+// map, the pedia, a tank, the hatch ceremony — so Input and Ads run normally and the frame
+// loop runs normally too; only SHOT_FROZEN (set per-case below) stops the sim from advancing
+// once the target frame is staged. Changes no gameplay/economy/balance — presentation only.
+function initShotMode() {
+  Input.init();
+  Ads.init();
+  switch (SHOT) {
+    case 'map':
+      // Stage map with stars + the daily-challenge card — openMap() alone is deterministic,
+      // nothing here is time-based, so no freeze is needed.
+      openMap();
+      break;
+    case 'pedia':
+      // Aquapedia grid, populated by the staged save injected above (Save.load() already
+      // ran with it in place) — pets tuck..nettle discovered, per store/README.md.
+      openPedia('startScreen');
+      break;
+    case 'tank': {
+      // Tank 1-1 gameplay: the two starting sunfins from startLevel() plus a couple of
+      // coins already mid-flight, frozen the instant they're placed.
+      Game.startLevel(0, 0);
+      spawnCoin(W * 0.42, TANK_TOP + TANK_H * 0.35, 'gold');
+      spawnCoin(W * 0.58, TANK_TOP + TANK_H * 0.55, 'diamond');
+      SHOT_FROZEN = true;
+      break;
+    }
+    case 'invasion': {
+      // Tank 1-5 carries the game's only guaranteed 2-alien wave ('mite+ravager' — see
+      // LEVELS), so this reuses that stage's own attack pattern rather than inventing a
+      // new spawn combo. spawnAlien() is the same function updateAttacks() calls when a
+      // real wave lands (see the `for (const k of Game.pendingAttack.split('+'))` line);
+      // this just calls it directly instead of waiting out a live countdown. Game.warnT is
+      // then pinned > 0 purely so drawWarning() keeps painting the INCOMING banner + a
+      // couple of fish/coins already in the tank, all in the same frozen frame.
+      Game.startLevel(0, 4);
+      spawnCoin(W * 0.5, TANK_TOP + TANK_H * 0.3, 'gold');
+      Game.pendingAttack = 'mite+ravager';
+      for (const k of Game.pendingAttack.split('+')) spawnAlien(k);
+      Game.warnT = 1.6;
+      SHOT_FROZEN = true;
+      break;
+    }
+    case 'hatch': {
+      // Results screen -> hatch ceremony, frozen at t=2.0s into showHatch's own timeline
+      // (past the shell-fly-apart reveal, pet settled and fully visible — the clearest
+      // frame of the animation). Set directly via showHatch's freezeAtSeconds param, not a
+      // setTimeout guess, so this can never land on the wrong frame.
+      const pet = petAt(0, 0);
+      showResults({ pet, isNew: true, time: 42, kills: 0, lost: 0,
+        stars: { bits: 7, par: 60, noLaserStage: false } });
+      $('resultScreen').classList.add('hidden');
+      showHatch(pet, {}, 2.0);
+      SHOT_FROZEN = true;
+      break;
+    }
+    default:
+      console.warn('[shot] unknown ?shot= value: ' + SHOT + ' — falling through to the menu');
+      Demo.start();
+      break;
+  }
+  if (Music.on) Music.setEnabled(false);   // capture is visual-only; keep the tab silent
+  requestAnimationFrame(frame);
+}
+
 // ============ START ============
 
 // ---- Native shell bootstrap (Capacitor, native-1) ----
@@ -12939,6 +13371,10 @@ if (SHOW_ICON) {
   // Store-asset render mode: skip the game boot (Demo/frame loop/menu music) entirely
   // so the icon canvas is the only thing drawn — see initIconRender() above.
   initIconRender();
+} else if (SHOW_AUDIOTEST) {
+  // Same contract as ?icon=1 and ?audit=art: no Input, no Demo, no frame loop, no menu
+  // music. The board owns the audio graph so nothing else is competing for the speaker.
+  initAudioTest();
 } else if (SHOW_AUDIT) {
   // Art-audit contact sheets: same contract as ?icon=1 — skip Input/Dbg/Ads/Demo/frame
   // and the menu music entirely, so nothing animates, no AudioContext is ever built, the
@@ -12946,6 +13382,11 @@ if (SHOW_ICON) {
   // what makes the sheets byte-reproducible. Input.init() is skipped deliberately, not
   // incidentally: its contextmenu preventDefault would block right-click-saving a sheet.
   initArtAudit();
+} else if (SHOT) {
+  // ?shot=<name> capture harness — see initShotMode() above. Dead when BUILD_FLAGS.dev is
+  // false, exactly like every other dev route in this if/else chain (SHOT is already null
+  // in that case, so this branch can never be entered).
+  initShotMode();
 } else {
   Input.init();
   Dbg.init();
