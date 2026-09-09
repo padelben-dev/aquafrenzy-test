@@ -760,7 +760,13 @@ const SHOW_AUDIOTEST = BUILD_FLAGS.dev && QS.get('audio') === 'test';
 // on a real device. TEMPORARY: 8B makes v2 the only route and this flag comes out.
 // Changes no gameplay, economy, wave or balance value -- art only.
 const ALIENS_V2 = BUILD_FLAGS.dev && QS.get('aliens') === 'v2';
-const GAME_BUILD = 63;
+// ?pets=v2 (Phase 9A pet emblems): replaces the 35 emoji glyphs in PET_EMBLEM with
+// drawn Canvas 2D shapes, killing the file's last font dependency. Old emoji set stays
+// the default so the two can be A/B'd on a real device. TEMPORARY: comes out once the
+// procedural set is approved. Art only -- no behaviour, economy, persistence, or any
+// change to which pet hatches where.
+const PETS_V2 = BUILD_FLAGS.dev && QS.get('pets') === 'v2';
+const GAME_BUILD = 64;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -9578,8 +9584,9 @@ function buildMap() {
       const petEl = el(hatched ? 'petEmb' : 'petSil', PET_EMBLEM[petHere.id] || '🐠');
       // Equalise apparent size across the 35 glyphs (see sizeEmblemEl): the emoji differ
       // by up to 2.4x in inked width at one font size, so a shared font-size does not
-      // give a shared apparent size.
-      sizeEmblemEl(petEl, petHere.id, 34);
+      // give a shared apparent size. On the procedural route emblemInto swaps the text
+      // node for a canvas and returns true, and the glyph sizing is then meaningless.
+      if (!emblemInto(petEl, petHere.id, 34)) sizeEmblemEl(petEl, petHere.id, 34);
       el('hatchLine', hatched ? petHere.name : '???');
       if (locked) {
         el('lockBadge', '🔒');
@@ -9799,7 +9806,8 @@ function buildUnlockCard(r) {
     d.className = cls; d.textContent = txt; card.appendChild(d); return d;
   };
   const petHere = petAt(t, l);
-  el(fresh ? 'petSil' : 'petEmb', PET_EMBLEM[petHere.id] || '🐠');
+  emblemInto(el(fresh ? 'petSil' : 'petEmb', PET_EMBLEM[petHere.id] || '🐠'),
+             petHere.id, 34);
   el('lbl', `${t + 1}-${l + 1}`);
   if (fresh) el('lockBadge', '🔒');
   else if (done) el('doneIco', '✔');
@@ -10007,13 +10015,17 @@ const PEDIA_ALIEN_DESC = {
   splitjaw: 'A tireless eater with a heavy hide. The deep tanks send it in pairs.',
 };
 
-function pediaCard(revealed, name, desc, where, drawPortrait, emblem) {
+function pediaCard(revealed, name, desc, where, drawPortrait, emblem, embId) {
   const card = document.createElement('div');
   card.className = 'pedCard' + (revealed ? '' : ' unknown');
   if (emblem != null) {
     const e = document.createElement('div');
     e.className = 'emb';
     e.textContent = revealed ? emblem : '❓';
+    // A hidden entry keeps its '?' on both routes; only a revealed one gets the drawing.
+    // 76 = the .pedCard .emb line-height, so the drawing occupies the same vertical
+    // space the 52px emoji did rather than sitting visibly smaller beside it.
+    if (revealed && embId) emblemInto(e, embId, 76);
     card.appendChild(e);
   } else {
     const cv = document.createElement('canvas');
@@ -10092,7 +10104,7 @@ function pediaEntries() {
     const pet = PETS[i];
     pets.push({ id: 'p:' + pet.id, revealed: Save.data.pets.includes(pet.id),
       name: pet.name, desc: pet.desc, where: 'Hatches at ' + stageName(i),
-      emblem: PET_EMBLEM[pet.id] });
+      emblem: PET_EMBLEM[pet.id], embId: pet.id });
   }
 
   return { fish, aliens, pets };
@@ -10145,7 +10157,7 @@ function buildPedia() {
   list.innerHTML = '';
   const nowSeen = [];
   for (const e of tabs[pediaTab]) {
-    const card = pediaCard(e.revealed, e.name, e.desc, e.where, e.draw, e.emblem);
+    const card = pediaCard(e.revealed, e.name, e.desc, e.where, e.draw, e.emblem, e.embId);
     if (pediaUnseen(e)) {
       const n = document.createElement('span');
       n.className = 'pedNew';
@@ -10276,6 +10288,7 @@ function buildPetRow() {
     const c = document.createElement('div');
     c.className = 'petChip' + (id === '' ? ' none' : '') + (Save.data.pet === id ? ' sel' : '');
     c.textContent = label; c.title = title;
+    if (id) emblemInto(c, id, 26);   // Phase 9A: NONE keeps its word, pets get a drawing
     c.addEventListener('click', () => {
       Snd.init(); Snd.resume(); Sfx.play('uiPetSelect');
       Save.data.pet = id; Save.write();
@@ -12983,10 +12996,723 @@ function emblemMetrics(glyph) {
   return m;
 }
 
+// ============ PET EMBLEMS — PROCEDURAL (Phase 9A) ============
+// ?pets=v2 replaces the 35 emoji glyphs in PET_EMBLEM with drawn Canvas 2D shapes.
+//
+// WHY: PET_EMBLEM is emoji TEXT, which is a font dependency -- the one external asset
+// left in a file whose whole convention is that it has none. The glyphs render in a
+// different art style on Android, several do not render at all on some platforms, and
+// 24 of the 35 are an object or the wrong animal rather than the creature the pet is
+// named for (measured and listed in the 7B report). None of that is fixable with text.
+//
+// GEOMETRY: these rows do NOT do their own centring or scaling. Each draw(g) paints in a
+// loose +-50 box and drawEmblem measures the resulting INK and fits it, exactly as it
+// already does for a glyph. One normalisation, two paint sources -- so the 7B guarantees
+// (centre offset, fill band, no overflow) hold for procedural art by construction rather
+// than by re-derivation, and cannot drift apart from the emoji route while both exist.
+//
+// READ AT 22px: a map card draws these at clamp(22px,4.5vw,34px). Every shape is
+// therefore built from few, large, high-contrast masses. Fine internal detail is drawn
+// only where it survives being 20 pixels wide.
+
+// ---- shared primitives -------------------------------------------------------------
+// A tapered limb as a filled quad. Same idiom as the alien art: strokes cannot join a
+// fill path, and a limb that is part of the body's own path never separates from it.
+function peLimb(g, x0, y0, x1, y1, w0, w1) {
+  const dx = x1 - x0, dy = y1 - y0, L = Math.hypot(dx, dy) || 1;
+  const nx = -dy / L, ny = dx / L;
+  g.moveTo(x0 + nx * w0, y0 + ny * w0);
+  g.lineTo(x1 + nx * w1, y1 + ny * w1);
+  g.lineTo(x1 - nx * w1, y1 - ny * w1);
+  g.lineTo(x0 - nx * w0, y0 - ny * w0);
+  g.closePath();
+}
+function pePoly(g, pts) {
+  g.moveTo(pts[0], pts[1]);
+  for (let i = 2; i < pts.length; i += 2) g.lineTo(pts[i], pts[i + 1]);
+  g.closePath();
+}
+// The generic fish body every finned pet starts from: a lens with a blunt or pointed
+// nose at +x and a peduncle at -x. Kept in one place so a "fish" reads as a fish across
+// the set, and so the pets that are NOT fish are separated by silhouette rather than by
+// accident.
+function peBody(g, nose, tail, ht, brow) {
+  brow = brow == null ? 1 : brow;
+  g.moveTo(nose, 0);
+  g.quadraticCurveTo(nose * 0.45, -ht * brow, (nose + tail) / 2, -ht);
+  g.quadraticCurveTo(tail * 0.72, -ht * 0.72, tail, -ht * 0.30);
+  g.lineTo(tail, ht * 0.30);
+  g.quadraticCurveTo(tail * 0.72, ht * 0.72, (nose + tail) / 2, ht);
+  g.quadraticCurveTo(nose * 0.45, ht * brow, nose, 0);
+  g.closePath();
+}
+// Forked caudal fin at the tail end.
+function peTail(g, x, spread, sweep) {
+  g.moveTo(x, 0);
+  g.lineTo(x - sweep, -spread);
+  g.quadraticCurveTo(x - sweep * 0.42, 0, x - sweep, spread);
+  g.closePath();
+}
+function peFill(g, style, fn) { g.beginPath(); fn(); g.fillStyle = style; g.fill(); }
+function peEye(g, x, y, r, dark) {
+  g.fillStyle = '#ffffff'; g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+  g.fillStyle = dark || '#141018'; g.beginPath(); g.arc(x + r * 0.16, y, r * 0.54, 0, TAU); g.fill();
+}
+// Every emblem gets the same thin dark contour so it holds together on a bright map card
+// and against the medallion's own gold wash.
+function peInk(g, fn, w) {
+  g.beginPath(); fn();
+  g.strokeStyle = '#1b1420'; g.lineWidth = w || 3; g.lineJoin = 'round'; g.stroke();
+}
+
+const PET_EMBLEM_ART = {
+
+  // --- the 11 that already read correctly as emoji, redrawn so the SET is consistent ---
+  // (Ben's call: no exceptions, no fallback to text. Their shapes are unchanged in
+  // intent -- a snail is still a snail -- they simply stop being a font dependency.)
+
+  tuck(g) {                                    // snail: spiral shell, foot, eye stalks
+    const shell = () => { g.moveTo(6, -4); for (let i = 0; i < 46; i++) {
+      const a = i * 0.30, r = 6 + i * 0.72; g.lineTo(6 + Math.cos(a) * r, -4 + Math.sin(a) * r); } };
+    peFill(g, '#e8b46a', () => { g.arc(6, -4, 34, 0, TAU); });
+    g.save(); g.globalAlpha = 0.55; peInk(g, shell, 4); g.restore();
+    peInk(g, () => { g.arc(6, -4, 34, 0, TAU); });
+    peFill(g, '#d9c98e', () => { pePoly(g, [-40, 30, 26, 30, 16, 16, -30, 16]);
+      peLimb(g, -26, 16, -38, -12, 4, 3); peLimb(g, -16, 16, -26, -18, 4, 3); });
+    peInk(g, () => { pePoly(g, [-40, 30, 26, 30, 16, 16, -30, 16]); });
+    peEye(g, -38, -14, 4); peEye(g, -26, -20, 4);
+  },
+
+  barnaby(g) {                                 // oyster: a ribbed SCALLOP FAN, hinge at the bottom
+    // Two attempts at "two halves meeting on a horizontal line" both read as an EYE: any
+    // lens outline with a pale disc in the middle does. A scallop fan cannot be misread --
+    // the radial ribs and the flat hinge ears are shell and nothing else. So the shell is
+    // the whole emblem, seen face on, with the pearl sitting in the open gap at the base.
+    const fan = (ry, fill) => {
+      g.beginPath();
+      g.moveTo(-6, ry);
+      for (let i = 0; i <= 9; i++) {                       // scalloped rim, 9 lobes
+        const a = Math.PI + i * Math.PI / 9;
+        const rr = 42 + (i % 2 ? 0 : 4);
+        g.lineTo(Math.cos(a) * rr, ry + Math.sin(a) * rr * (ry < 0 ? 1 : 1));
+      }
+      g.lineTo(6, ry); g.closePath();
+      g.fillStyle = fill; g.fill();
+      g.strokeStyle = '#1b1420'; g.lineWidth = 3; g.lineJoin = 'round'; g.stroke();
+    };
+    // lower valve, opened downward
+    g.save(); g.scale(1, -1); fan(-4, '#8d9c92'); g.restore();
+    peFill(g, '#ffffff', () => { g.arc(0, 12, 12, 0, TAU); });
+    peFill(g, 'rgba(186,150,220,.5)', () => { g.arc(3, 15, 8.5, 0, TAU); });
+    peInk(g, () => { g.arc(0, 12, 12, 0, TAU); }, 2.4);
+    // upper valve
+    fan(-2, '#c4d0c6');
+    g.save(); g.globalAlpha = 0.5;
+    peInk(g, () => { for (let i = 0; i <= 6; i++) {                 // radial ribs
+      const a = Math.PI + i * Math.PI / 6;
+      g.moveTo(0, -2); g.lineTo(Math.cos(a) * 38, -2 + Math.sin(a) * 38); } }, 2.4);
+    g.restore();
+    // hinge ears, the detail that fixes the shell as a shell
+    peFill(g, '#c4d0c6', () => { pePoly(g, [-40, -2, -50, -12, -30, -8]);
+      pePoly(g, [40, -2, 50, -12, 30, -8]); });
+  },
+
+  dollop(g) {                                  // jellyfish: bell + trailing tentacles
+    peFill(g, '#f2a8d8', () => { g.moveTo(-34, 2);
+      g.bezierCurveTo(-34, -40, 34, -40, 34, 2); g.quadraticCurveTo(0, 14, -34, 2); g.closePath(); });
+    peInk(g, () => { g.moveTo(-34, 2); g.bezierCurveTo(-34, -40, 34, -40, 34, 2);
+      g.quadraticCurveTo(0, 14, -34, 2); g.closePath(); });
+    peFill(g, '#e07fc0', () => { for (let i = -2; i <= 2; i++) {
+      const x = i * 13; peLimb(g, x, 6, x + (i % 2 ? 9 : -9), 42, 4.5, 2); } });
+    peFill(g, 'rgba(255,255,255,.55)', () => { g.ellipse(-13, -20, 9, 6, -0.5, 0, TAU); });
+  },
+
+  clatter(g) {                                 // crab: stocky, wide claws (vs tinsel)
+    peFill(g, '#e0703c', () => { g.ellipse(0, 4, 30, 21, 0, 0, TAU); });
+    peInk(g, () => { g.ellipse(0, 4, 30, 21, 0, 0, TAU); });
+    peFill(g, '#e0703c', () => { for (const s of [-1, 1]) for (let i = 0; i < 3; i++) {
+      const y = -2 + i * 11; peLimb(g, s * 26, y, s * 44, y + 12, 4.5, 2.5); } });
+    peFill(g, '#f08a52', () => { for (const s of [-1, 1]) {
+      pePoly(g, [s * 22, -12, s * 42, -30, s * 34, -12, s * 44, -8, s * 28, -4]); } });
+    peInk(g, () => { for (const s of [-1, 1]) {
+      pePoly(g, [s * 22, -12, s * 42, -30, s * 34, -12, s * 44, -8, s * 28, -4]); } }, 2.4);
+    peEye(g, -10, -6, 5); peEye(g, 10, -6, 5);
+  },
+
+  gunther(g) {                                 // whale: bulk, fluke, spout
+    peFill(g, '#5f8fc4', () => { g.moveTo(42, 2);
+      g.quadraticCurveTo(20, -30, -14, -26); g.quadraticCurveTo(-40, -22, -40, 0);
+      g.quadraticCurveTo(-40, 22, -8, 26); g.quadraticCurveTo(22, 26, 42, 2); g.closePath(); });
+    peInk(g, () => { g.moveTo(42, 2); g.quadraticCurveTo(20, -30, -14, -26);
+      g.quadraticCurveTo(-40, -22, -40, 0); g.quadraticCurveTo(-40, 22, -8, 26);
+      g.quadraticCurveTo(22, 26, 42, 2); g.closePath(); });
+    peFill(g, '#cfe4f2', () => { g.moveTo(30, 14); g.quadraticCurveTo(4, 30, -22, 22);
+      g.quadraticCurveTo(2, 18, 30, 14); g.closePath(); });
+    peFill(g, '#5f8fc4', () => { pePoly(g, [-38, 0, -50, -18, -42, -2, -50, 16]); });
+    peFill(g, '#bfe0f2', () => { peLimb(g, 6, -26, 2, -46, 4, 7); });
+    peEye(g, 26, -4, 4.5);
+  },
+
+  plod(g) {                                    // turtle: domed patterned shell, flippers
+    peFill(g, '#8fbf6a', () => { for (const s of [-1, 1]) {
+      peLimb(g, s * 22, 8, s * 42, 26, 8, 6); peLimb(g, s * 24, -6, s * 44, -16, 7, 5); } });
+    peFill(g, '#9ad07a', () => { g.ellipse(34, -6, 13, 10, 0, 0, TAU); });
+    peInk(g, () => { g.ellipse(34, -6, 13, 10, 0, 0, TAU); }, 2.4);
+    peFill(g, '#4f7a3a', () => { g.ellipse(0, 0, 34, 26, 0, 0, TAU); });
+    peInk(g, () => { g.ellipse(0, 0, 34, 26, 0, 0, TAU); });
+    g.save(); g.globalAlpha = 0.5;
+    peInk(g, () => { g.ellipse(0, 0, 18, 13, 0, 0, TAU);
+      for (let i = 0; i < 6; i++) { const a = i * TAU / 6;
+        g.moveTo(Math.cos(a) * 18, Math.sin(a) * 13); g.lineTo(Math.cos(a) * 34, Math.sin(a) * 26); } }, 2.6);
+    g.restore();
+    peEye(g, 40, -8, 3.5);
+  },
+
+  bruiser(g) {                                 // shark: tall dorsal, pointed snout, crescent tail
+    peFill(g, '#8fa2b0', () => { peBody(g, 44, -34, 17, 0.55); });
+    peFill(g, '#8fa2b0', () => { pePoly(g, [4, -15, 12, -46, 22, -13]);
+      pePoly(g, [-2, 14, 6, 32, 12, 13]);
+      peLimb(g, 16, 12, 34, 26, 5, 3); });
+    peFill(g, '#8fa2b0', () => { peTail(g, -34, 26, 18); });
+    peInk(g, () => { peBody(g, 44, -34, 17, 0.55); pePoly(g, [4, -15, 12, -46, 22, -13]); peTail(g, -34, 26, 18); });
+    peFill(g, '#dfe8ee', () => { g.moveTo(44, 0); g.quadraticCurveTo(6, 16, -30, 8);
+      g.quadraticCurveTo(6, 8, 44, 0); g.closePath(); });
+    peFill(g, '#ffffff', () => { for (let i = 0; i < 5; i++) {
+      const x = 40 - i * 7; pePoly(g, [x, 3, x - 3, 9, x - 6, 3]); } });
+    peEye(g, 30, -5, 4, '#1b1018');
+  },
+
+  sable(g) {                                   // octopus: wide dome, 8 thick curling arms
+    peFill(g, '#8f5fc0', () => { for (let i = 0; i < 8; i++) {
+      const s = i < 4 ? -1 : 1, k = i % 4;
+      peLimb(g, s * (6 + k * 7), 12, s * (18 + k * 9), 24 + k * 8, 6.5, 3); } });
+    peFill(g, '#a06fd0', () => { g.moveTo(-32, 10);
+      g.bezierCurveTo(-34, -34, 34, -34, 32, 10); g.quadraticCurveTo(0, 22, -32, 10); g.closePath(); });
+    peInk(g, () => { g.moveTo(-32, 10); g.bezierCurveTo(-34, -34, 34, -34, 32, 10);
+      g.quadraticCurveTo(0, 22, -32, 10); g.closePath(); });
+    peEye(g, -12, -6, 7); peEye(g, 12, -6, 7);
+  },
+
+  pip(g) {                                     // shrimp: curled body, long antennae, fan tail
+    peFill(g, '#f2a07a', () => { g.moveTo(28, -18);
+      g.bezierCurveTo(-6, -30, -34, -6, -20, 24); g.bezierCurveTo(-8, 6, 6, 2, 28, -2); g.closePath(); });
+    peInk(g, () => { g.moveTo(28, -18); g.bezierCurveTo(-6, -30, -34, -6, -20, 24);
+      g.bezierCurveTo(-8, 6, 6, 2, 28, -2); g.closePath(); });
+    peFill(g, '#e08a62', () => { pePoly(g, [-20, 24, -40, 34, -30, 16, -42, 12]); });
+    peFill(g, '#f2a07a', () => { for (let i = 0; i < 3; i++) peLimb(g, 6 - i * 12, 2, 2 - i * 12, 20, 3, 1.6); });
+    g.save(); g.globalAlpha = 0.8;
+    peInk(g, () => { g.moveTo(28, -14); g.quadraticCurveTo(44, -34, 30, -44);
+      g.moveTo(30, -10); g.quadraticCurveTo(48, -22, 46, -36); }, 2.4);
+    g.restore();
+    peEye(g, 22, -14, 4.5);
+  },
+
+  sleet(g) {                                   // penguin: upright, flippers, beak
+    peFill(g, '#2c3444', () => { g.ellipse(0, 6, 24, 32, 0, 0, TAU); });
+    peFill(g, '#2c3444', () => { g.arc(0, -26, 17, 0, TAU);
+      peLimb(g, -20, -2, -32, 22, 7, 4); peLimb(g, 20, -2, 32, 22, 7, 4); });
+    peInk(g, () => { g.ellipse(0, 6, 24, 32, 0, 0, TAU); g.moveTo(17, -26); g.arc(0, -26, 17, 0, TAU); });
+    peFill(g, '#f4f6f8', () => { g.ellipse(0, 12, 15, 22, 0, 0, TAU); });
+    peFill(g, '#f4f6f8', () => { g.ellipse(0, -22, 11, 10, 0, 0, TAU); });
+    peFill(g, '#f0a83a', () => { pePoly(g, [0, -22, 16, -16, 0, -12]);
+      pePoly(g, [-10, 38, 10, 38, 12, 44, -12, 44]); });
+    peEye(g, -6, -28, 3.5); peEye(g, 7, -28, 3.5);
+  },
+
+  nyx(g) {                                     // squid: torpedo mantle, big terminal fins, two long tentacles
+    peFill(g, '#3f4f8a', () => { pePoly(g, [-16, -34, 16, -34, 10, 8, -10, 8]);
+      pePoly(g, [-14, -30, -40, -44, -12, -12]); pePoly(g, [14, -30, 40, -44, 12, -12]); });
+    peInk(g, () => { pePoly(g, [-16, -34, 16, -34, 10, 8, -10, 8]);
+      pePoly(g, [-14, -30, -40, -44, -12, -12]); pePoly(g, [14, -30, 40, -44, 12, -12]); });
+    peFill(g, '#5f6fb0', () => { for (let i = 0; i < 5; i++) {
+      const x = -10 + i * 5; peLimb(g, x, 6, x * 2.2, 30, 3.2, 1.6); }
+      peLimb(g, -8, 6, -26, 44, 3.6, 2.4); peLimb(g, 8, 6, 26, 44, 3.6, 2.4); });
+    peEye(g, -8, -2, 5.5); peEye(g, 8, -2, 5.5);
+  },
+
+  // --- the 17 that read as an OBJECT or a CONCEPT (7B list, approved) ---
+
+  quill(g) {                                   // needlefish: long thin body, straight spike snout
+    peFill(g, '#cfe6f2', () => { g.moveTo(48, 0); g.lineTo(6, -8);
+      g.quadraticCurveTo(-24, -9, -34, -6); g.lineTo(-34, 6);
+      g.quadraticCurveTo(-24, 9, 6, 8); g.closePath(); });
+    peInk(g, () => { g.moveTo(48, 0); g.lineTo(6, -8); g.quadraticCurveTo(-24, -9, -34, -6);
+      g.lineTo(-34, 6); g.quadraticCurveTo(-24, 9, 6, 8); g.closePath(); });
+    peFill(g, '#8fb8cf', () => { peTail(g, -34, 15, 12); pePoly(g, [-6, -8, 4, -22, 10, -7]); });
+    peEye(g, 12, -1, 4.5);
+  },
+
+  marigold(g) {                                // nurse fish: generic body + the nurse cross
+    peFill(g, '#f2c85a', () => { peBody(g, 34, -26, 22); });
+    peFill(g, '#e0a83a', () => { peTail(g, -26, 21, 15); pePoly(g, [-4, -20, 6, -34, 14, -18]); });
+    peInk(g, () => { peBody(g, 34, -26, 22); peTail(g, -26, 21, 15); });
+    peFill(g, '#ffffff', () => { g.ellipse(4, 0, 13, 13, 0, 0, TAU); });
+    peFill(g, '#d84a4a', () => { pePoly(g, [1, -10, 7, -10, 7, -3, 14, -3, 14, 3, 7, 3, 7, 10, 1, 10, 1, 3, -6, 3, -6, -3, 1, -3]); });
+    peEye(g, 25, -5, 4.5);
+  },
+
+  fennel(g) {                                  // seahorse: S-curve, curled tail, tubular snout, frill
+    const body = () => { g.moveTo(20, -40); g.quadraticCurveTo(-14, -34, -6, -6);
+      g.quadraticCurveTo(2, 20, -14, 30); g.quadraticCurveTo(-30, 38, -26, 22);
+      g.quadraticCurveTo(-22, 14, -14, 18); g.quadraticCurveTo(-10, 6, -18, -8);
+      g.quadraticCurveTo(-30, -34, 6, -46); g.closePath(); };
+    peFill(g, '#e8a03a', body); peInk(g, body);
+    peFill(g, '#f0b85a', () => { pePoly(g, [20, -40, 44, -34, 22, -30]);
+      pePoly(g, [4, -44, 12, -50, 18, -42]); });
+    peFill(g, '#c07a20', () => { for (let i = 0; i < 4; i++) {
+      const t = i / 3; peLimb(g, -14 - t * 8, -26 + t * 26, -24 - t * 6, -24 + t * 26, 3, 1.5); } });
+    peEye(g, 8, -38, 4);
+  },
+
+  lull(g) {                                    // siren: fish-tailed figure, head thrown back, singing
+    // Rebuilt bigger and more upright. The first pass was a small blob with a small head
+    // and the figure never resolved; a siren has to read as HEAD + TORSO + TAIL in three
+    // clearly separate masses, with the head tipped back so it is visibly singing.
+    peFill(g, '#5fb0a0', () => { pePoly(g, [-10, 40, -40, 40, -26, 24, -42, 12]); });
+    peFill(g, '#7fd0c0', () => { g.moveTo(10, -8); g.quadraticCurveTo(22, 12, 8, 26);
+      g.quadraticCurveTo(-2, 38, -14, 42); g.quadraticCurveTo(-16, 24, -12, 10);
+      g.quadraticCurveTo(-10, -6, 10, -8); g.closePath(); });
+    peInk(g, () => { g.moveTo(10, -8); g.quadraticCurveTo(22, 12, 8, 26);
+      g.quadraticCurveTo(-2, 38, -14, 42); g.quadraticCurveTo(-16, 24, -12, 10);
+      g.quadraticCurveTo(-10, -6, 10, -8); g.closePath();
+      pePoly(g, [-10, 40, -40, 40, -26, 24, -42, 12]); });
+    g.save(); g.globalAlpha = 0.55;
+    peInk(g, () => { for (let i = 0; i < 3; i++) { const y = 6 + i * 10;
+      g.moveTo(-12, y); g.quadraticCurveTo(0, y + 5, 10, y - 1); } }, 2.2);
+    g.restore();
+    peFill(g, '#3f6a80', () => { g.moveTo(-6, -40); g.quadraticCurveTo(-40, -30, -30, 8);
+      g.quadraticCurveTo(-44, -26, -18, -46); g.quadraticCurveTo(2, -54, 12, -40);
+      g.quadraticCurveTo(0, -46, -6, -40); g.closePath(); });
+    peFill(g, '#f4d6ae', () => { g.ellipse(0, -28, 14, 15, 0.28, 0, TAU); });
+    peInk(g, () => { g.ellipse(0, -28, 14, 15, 0.28, 0, TAU); }, 2.4);
+    peFill(g, '#8a4a3a', () => { g.ellipse(11, -24, 4, 5, 0.3, 0, TAU); });   // open mouth
+    peEye(g, 6, -32, 3.2);
+    g.save(); g.globalAlpha = 0.95;
+    peInk(g, () => { g.moveTo(22, -34); g.quadraticCurveTo(36, -40, 32, -28);
+      g.moveTo(30, -50); g.quadraticCurveTo(46, -54, 40, -42); }, 3.2);
+    peFill(g, '#1b1420', () => { g.ellipse(23, -30, 4, 3, -0.4, 0, TAU);
+      g.ellipse(31, -44, 4, 3, -0.4, 0, TAU); });
+    g.restore();
+  },
+
+  widget(g) {                                  // automaton: a brass FISH first, a machine second
+    // The first pass led with the machinery and the fish never arrived. Draw the fish
+    // silhouette the rest of the set uses, then rivet it: the read is "clockwork fish",
+    // so the fish has to be legible before any of the hardware means anything.
+    peFill(g, '#8f6a20', () => { peTail(g, -26, 20, 15); pePoly(g, [-2, 14, 6, 30, 14, 13]); });
+    peFill(g, '#c8a03a', () => { peBody(g, 34, -26, 22); });
+    peInk(g, () => { peBody(g, 34, -26, 22); peTail(g, -26, 20, 15); });
+    peFill(g, '#e0c060', () => { const R = 16, r = 9;
+      for (let i = 0; i < 8; i++) { const a = i * TAU / 8;
+        pePoly(g, [Math.cos(a) * r, -28 + Math.sin(a) * r,
+                   Math.cos(a + 0.24) * R, -28 + Math.sin(a + 0.24) * R,
+                   Math.cos(a + 0.48) * r, -28 + Math.sin(a + 0.48) * r]); }
+      g.moveTo(r, -28); g.arc(0, -28, r, 0, TAU); });
+    peInk(g, () => { g.moveTo(9, -28); g.arc(0, -28, 9, 0, TAU); }, 2.4);
+    peFill(g, '#8f6a20', () => { g.arc(0, -28, 4.5, 0, TAU); });
+    g.save(); g.globalAlpha = 0.6;
+    peInk(g, () => { g.moveTo(8, -19); g.quadraticCurveTo(4, 0, 8, 19); }, 2.6); g.restore();
+    peFill(g, '#8f6a20', () => { for (let i = 0; i < 5; i++) {
+      const t = i / 4; g.arc(8 + Math.sin(t * 3) * 2 - 2, -14 + t * 28, 2.2, 0, TAU); } });
+    peFill(g, '#2c3a4a', () => { g.arc(22, -4, 10, 0, TAU); });
+    peFill(g, '#7fd8f0', () => { g.arc(22, -4, 6, 0, TAU); });
+    peFill(g, '#d8f6ff', () => { g.arc(19, -7, 2.4, 0, TAU); });
+    peInk(g, () => { g.moveTo(32, -4); g.arc(22, -4, 10, 0, TAU); }, 2.6);
+  },
+
+  beacon(g) {                                  // angler: round dark body, underbite, lit bulb on a stalk
+    peFill(g, '#3a3050', () => { g.ellipse(-2, 6, 32, 27, 0, 0, TAU); });
+    peInk(g, () => { g.ellipse(-2, 6, 32, 27, 0, 0, TAU); });
+    peFill(g, '#2a2038', () => { g.moveTo(-30, 10); g.quadraticCurveTo(0, 40, 28, 12);
+      g.quadraticCurveTo(0, 22, -30, 10); g.closePath(); });
+    peFill(g, '#ffffff', () => { for (let i = 0; i < 6; i++) {
+      const x = -22 + i * 9; pePoly(g, [x, 14, x + 4, 24, x + 8, 14]); } });
+    peFill(g, '#3a3050', () => { peLimb(g, -6, -20, 14, -42, 4, 3); });
+    peFill(g, '#ffe07a', () => { g.arc(18, -44, 10, 0, TAU); });
+    g.save(); g.globalAlpha = 0.35;
+    peFill(g, '#ffe07a', () => { g.arc(18, -44, 17, 0, TAU); }); g.restore();
+    peEye(g, 8, -4, 6);
+  },
+
+  echo(g) {                                    // porpoise: blunt snout, dorsal, faint sonar arc
+    peFill(g, '#7f97a8', () => { g.moveTo(42, 4); g.quadraticCurveTo(30, -16, 2, -20);
+      g.quadraticCurveTo(-24, -22, -34, -10); g.lineTo(-34, 8);
+      g.quadraticCurveTo(-16, 22, 8, 18); g.quadraticCurveTo(32, 16, 42, 4); g.closePath(); });
+    peFill(g, '#7f97a8', () => { pePoly(g, [-2, -19, 10, -42, 22, -15]); peTail(g, -34, 20, 14);
+      peLimb(g, 4, 16, 22, 30, 6, 3); });
+    peInk(g, () => { g.moveTo(42, 4); g.quadraticCurveTo(30, -16, 2, -20);
+      g.quadraticCurveTo(-24, -22, -34, -10); g.lineTo(-34, 8);
+      g.quadraticCurveTo(-16, 22, 8, 18); g.quadraticCurveTo(32, 16, 42, 4); g.closePath();
+      pePoly(g, [-2, -19, 10, -42, 22, -15]); });
+    peFill(g, '#cfdde6', () => { g.moveTo(42, 4); g.quadraticCurveTo(10, 18, -20, 14);
+      g.quadraticCurveTo(12, 10, 42, 4); g.closePath(); });
+    g.save(); g.globalAlpha = 0.45;
+    peInk(g, () => { for (let i = 1; i <= 2; i++) { g.moveTo(44 + i * 7, -12);
+      g.quadraticCurveTo(52 + i * 8, 2, 44 + i * 7, 16); } }, 2.6);
+    g.restore();
+    peEye(g, 28, -4, 4);
+  },
+
+  kite(g) {                                    // manta: wide diamond wings, cephalic lobes, whip tail
+    peFill(g, '#4a6f9a', () => { g.moveTo(0, -20);
+      g.quadraticCurveTo(30, -22, 48, 6); g.quadraticCurveTo(24, 14, 8, 22);
+      g.quadraticCurveTo(0, 26, -8, 22); g.quadraticCurveTo(-24, 14, -48, 6);
+      g.quadraticCurveTo(-30, -22, 0, -20); g.closePath(); });
+    peInk(g, () => { g.moveTo(0, -20); g.quadraticCurveTo(30, -22, 48, 6);
+      g.quadraticCurveTo(24, 14, 8, 22); g.quadraticCurveTo(0, 26, -8, 22);
+      g.quadraticCurveTo(-24, 14, -48, 6); g.quadraticCurveTo(-30, -22, 0, -20); g.closePath(); });
+    // The whip tail runs long on purpose. A wide symmetric diamond alone sat just under
+    // the near-duplicate cut against Sol's star; the tail is the manta's own feature AND
+    // the thing that stops the silhouette reading as a radially symmetric mass.
+    peFill(g, '#4a6f9a', () => { pePoly(g, [-13, -19, -19, -38, -6, -20]);
+      pePoly(g, [13, -19, 19, -38, 6, -20]);
+      peLimb(g, 0, 20, 3, 44, 4.2, 2.6); peLimb(g, 3, 44, -2, 68, 2.6, 1.2); });
+    peFill(g, '#cfe0ee', () => { g.ellipse(-19, 2, 8, 5, 0.2, 0, TAU); g.ellipse(19, 2, 8, 5, -0.2, 0, TAU); });
+    peEye(g, -11, -12, 3.5); peEye(g, 11, -12, 3.5);
+  },
+
+  jolt(g) {                                    // eel: ribbon body in a shallow S, one zigzag spark
+    const body = () => { g.moveTo(44, -6);
+      g.bezierCurveTo(14, -22, -6, 10, -40, -2); g.lineTo(-40, 10);
+      g.bezierCurveTo(-4, 22, 16, -10, 44, 6); g.closePath(); };
+    peFill(g, '#7ac86a', body); peInk(g, body);
+    peFill(g, '#ffe84a', () => { pePoly(g, [8, -30, 20, -30, 13, -18, 24, -18, 4, 2, 10, -14, 0, -14]); });
+    peInk(g, () => { pePoly(g, [8, -30, 20, -30, 13, -18, 24, -18, 4, 2, 10, -14, 0, -14]); }, 2);
+    peEye(g, 36, -2, 4);
+  },
+
+  vesper(g) {                                  // angelfish: tall round disc, bold bars, filaments, halo
+    // The first pass was a narrow sliver that read as a leaf. An angelfish is defined by a
+    // near-CIRCULAR body that is taller than it is long, with the dorsal and anal fins
+    // sweeping off it as one continuous triangle. Body first, fins as extensions of it.
+    peFill(g, '#f4e6b4', () => { pePoly(g, [6, -20, 20, -46, 24, -14]);
+      pePoly(g, [4, 20, 16, 44, 22, 14]); peLimb(g, 2, -4, -30, -26, 3, 1.2);
+      peLimb(g, 2, 4, -30, 26, 3, 1.2); });
+    peFill(g, '#f8ecc0', () => { g.ellipse(4, 0, 24, 30, 0, 0, TAU); });
+    peFill(g, '#f4e6b4', () => { peTail(g, -20, 18, 14); });
+    peInk(g, () => { g.ellipse(4, 0, 24, 30, 0, 0, TAU); peTail(g, -20, 18, 14);
+      pePoly(g, [6, -20, 20, -46, 24, -14]); pePoly(g, [4, 20, 16, 44, 22, 14]); });
+    peFill(g, '#8a6f2a', () => { for (const x of [16, 2, -12]) {
+      g.moveTo(x + 5, -28); g.quadraticCurveTo(x + 1, 0, x + 4, 28);
+      g.lineTo(x - 3, 28); g.quadraticCurveTo(x - 6, 0, x - 2, -28); g.closePath(); } });
+    g.save(); g.globalAlpha = 0.9;
+    peInk(g, () => { g.ellipse(12, -44, 15, 5, 0.12, 0, TAU); }, 3.4); g.restore();
+    peEye(g, 20, -8, 5);
+  },
+
+  cinder(g) {                                  // lanternfish: belly photophores + a glowing lure
+    peFill(g, '#3f4a60', () => { peBody(g, 32, -28, 17); });
+    peFill(g, '#3f4a60', () => { peTail(g, -28, 17, 13); });
+    peInk(g, () => { peBody(g, 32, -28, 17); peTail(g, -28, 17, 13); });
+    peFill(g, '#ffd86a', () => { for (let i = 0; i < 6; i++) g.arc(-18 + i * 9, 12, 3.4, 0, TAU); });
+    peFill(g, '#3f4a60', () => { peLimb(g, 10, -14, 24, -36, 3, 2); });
+    peFill(g, '#ffe89a', () => { g.arc(26, -40, 8, 0, TAU); });
+    g.save(); g.globalAlpha = 0.3;
+    peFill(g, '#ffe89a', () => { g.arc(26, -40, 15, 0, TAU); }); g.restore();
+    peEye(g, 22, -3, 5);
+  },
+
+  shiver(g) {                                  // icefish: pale translucent body, skeleton lines, frost gill
+    peFill(g, 'rgba(206,236,246,.92)', () => { peBody(g, 36, -28, 19); });
+    peFill(g, 'rgba(206,236,246,.92)', () => { peTail(g, -28, 18, 14); });
+    peInk(g, () => { peBody(g, 36, -28, 19); peTail(g, -28, 18, 14); });
+    g.save(); g.globalAlpha = 0.5;
+    peInk(g, () => { g.moveTo(20, 0); g.lineTo(-24, 0);
+      for (let i = 0; i < 5; i++) { const x = 14 - i * 8;
+        g.moveTo(x, -2); g.quadraticCurveTo(x - 4, -11, x - 9, -13);
+        g.moveTo(x, 2); g.quadraticCurveTo(x - 4, 11, x - 9, 13); } }, 2.4);
+    g.restore();
+    peFill(g, '#ffffff', () => { for (let i = 0; i < 3; i++) {
+      const a = i * TAU / 3; peLimb(g, 22, -8, 22 + Math.cos(a) * 9, -8 + Math.sin(a) * 9, 2, 1); } });
+    peEye(g, 27, -5, 4.5);
+  },
+
+  tinsel(g) {                                  // snow crab: long jointed legs, pale (vs clatter's stocky orange)
+    // Legs radiating evenly in all directions read as a SPIDER, twice. Clatter already
+    // proves the crab layout that works, so this is built from the same skeleton -- wide
+    // body, claws forward and high, legs leaving the SIDES and sweeping down -- and is
+    // separated from Clatter by what actually differs about a snow crab: much longer,
+    // thinner, jointed legs and a pale shell instead of a stocky orange one.
+    peFill(g, '#bcd8e8', () => { for (const s of [-1, 1]) for (let i = 0; i < 3; i++) {
+      const y = 0 + i * 9, ex = s * (34 + i * 3), ey = y + 12;
+      peLimb(g, s * 18, y, ex, ey, 4.6, 3.2);
+      peLimb(g, ex, ey, s * (44 + i * 2), ey + 22 + i * 4, 3.2, 1.8); } });
+    peInk(g, () => { for (const s of [-1, 1]) for (let i = 0; i < 3; i++) {
+      const y = 0 + i * 9, ex = s * (34 + i * 3), ey = y + 12;
+      g.moveTo(s * 18, y); g.lineTo(ex, ey); g.lineTo(s * (44 + i * 2), ey + 22 + i * 4); } }, 2);
+    peFill(g, '#e8f4fa', () => { g.ellipse(0, 4, 25, 16, 0, 0, TAU); });
+    peInk(g, () => { g.ellipse(0, 4, 25, 16, 0, 0, TAU); });
+    peFill(g, '#dcecf6', () => { for (const s of [-1, 1])
+      pePoly(g, [s * 17, -8, s * 34, -30, s * 27, -11, s * 41, -6, s * 21, -2]); });
+    peInk(g, () => { for (const s of [-1, 1])
+      pePoly(g, [s * 17, -8, s * 34, -30, s * 27, -11, s * 41, -6, s * 21, -2]); }, 2.2);
+    peEye(g, -8, -1, 4); peEye(g, 8, -1, 4);
+  },
+
+  aurora(g) {                                  // glowsquid: elongated mantle UP, wide fan of trailing arms, glow band
+    peFill(g, '#5fd0a8', () => { g.moveTo(0, -46);
+      g.quadraticCurveTo(18, -34, 15, -2); g.lineTo(-15, -2); g.quadraticCurveTo(-18, -34, 0, -46); g.closePath();
+      pePoly(g, [-14, -26, -30, -18, -13, -12]); pePoly(g, [14, -26, 30, -18, 13, -12]); });
+    peInk(g, () => { g.moveTo(0, -46); g.quadraticCurveTo(18, -34, 15, -2);
+      g.lineTo(-15, -2); g.quadraticCurveTo(-18, -34, 0, -46); g.closePath(); });
+    peFill(g, '#8f6fd0', () => { for (let i = 0; i < 7; i++) {
+      const t = (i - 3) / 3; peLimb(g, t * 11, 0, t * 40, 30 + Math.abs(t) * 12, 3.4, 1.5); } });
+    g.save(); g.globalAlpha = 0.75;
+    peFill(g, '#d8ffe8', () => { g.moveTo(-15, -14); g.quadraticCurveTo(0, -8, 15, -14);
+      g.quadraticCurveTo(0, -20, -15, -14); g.closePath(); });
+    g.restore();
+    peEye(g, -7, -8, 4.5); peEye(g, 7, -8, 4.5);
+  },
+
+  lumen(g) {                                   // lampeye: small fish, ONE oversized luminous eye
+    peFill(g, '#4a5a72', () => { peBody(g, 26, -30, 16); peTail(g, -30, 16, 12); });
+    peInk(g, () => { peBody(g, 26, -30, 16); peTail(g, -30, 16, 12); });
+    g.save(); g.globalAlpha = 0.35;
+    peFill(g, '#ffe89a', () => { g.arc(10, -2, 26, 0, TAU); }); g.restore();
+    peFill(g, '#fff6c8', () => { g.arc(10, -2, 16, 0, TAU); });
+    peFill(g, '#2a2030', () => { g.arc(14, -2, 8, 0, TAU); });
+    peFill(g, '#ffffff', () => { g.arc(8, -8, 5, 0, TAU); });
+    peInk(g, () => { g.moveTo(26, -2); g.arc(10, -2, 16, 0, TAU); }, 2.6);
+    peFill(g, '#ffe89a', () => { const R = 9, r = 3.6;
+      for (let i = 0; i < 4; i++) { const a = i * TAU / 4;
+        pePoly(g, [-16 + Math.cos(a) * R, -26 + Math.sin(a) * R,
+                   -16 + Math.cos(a + 0.78) * r, -26 + Math.sin(a + 0.78) * r]); } });
+  },
+
+  sonar(g) {                                   // barreleye: transparent domed head, two UPWARD tubular eyes
+    peFill(g, '#5f7a8a', () => { peBody(g, 18, -34, 18); peTail(g, -34, 17, 13); });
+    peInk(g, () => { peBody(g, 18, -34, 18); peTail(g, -34, 17, 13); });
+    peFill(g, 'rgba(190,235,245,.85)', () => { g.moveTo(-6, 4);
+      g.bezierCurveTo(-10, -34, 34, -34, 30, 4); g.quadraticCurveTo(12, 12, -6, 4); g.closePath(); });
+    peInk(g, () => { g.moveTo(-6, 4); g.bezierCurveTo(-10, -34, 34, -34, 30, 4);
+      g.quadraticCurveTo(12, 12, -6, 4); g.closePath(); }, 2.6);
+    peFill(g, '#5fd85f', () => { for (const x of [4, 20]) {
+      pePoly(g, [x - 6, 2, x + 6, 2, x + 5, -20, x - 5, -20]); g.moveTo(x + 5, -20); g.arc(x, -20, 5, 0, TAU); } });
+    peInk(g, () => { for (const x of [4, 20]) { g.moveTo(x + 5, -20); g.arc(x, -20, 5, 0, TAU); } }, 2);
+  },
+
+  grim(g) {                                    // gulper eel: HUGE hinged jaw open, tiny body, whip tail
+    peFill(g, '#2f2838', () => { g.moveTo(20, -12); g.lineTo(-40, -2);
+      g.quadraticCurveTo(-46, 0, -40, 3); g.lineTo(20, 6); g.closePath(); });
+    peFill(g, '#3a3048', () => { g.moveTo(20, -12); g.quadraticCurveTo(44, -34, 46, -6);
+      g.quadraticCurveTo(46, 30, 18, 8); g.quadraticCurveTo(6, -2, 20, -12); g.closePath(); });
+    peInk(g, () => { g.moveTo(20, -12); g.quadraticCurveTo(44, -34, 46, -6);
+      g.quadraticCurveTo(46, 30, 18, 8); g.quadraticCurveTo(6, -2, 20, -12); g.closePath(); });
+    peFill(g, '#6a2038', () => { g.moveTo(22, -8); g.quadraticCurveTo(40, -8, 42, -2);
+      g.quadraticCurveTo(40, 18, 22, 5); g.closePath(); });
+    peFill(g, '#ffffff', () => { for (let i = 0; i < 4; i++) {
+      const x = 24 + i * 6; pePoly(g, [x, -9, x + 3, -3, x + 6, -9]);
+      pePoly(g, [x, 6 - i, x + 3, 0, x + 6, 6 - i]); } });
+    peFill(g, '#2f2838', () => { peLimb(g, -38, 0, -48, 26, 3, 1.2); });
+    peEye(g, 24, -14, 3.6);
+  },
+
+  sol(g) {                                     // sunstar: many UNEVEN arms, big central disc
+    // A perfectly regular 11-point star is close to a filled circle once the signature
+    // crops to the ink and stretches it to a square, which put it under the near-duplicate
+    // cut against three unrelated emblems. Real sunstars have arms of visibly different
+    // lengths and a large central disc, and using that breaks the radial uniformity that
+    // was collapsing the signature -- the correct fix and the more accurate animal.
+    const N = 11;
+    const arms = (r0, k) => { for (let i = 0; i < N; i++) {
+      const a = i * TAU / N - Math.PI / 2;
+      const L = (36 + ((i * 5) % 4) * 5) * k;                 // 36 / 41 / 46 / 51, cycling
+      pePoly(g, [Math.cos(a - 0.19) * r0, Math.sin(a - 0.19) * r0,
+                 Math.cos(a) * L, Math.sin(a) * L,
+                 Math.cos(a + 0.19) * r0, Math.sin(a + 0.19) * r0]); } };
+    peFill(g, '#f08a3a', () => { arms(19, 1); g.moveTo(21, 0); g.arc(0, 0, 21, 0, TAU); });
+    peInk(g, () => { arms(19, 1); }, 2.4);
+    peFill(g, '#ffc07a', () => { g.arc(0, 0, 19, 0, TAU); });
+    peInk(g, () => { g.moveTo(19, 0); g.arc(0, 0, 19, 0, TAU); }, 2.6);
+    peFill(g, '#c05a20', () => { g.arc(0, 0, 6, 0, TAU);
+      for (let i = 0; i < N; i++) { const a = i * TAU / N - Math.PI / 2;
+        g.arc(Math.cos(a) * 12.5, Math.sin(a) * 12.5, 2.4, 0, TAU); } });
+  },
+
+  // --- the 7 that were the WRONG CREATURE (7B list, approved) ---
+
+  rattle(g) {                                  // FISH skeleton, not a human skull
+    peFill(g, '#e8ecf0', () => { g.moveTo(38, -4); g.quadraticCurveTo(30, -20, 8, -18);
+      g.quadraticCurveTo(-6, -16, -6, 0); g.quadraticCurveTo(-6, 16, 8, 18);
+      g.quadraticCurveTo(30, 20, 38, 4); g.closePath(); });
+    peInk(g, () => { g.moveTo(38, -4); g.quadraticCurveTo(30, -20, 8, -18);
+      g.quadraticCurveTo(-6, -16, -6, 0); g.quadraticCurveTo(-6, 16, 8, 18);
+      g.quadraticCurveTo(30, 20, 38, 4); g.closePath(); });
+    peFill(g, '#e8ecf0', () => { peLimb(g, -6, 0, -34, 0, 4, 3);
+      for (let i = 0; i < 5; i++) { const x = -10 - i * 5;
+        peLimb(g, x, -1, x - 3, -13 + i, 2.2, 1.4); peLimb(g, x, 1, x - 3, 13 - i, 2.2, 1.4); }
+      pePoly(g, [-34, 0, -46, -15, -40, 0, -46, 15]); });
+    peFill(g, '#2a2230', () => { g.arc(22, -5, 6.5, 0, TAU); });
+    peFill(g, '#2a2230', () => { for (let i = 0; i < 4; i++) {
+      const x = 20 + i * 5; pePoly(g, [x, 9, x + 2.4, 14, x + 4.8, 9]); } });
+  },
+
+  nettle(g) {                                  // hermit crab in a SPIRAL shell, not a lobster
+    peFill(g, '#c07a4a', () => { g.moveTo(4, -6); for (let i = 0; i < 42; i++) {
+      const a = i * 0.32, r = 4 + i * 0.78; g.lineTo(4 + Math.cos(a) * r, -6 + Math.sin(a) * r); }
+      g.closePath(); });
+    peFill(g, '#d89a6a', () => { g.arc(4, -6, 31, 0, TAU); });
+    g.save(); g.globalAlpha = 0.55;
+    peInk(g, () => { g.moveTo(4, -6); for (let i = 0; i < 42; i++) {
+      const a = i * 0.32, r = 4 + i * 0.78; g.lineTo(4 + Math.cos(a) * r, -6 + Math.sin(a) * r); } }, 3.4);
+    g.restore();
+    peInk(g, () => { g.arc(4, -6, 31, 0, TAU); });
+    peFill(g, '#e05a3a', () => { pePoly(g, [-20, 12, -44, 2, -34, 16, -46, 22, -22, 24]);
+      for (let i = 0; i < 3; i++) peLimb(g, -12 + i * 6, 24, -18 + i * 8, 40, 3.4, 1.8); });
+    peInk(g, () => { pePoly(g, [-20, 12, -44, 2, -34, 16, -46, 22, -22, 24]); }, 2.4);
+    peEye(g, -22, 6, 4);
+  },
+
+  growler(g) {                                 // walrus: tusks + whiskers (vs a plain seal)
+    peFill(g, '#a0786a', () => { g.ellipse(-4, 6, 34, 26, 0, 0, TAU); });
+    peFill(g, '#a0786a', () => { peLimb(g, -30, 22, -46, 32, 8, 6); peLimb(g, 22, 24, 36, 34, 8, 6); });
+    peInk(g, () => { g.ellipse(-4, 6, 34, 26, 0, 0, TAU); });
+    peFill(g, '#b8907e', () => { g.ellipse(2, 14, 20, 14, 0, 0, TAU); });
+    peFill(g, '#ffffff', () => { pePoly(g, [-6, 18, -1, 18, -3, 42]); pePoly(g, [8, 18, 13, 18, 12, 42]); });
+    peInk(g, () => { pePoly(g, [-6, 18, -1, 18, -3, 42]); pePoly(g, [8, 18, 13, 18, 12, 42]); }, 2);
+    g.save(); g.globalAlpha = 0.7;
+    peInk(g, () => { for (let i = -1; i <= 1; i++) { g.moveTo(-8, 12 + i * 4); g.lineTo(-26, 8 + i * 7);
+      g.moveTo(12, 12 + i * 4); g.lineTo(30, 8 + i * 7); } }, 1.8);
+    g.restore();
+    peEye(g, -12, -4, 5); peEye(g, 8, -4, 5);
+  },
+
+  orla(g) {                                    // selkie: a SEAL-woman -- seal body, flowing hair, flippers
+    peFill(g, '#6a7f96', () => { g.moveTo(2, -12); g.quadraticCurveTo(20, 8, 10, 26);
+      g.quadraticCurveTo(2, 40, -14, 42); g.quadraticCurveTo(-4, 24, -8, 8);
+      g.quadraticCurveTo(-10, -8, 2, -12); g.closePath(); });
+    peFill(g, '#586b80', () => { pePoly(g, [-14, 42, -40, 38, -28, 26, -44, 18]);
+      peLimb(g, 8, 6, 30, 16, 6, 3); });
+    peInk(g, () => { g.moveTo(2, -12); g.quadraticCurveTo(20, 8, 10, 26);
+      g.quadraticCurveTo(2, 40, -14, 42); g.quadraticCurveTo(-4, 24, -8, 8);
+      g.quadraticCurveTo(-10, -8, 2, -12); g.closePath(); });
+    peFill(g, '#8f9db0', () => { g.ellipse(-2, -28, 14, 13, 0, 0, TAU); });
+    peFill(g, '#3a4658', () => { g.moveTo(-14, -34); g.quadraticCurveTo(-38, -22, -28, 8);
+      g.quadraticCurveTo(-40, -20, -20, -42); g.quadraticCurveTo(-2, -50, 10, -40);
+      g.quadraticCurveTo(-4, -44, -14, -34); g.closePath(); });
+    peInk(g, () => { g.ellipse(-2, -28, 14, 13, 0, 0, TAU); }, 2.4);
+    peEye(g, -6, -29, 3.4); peEye(g, 6, -29, 3.4);
+  },
+
+  moxie(g) {                                   // tadpole mid-morph: round head, tail, budding legs
+    peFill(g, '#7ac86a', () => { g.ellipse(6, -2, 26, 23, 0, 0, TAU); });
+    peFill(g, '#7ac86a', () => { g.moveTo(-14, -12); g.quadraticCurveTo(-38, -18, -46, 4);
+      g.quadraticCurveTo(-36, 22, -14, 12); g.closePath(); });
+    peFill(g, '#5faa4a', () => { peLimb(g, -6, 18, -14, 38, 5, 3);
+      peLimb(g, -14, 38, 2, 44, 3.6, 2.4);
+      peLimb(g, 14, 18, 22, 36, 4.4, 2.6); });
+    peInk(g, () => { g.ellipse(6, -2, 26, 23, 0, 0, TAU); });
+    peEye(g, -2, -12, 6); peEye(g, 16, -12, 6);
+    g.save(); g.globalAlpha = 0.5;
+    peInk(g, () => { g.moveTo(-2, 8); g.quadraticCurveTo(6, 14, 14, 8); }, 2.4);
+    g.restore();
+  },
+
+  fathom(g) {                                  // sea-DRAGON: one clean S-coil, horned head, dorsal spines
+    // The coiled version turned into a green scribble. A serpent reads from ONE clear
+    // S-curve of even thickness with an unmistakable head on the end of it, so this is a
+    // single ribbon: head high at the right, one dip, one rise, tail fin at the left.
+    const spine = [[40, -26], [16, -34], [-6, -14], [-24, 6], [-42, 18]];
+    const ribbon = () => { g.moveTo(40, -26);
+      g.bezierCurveTo(14, -40, -4, -22, -20, -2);
+      g.bezierCurveTo(-32, 12, -40, 14, -46, 14);
+      g.lineTo(-42, 26);
+      g.bezierCurveTo(-28, 26, -18, 16, -8, 4);
+      g.bezierCurveTo(8, -14, 20, -24, 42, -14);
+      g.closePath(); };
+    peFill(g, '#4aa88a', ribbon); peInk(g, ribbon);
+    peFill(g, '#2f7a62', () => { pePoly(g, [-42, 20, -56, 6, -50, 20, -58, 34]); });
+    peFill(g, '#ffd35a', () => { for (let i = 1; i < spine.length; i++) {
+      const [x, y] = spine[i], [px, py] = spine[i - 1];
+      const dx = x - px, dy = y - py, L = Math.hypot(dx, dy) || 1;
+      const nx = -dy / L, ny = dx / L;
+      pePoly(g, [x, y, x + nx * 13 - dx * 0.18, y + ny * 13 - dy * 0.18, px, py]); } });
+    peFill(g, '#4aa88a', () => { g.ellipse(40, -26, 15, 11, -0.3, 0, TAU); });
+    peInk(g, () => { g.ellipse(40, -26, 15, 11, -0.3, 0, TAU); }, 2.6);
+    peFill(g, '#ffd35a', () => { pePoly(g, [36, -34, 32, -50, 44, -38]);
+      pePoly(g, [46, -32, 50, -48, 52, -32]); });
+    peEye(g, 44, -28, 4);
+  },
+
+  // marigold's "wrong creature" note (generic) is answered above by the nurse marking.
+};
+
+// ---- normalisation: the SAME contract emblemMetrics gives a glyph -------------------
+// Ink bbox of a procedural emblem, relative to the draw origin, measured once at
+// EMBLEM_REF-ish scale and cached. Returned in exactly the shape emblemMetrics returns
+// for a glyph, so drawEmblem can centre and fit either paint source with one piece of
+// arithmetic and the 7B geometry guarantees cannot drift between the two routes.
+const _peCache = new Map();
+function peMetrics(id) {
+  let m = _peCache.get(id);
+  if (m) return m;
+  const S3 = EMBLEM_REF * 3, mid = S3 / 2;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S3;
+  const g = cv.getContext('2d', { willReadFrequently: true });
+  g.save(); g.translate(mid, mid); PET_EMBLEM_ART[id](g); g.restore();
+  const d = g.getImageData(0, 0, S3, S3).data;
+  let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1;
+  for (let y = 0; y < S3; y++) {
+    for (let x = 0; x < S3; x++) {
+      if (d[(y * S3 + x) * 4 + 3] > 8) {
+        if (x < x0) x0 = x; if (x > x1) x1 = x;
+        if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+    }
+  }
+  m = x1 < 0
+    ? { w: EMBLEM_REF, h: EMBLEM_REF, dx: 0, dy: 0, empty: true }
+    : { w: x1 - x0 + 1, h: y1 - y0 + 1, dx: (x0 + x1) / 2 - mid, dy: (y0 + y1) / 2 - mid, empty: false };
+  _peCache.set(id, m);
+  return m;
+}
+
+// Paint a procedural emblem with its INK centred on (cx, cy) and its long side at
+// EMBLEM_FILL of D, with the same half-diagonal clamp drawEmblem applies to a glyph.
+// This is the only place procedural emblem geometry is computed; every surface -- the
+// medallion, the map cards, the Aquapedia, the loadout chips, the audit sheets -- comes
+// through here, so none of them can disagree about where an emblem sits.
+function drawEmblemArt(g, id, cx, cy, D) {
+  const m = peMetrics(id);
+  const long = Math.max(m.w, m.h) || EMBLEM_REF;
+  let k = (EMBLEM_FILL * D) / long;
+  const halfDiag = Math.hypot(m.w, m.h) / 2 * k;
+  if (halfDiag > D / 2) k *= (D / 2) / halfDiag;
+  g.save();
+  g.translate(cx - m.dx * k, cy - m.dy * k);
+  g.scale(k, k);
+  PET_EMBLEM_ART[id](g);
+  g.restore();
+  return k;
+}
+
+// Put a pet's emblem INTO a DOM element. Returns false on the default route, where the
+// caller's existing text-node code runs untouched -- so v1 stays byte-identical at every
+// one of these surfaces while v2 gets a real drawing.
+function emblemInto(el, id, box) {
+  if (!PETS_V2 || !PET_EMBLEM_ART[id]) return false;
+  el.textContent = '';
+  const dpr = Math.min(3, window.devicePixelRatio || 1);
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = Math.round(box * dpr);
+  cv.style.width = cv.style.height = box + 'px';
+  cv.style.display = 'block';
+  cv.style.margin = '0 auto';
+  const g = cv.getContext('2d');
+  g.scale(dpr, dpr);
+  drawEmblemArt(g, id, box / 2, box / 2, box);
+  el.appendChild(cv);
+  return true;
+}
+
 // Draw a pet's emblem with its INK centred on (cx, cy) and scaled so the ink's long side
 // is EMBLEM_FILL of D. Never overflows: the long side is what is fitted, so the short
 // side is smaller by construction.
 function drawEmblem(g, id, cx, cy, D) {
+  // Phase 9A: the procedural route. Identical centring and fitting -- drawEmblemArt is
+  // the same arithmetic against measured ink -- only the paint differs.
+  if (PETS_V2 && PET_EMBLEM_ART[id]) return drawEmblemArt(g, id, cx, cy, D);
   const glyph = PET_EMBLEM[id] || '🐠';
   const m = emblemMetrics(glyph);
   const long = Math.max(m.w, m.h) || EMBLEM_REF;
@@ -14647,7 +15373,12 @@ function auditSheetAlien() {
 // textBaseline='middle' does not vertically centre an emoji -- most glyphs render high of
 // the nominal centre, so +6 pulls them back. It is right for the 34 glyphs that sit high
 // and actively wrong for the one that sits low.
-const AUDIT_MEDALLION = { CANVAS: 192, CX: 96, CY: 96, R: 86, D: 172, DY: 6, FONT: '96px serif' };
+// DY and FONT are GONE. They recorded the pre-7B medallion, which drew every glyph at a
+// fixed 96px and nudged it down 6px to fight emoji baselines. 7B replaced both with
+// measured-ink centring in drawEmblem, and nothing has read either field since --
+// they were left behind compensating for nothing, which is exactly how a harness starts
+// describing a build that no longer exists. Verified unreferenced before removal.
+const AUDIT_MEDALLION = { CANVAS: 192, CX: 96, CY: 96, R: 86, D: 172 };
 
 // Perceptual near-duplicate threshold. The 595 emblem pairs span a shape distance of
 // roughly 0.16 to 0.63 with no natural gap, so there is no threshold that cleanly splits
@@ -14793,6 +15524,7 @@ function auditSheetPet() {
   }
 
   return auditSheet('pet', 'PET SHEET - ' + PETS.length + ' pets',
+    (PETS_V2 ? 'PROCEDURAL (?pets=v2) - ' : 'emoji (default route) - ') +
     'measured through the REAL drawEmblem at r=' + M.R + ' (ink centred, ' +
     (EMBLEM_FILL * 100).toFixed(0) + '% fill target, no-overflow clamp) - left: in-tank art, right: emblem',
     PETS.slice(),
@@ -14903,15 +15635,18 @@ function auditSheetMap() {
   ];
 
   // THE EMPTY PET SLOT IS BY DESIGN, NOT A BUG -- and that is the finding.
-  // buildMap gives a locked card a .petSil and a done card a .petEmb, but the `next` card
-  // branch appends only a .playTag: it has no pet element at all. Neither does the unnamed
-  // fourth state (canvas + label only). So on the one card the player is actually being
-  // pointed at, the pet it hatches is invisible -- the card that most wants to advertise
-  // its reward is the only one that does not. Reported ONCE as a design finding rather
-  // than as 35 identical warnings, which would bury it.
-  // Real check, not a hardcoded claim: build the actual map DOM and count cards whose pet
-  // element is missing. Presence is structural, so this works while #mapScreen is hidden
-  // (sizes would not, which is a different check).
+  // Every stage card must carry the pet it hatches, in EVERY state. This was the original
+  // defect the whole map arc started from, and it is checked here against the real DOM
+  // rather than described in prose -- build the actual map, then look.
+  //
+  // The prose that used to sit here said the `next` card "appends only a .playTag: it has
+  // no pet element at all", and the cell drawer below hardcoded `state === 'next' ? 'no pet
+  // slot'` for all 35 stages to match. Both were stale: buildMap appends the pet element
+  // BEFORE the locked/next/done branch, so every state has always carried it since that was
+  // fixed, and the sheet was reporting a bug the product no longer had -- 35 times. The
+  // per-state result is now MEASURED once, here, and the cell drawer reads it, so the sheet
+  // cannot disagree with the game about this again.
+  const MAP_PET_STATE = { locked: false, next: false, done: false };
   try {
     const savedPets = Save.data.pets.slice();
     const savedT = Save.data.tank, savedL = Save.data.level;
@@ -14919,17 +15654,24 @@ function auditSheetMap() {
     Save.data.pets = [];
     for (let i = 0; i < 7; i++) Save.data.pets.push(petAt(Math.floor(i / 5), i % 5).id);
     Save.data.tank = 1; Save.data.level = 2;
+    const fi = frontierIdx();
     buildMap();
     const cards = document.querySelectorAll('#mapList .stageCard');
     const missing = [];
-    cards.forEach(c => {
+    const seen = { locked: 0, next: 0, done: 0 }, withPet = { locked: 0, next: 0, done: 0 };
+    cards.forEach((c, i) => {
+      const st = i < fi ? 'done' : i === fi ? 'next' : 'locked';
+      seen[st]++;
       if (!c.querySelector('.petSil') && !c.querySelector('.petEmb')) {
         const lbl = c.querySelector('.lbl');
         missing.push(lbl ? lbl.textContent : '?');
-      }
+      } else withPet[st]++;
     });
+    for (const st of ['locked', 'next', 'done']) MAP_PET_STATE[st] = seen[st] > 0 && withPet[st] === seen[st];
     ArtAudit.row('map', 'buildMap pet slots', cards.length + ' cards, ' +
-                 missing.length + ' without a pet element', missing.length === 0);
+                 missing.length + ' without a pet element  [' +
+                 ['locked', 'next', 'done'].map(s => s + ' ' + withPet[s] + '/' + seen[s]).join(', ') + ']',
+                 missing.length === 0);
     if (missing.length) {
       ArtAudit.warn('map', missing.join(','), 'PET_SLOT_EMPTY',
         missing.length + ' of ' + cards.length + ' real map cards render no pet element: ' +
@@ -14992,11 +15734,18 @@ function auditSheetMap() {
 
       // --- the pet slot: silhouette when locked, full colour when cleared, ABSENT on next
       const glyph = PET_EMBLEM[pet.id] || '🐠';
-      if (state === 'locked' || state === 'done') {
+      // MEASURED, not assumed: MAP_PET_STATE was filled from the real buildMap DOM above.
+      if (MAP_PET_STATE[state]) {
         g.save();
         g.font = AUDIT_CARD.PET_FONT; g.textAlign = 'center'; g.textBaseline = 'middle';
         if (state === 'locked') g.filter = 'brightness(0) opacity(0.8)';
-        g.fillText(glyph, ox + cardW / 2, oy + th * 0.06 + 16);
+        // On the procedural route the card holds a canvas, not a glyph, so the sheet has
+        // to draw what the card draws. A harness that kept painting the emoji here would
+        // be auditing a surface the game no longer renders.
+        if (PETS_V2 && PET_EMBLEM_ART[pet.id])
+          drawEmblemArt(g, pet.id, ox + cardW / 2, oy + th * 0.06 + 16, 34);
+        else
+          g.fillText(glyph, ox + cardW / 2, oy + th * 0.06 + 16);
         g.restore();
         g.filter = 'none';
       } else {
@@ -15045,7 +15794,7 @@ function auditSheetMap() {
       auditLabel(g, cw, ch, (t + 1) + '-' + (l + 1) + ' ' + pet.id, it.st.lbl,
                  state === 'next' ? '#ff8f8f' : null);
       ArtAudit.row('map', (t + 1) + '-' + (l + 1) + '/' + state,
-                   state === 'next' ? 'no pet slot' : 'pet shown', state !== 'next');
+                   MAP_PET_STATE[state] ? 'pet shown' : 'no pet slot', MAP_PET_STATE[state]);
     },
     { cellW: 166, cellH: 148 });
 }
