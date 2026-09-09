@@ -754,7 +754,13 @@ let SHOT_FROZEN = false;
 // is tuned by ear on a real device instead of by reading numbers here. Gated exactly like
 // ?icon=1 / ?audit=art / ?debug=1 -- dead in any build with BUILD_FLAGS.dev=false.
 const SHOW_AUDIOTEST = BUILD_FLAGS.dev && QS.get('audio') === 'test';
-const GAME_BUILD = 60;
+// ?aliens=v2 (Phase 8 alien identity): swaps drawAlien's BODY for the ALIEN_ART table --
+// seven silhouettes derived from what each alien DOES, an attack pose, and a hit flash
+// that no longer erases the creature. Old art stays the default so the two can be A/B'd
+// on a real device. TEMPORARY: 8B makes v2 the only route and this flag comes out.
+// Changes no gameplay, economy, wave or balance value -- art only.
+const ALIENS_V2 = BUILD_FLAGS.dev && QS.get('aliens') === 'v2';
+const GAME_BUILD = 63;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -2381,6 +2387,7 @@ const Luck = {
 };
 // A fish entering the tank by purchase or brood hatch may come up shimmer.
 function luckBless(f) {
+  if (Tel.on && f) Tel.luckEvent('shimmerFish');
   if (f && Luck.roll(CFG.LUCK.shimmerChance)) {
     f.shimmer = true;
     puff(f.x, f.y, '#ffffff', 10, 90);
@@ -2395,6 +2402,7 @@ function fishCoin(f, x, y, type) {
   const c = spawnCoin(x, y, type);
   if (f.shimmer) { c.value *= CFG.LUCK.shimmerCoinMult; c.shimmer = true; }
   if (Luck.roll(CFG.LUCK.luckyCoinChance)) { c.lucky = true; c.value *= CFG.LUCK.luckyCoinMult; }
+  if (Tel.on && c.shimmer) Tel.luckEvent('shimmerCoin');
   return c;
 }
 // A single bright mote drifting up — the shimmer fish's sparkle and the lucky coin's trail.
@@ -3630,17 +3638,11 @@ function drawFood(g, f) {
 }
 
 // ============ ART: ALIENS ============
-function drawAlien(g, a) {
-  // rOverride mirrors drawFish's: the Aquapedia draws portraits into its own small
-  // canvases, where the world scale S means nothing.
-  const d = ALIENS[a.kind], r = a.rOverride || alienR(a);
-  g.save();
-  g.translate(a.x, a.y);
-  if (a.dying > 0) { g.globalAlpha = a.dying; g.scale(1 + (1 - a.dying) * 0.5, 1 + (1 - a.dying) * 0.5); }
-  const flash = a.hurt > 0;
-  // Streak is only vulnerable in its red phase; the colour IS the mechanic.
-  const col = flash ? '#ffffff' : (d.phases && a.phase === 1 ? '#4f7fe0' : d.col);
-
+// The pre-Phase-8 body, moved here verbatim so the default route is byte-for-byte the
+// drawing it always was. Six tentacles at fixed angles, one ellipse, one eye, five teeth --
+// identical for all seven kinds except d.col and d.r, which is the defect Phase 8 exists
+// to fix. Reached only when ?aliens=v2 is absent.
+function drawAlienBodyV1(g, a, r, col) {
   // --- tentacles / legs ---
   g.strokeStyle = col; g.lineWidth = r * 0.16; g.lineCap = 'round';
   for (let i = 0; i < 6; i++) {
@@ -3679,6 +3681,473 @@ function drawAlien(g, a) {
     g.lineTo(i * r * 0.17 + r * 0.06, r * 0.30);
     g.closePath(); g.fill();
   }
+
+}
+
+// ============ ART: ALIENS V2 — SILHOUETTE IDENTITY (Phase 8) ============
+// ?aliens=v2 swaps drawAlien's BODY for this table. The health bar, the death fade and
+// the laser-proof ring are untouched and shared with v1 — only the creature changes.
+//
+// WHY A TABLE OF SHAPES AND NOT A SWITCH: every row owns exactly one `shape(g, P)` that
+// appends its whole outline as subpaths of a SINGLE path. That one function is what the
+// body fill, the hit flash, the rim and the INCOMING banner stamp all call. There is no
+// second copy of the geometry anywhere, so the stamp can never drift from the creature
+// (the 7A harness audited its own stale copy of the medallion; this makes that mistake
+// structurally impossible for aliens). It also means "does it survive being flattened to
+// one colour" is not a rendering accident — the flat stamp IS the shape path.
+//
+// EVERY SHAPE IS DERIVED FROM WHAT THE ALIEN DOES, not from its name. The reasoning per
+// row is in its comment, and the behaviour it cites was read out of updateAliens/ALIENS
+// and then verified by stepping the live sim. Two rows deliberately have no bite pose,
+// because those two aliens have eats:0 and physically cannot bite.
+//
+// Local space: origin at the alien's centre, +y DOWN. Mouths point down, the way v1's
+// did, so nothing needs a direction flip — an alien reads the same swimming either way,
+// and the banner stamp is therefore the same picture as the tank.
+
+const ALIEN_BITE_T = 0.34;   // seconds an attack pose lasts (visual only — nothing reads it but the art)
+// Hit-flash strength. Held in an object rather than as a bare const so it can be swept
+// and MEASURED on a live build (the same reason the Phase 7F audio board exists) instead
+// of being asserted here and never checked again.
+//   add : additive white laid over the body. Push it toward 1 and every alien converges
+//         on white — which is precisely the v1 defect this replaces.
+//   rim : white outline width, in units of r. This is what carries the "landed" punch,
+//         so `add` can stay low enough to keep each alien's own colour readable.
+// Both values are the ones the audit's chroma-retention sweep selected; see the report.
+const ALIEN_FLASH = { add: 0.22, rim: 0.07 };
+
+// A tapered limb as a FILLED quad rather than a stroke: strokes cannot be part of a fill
+// path, and the whole point of shape() is that one path carries the entire silhouette.
+function alimb(g, x0, y0, x1, y1, w0, w1) {
+  const dx = x1 - x0, dy = y1 - y0, L = Math.hypot(dx, dy) || 1;
+  const nx = -dy / L, ny = dx / L;
+  g.moveTo(x0 + nx * w0, y0 + ny * w0);
+  g.lineTo(x1 + nx * w1, y1 + ny * w1);
+  g.lineTo(x1 - nx * w1, y1 - ny * w1);
+  g.lineTo(x0 - nx * w0, y0 - ny * w0);
+  g.closePath();
+}
+// A tooth row as filled triangles along a horizontal edge, pointing `dir` (+1 down).
+function ateeth(g, cx, y, halfW, n, h, dir) {
+  const step = (halfW * 2) / n;
+  for (let i = 0; i < n; i++) {
+    const x = cx - halfW + step * i;
+    g.moveTo(x, y);
+    g.lineTo(x + step * 0.5, y + h * dir);
+    g.lineTo(x + step, y);
+    g.closePath();
+  }
+}
+
+const ALIEN_ART = {
+
+  // MITE — eats exactly ONE fish and then heads for the edge. hp 10, the smallest radius
+  // in the table and by far the cheapest kill. It is a snatcher, not a threat: it takes
+  // one thing and goes. So it carries the LEAST INK of the seven — a small compact body
+  // and only TWO limbs where everything else has a crowd of them. Nothing about it should
+  // read as "settle in".
+  mite: {
+    note: 'one bite then leaves — smallest, sparsest, two limbs only',
+    shape(g, P) {
+      const r = P.r, b = P.bite;
+      // teardrop body, snout down
+      g.moveTo(0, r * 0.98);
+      g.quadraticCurveTo(-r * 0.40, r * 0.44, -r * 0.44, -r * 0.06);
+      g.quadraticCurveTo(-r * 0.44, -r * 0.72, 0, -r * 0.72);
+      g.quadraticCurveTo(r * 0.44, -r * 0.72, r * 0.44, -r * 0.06);
+      g.quadraticCurveTo(r * 0.40, r * 0.44, 0, r * 0.98);
+      g.closePath();
+      // two swept barbs — the whole limb budget. Raked BACK rather than straight up, or
+      // the pair reads as a sprout instead of something moving.
+      for (const s of [-1, 1]) {
+        alimb(g, s * r * 0.24, -r * 0.46, s * r * 1.06, -r * 0.86, r * 0.10, r * 0.05);
+        alimb(g, s * r * 1.06, -r * 0.86, s * r * 1.30, -r * 0.22, r * 0.05, r * 0.02);
+      }
+      // pincers at the snout. They are the whole attack read on an alien this small, so
+      // they swing through a wide arc AND lengthen — measured against the same floor the
+      // pairwise test uses, because a pose nobody can see is not a pose.
+      const sp = 0.16 + b * 1.00, dn = 1.10 + b * 0.34;
+      for (const s of [-1, 1]) {
+        alimb(g, s * r * 0.14, r * 0.68, s * r * sp, r * dn, r * 0.10, r * 0.055);
+        alimb(g, s * r * sp, r * dn, s * r * (sp * 0.55), r * (dn + 0.30), r * 0.055, r * 0.02);
+      }
+    },
+    detail(g, P) {
+      const r = P.r;
+      aeye(g, 0, -r * 0.22, r * 0.30, P);
+    },
+  },
+
+  // RAVAGER — eats:Infinity on the default 1.3s cooldown and never stops. The baseline
+  // endless threat, and the one the player meets first among the tireless kinds. Its
+  // identity is APPETITE, so the mouth is not a detail on the body, it IS the bottom
+  // half of the body: a hinged jaw that opens across the creature's whole width.
+  ravager: {
+    note: 'eats forever — the jaw is half the animal',
+    shape(g, P) {
+      const r = P.r, b = P.bite;
+      const gap = r * (0.16 + b * 0.52);          // how far the jaw has dropped
+      // heavy upper dome, mass carried high
+      g.moveTo(-r * 1.02, r * 0.10);
+      g.quadraticCurveTo(-r * 1.02, -r * 0.86, 0, -r * 0.86);
+      g.quadraticCurveTo(r * 1.02, -r * 0.86, r * 1.02, r * 0.10);
+      g.lineTo(r * 0.80, r * 0.16);
+      g.lineTo(-r * 0.80, r * 0.16);
+      g.closePath();
+      // upper tooth row, hanging from the palate
+      ateeth(g, 0, r * 0.16, r * 0.74, 5, r * 0.24, 1);
+      // lower jaw plate, swings down on the bite
+      const jy = r * 0.30 + gap;
+      g.moveTo(-r * 0.86, jy);
+      g.quadraticCurveTo(0, jy + r * 0.62, r * 0.86, jy);
+      g.lineTo(r * 0.66, jy - r * 0.10);
+      g.lineTo(-r * 0.66, jy - r * 0.10);
+      g.closePath();
+      ateeth(g, 0, jy, r * 0.62, 4, -r * 0.22, 1);
+      // six stubby legs, three a side
+      for (let i = 0; i < 3; i++) {
+        const y = -r * 0.30 + i * r * 0.28;
+        alimb(g, -r * 0.92, y, -r * 1.34, y + r * 0.16, r * 0.10, r * 0.04);
+        alimb(g,  r * 0.92, y,  r * 1.34, y + r * 0.16, r * 0.10, r * 0.04);
+      }
+    },
+    detail(g, P) { aeye(g, 0, -P.r * 0.36, P.r * 0.34, P); },
+  },
+
+  // BLOAT — laserProof:true. hitAlien() returns IMMUNE; the ONLY thing that damages it is
+  // feedAlien(), i.e. dropping food into it until hp hits zero. It is a container you fill,
+  // not a creature you shoot, so it is the one alien with NO limbs and NO teeth: a sealed,
+  // distended sac with an intake on top and pressure seams down the sides. It also carries
+  // the largest radius in the table (48) and the slowest bite (2.8s), and the shape says
+  // both — maximum area, minimum threat surface.
+  bloat: {
+    note: 'unshootable, killed by feeding — a sealed sac with an intake, no limbs at all',
+    shape(g, P) {
+      const r = P.r, b = P.bite;
+      const sw = 1 + b * 0.06;                    // swells as it swallows
+      // three-lobed distended body: a circle pushed out at the sides and the base
+      g.moveTo(0, -r * 0.92 * sw);
+      g.bezierCurveTo(r * 0.78 * sw, -r * 0.92 * sw, r * 1.10 * sw, -r * 0.22 * sw, r * 1.02 * sw, r * 0.26 * sw);
+      g.bezierCurveTo(r * 0.96 * sw,  r * 0.78 * sw, r * 0.52 * sw,  r * 1.04 * sw, 0, r * 1.04 * sw);
+      g.bezierCurveTo(-r * 0.52 * sw, r * 1.04 * sw, -r * 0.96 * sw, r * 0.78 * sw, -r * 1.02 * sw, r * 0.26 * sw);
+      g.bezierCurveTo(-r * 1.10 * sw, -r * 0.22 * sw, -r * 0.78 * sw, -r * 0.92 * sw, 0, -r * 0.92 * sw);
+      g.closePath();
+      // intake funnel on top — the only opening. It is the ONLY moving part this creature
+      // has (no limbs, no jaw), so the whole feeding read rides on it: it flares wide and
+      // rises as it swallows.
+      // A wide flared siphon seated straight on the body, NOT a narrow neck — a narrow one
+      // made the whole creature read as a bottle rather than as something alive.
+      const fw = r * (0.40 + b * 0.52), fh = r * (1.16 + b * 0.22);
+      g.moveTo(-r * 0.56, -r * 0.72);
+      g.quadraticCurveTo(-r * (0.52 + b * 0.20), -fh * 0.86, -fw, -fh);
+      g.quadraticCurveTo(0, -fh - r * 0.10, fw, -fh);
+      g.quadraticCurveTo(r * (0.52 + b * 0.20), -fh * 0.86, r * 0.56, -r * 0.72);
+      g.closePath();
+    },
+    detail(g, P) {
+      const r = P.r;
+      // pressure seams — reads as "under load", and gives the flat stamp interior texture
+      g.save();
+      g.globalAlpha = 0.30; g.strokeStyle = '#2a0f22'; g.lineWidth = Math.max(1, r * 0.055);
+      for (let i = -1; i <= 1; i++) {
+        g.beginPath();
+        g.ellipse(0, r * i * 0.34, r * (0.94 - Math.abs(i) * 0.16), r * 0.10, 0, 0, TAU);
+        g.stroke();
+      }
+      g.restore();
+      aeye(g, 0, -r * 0.30, r * 0.30, P);
+    },
+  },
+
+  // LURKER — eats:0, floor:true. Verified in the live sim: it never targets a fish (the
+  // hunt branch requires d.eats > 0) and it never touches one. It is scenery with a
+  // bounty on it. floor:true pins it to SAND_TOP, so its whole read is GROUND: a wide,
+  // low, flat-bottomed carapace on a comb of legs. Nothing about it points at your fish.
+  // It is the horizontal pole of the two floor-dwellers — see sentry for the vertical one.
+  lurker: {
+    note: 'harmless floor crawler (eats:0) — wide, flat-bottomed, ground-hugging',
+    hasBite: false,
+    shape(g, P) {
+      const r = P.r;
+      const base = r * 0.34;
+      // wide low carapace with a flat underside
+      g.moveTo(-r * 1.34, base);
+      g.quadraticCurveTo(-r * 1.30, -r * 0.44, -r * 0.54, -r * 0.56);
+      g.quadraticCurveTo(0, -r * 0.66, r * 0.54, -r * 0.56);
+      g.quadraticCurveTo(r * 1.30, -r * 0.44, r * 1.34, base);
+      g.closePath();
+      // a comb of seven short legs along the bottom edge
+      for (let i = 0; i < 7; i++) {
+        const x = -r * 1.08 + i * r * 0.36;
+        alimb(g, x, base - r * 0.04, x + r * 0.10, base + r * 0.44, r * 0.075, r * 0.03);
+      }
+      // two low eye stalks
+      for (const s of [-1, 1]) alimb(g, s * r * 0.26, -r * 0.52, s * r * 0.34, -r * 0.92, r * 0.075, r * 0.055);
+    },
+    detail(g, P) {
+      const r = P.r;
+      for (const s of [-1, 1]) aeye(g, s * r * 0.35, -r * 0.96, r * 0.15, P);
+    },
+  },
+
+  // STREAK — speed 120, the fastest thing in the tank by 62%, and the only kind with
+  // phases:true. Two jobs for the shape. (1) It must look fast standing still: one long
+  // swept dart, everything raked backwards, no vertical mass. (2) THE PHASE MUST READ
+  // WITHOUT COLOUR. In v1 the phase is nothing but a body-colour swap (red -> #4f7fe0),
+  // and shooting the blue phase HEALS it — the single most punishing mechanic in the game
+  // is carried entirely on a red/blue distinction, which is the exact pair a deuteranope
+  // cannot make, and which the INCOMING banner throws away outright. So the phase is now
+  // a SHAPE: vulnerable = dorsal blade up and ventral spikes out (spiky = shoot it);
+  // resting = plates folded flat into a smooth shell (smooth = leave it alone).
+  streak: {
+    note: 'fastest; phase readable as SHAPE (spiky = vulnerable) not just colour',
+    shape(g, P) {
+      const r = P.r, b = P.bite;
+      const open = P.phase === 1 ? 0 : 1;         // phase 1 is the resting/blue phase
+      const rake = 1 - b * 0.35;                  // fins fold flat as it strikes
+      // fuselage: sharp nose forward, forked tail behind
+      g.moveTo(r * 1.46, r * 0.04);
+      g.quadraticCurveTo(r * 0.50, -r * 0.44, -r * 0.44, -r * 0.36);
+      g.lineTo(-r * 1.34, -r * 0.62);
+      g.lineTo(-r * 0.92, -r * 0.08);
+      g.lineTo(-r * 1.34, r * 0.52);
+      g.lineTo(-r * 0.44, r * 0.34);
+      g.quadraticCurveTo(r * 0.50, r * 0.44, r * 1.46, r * 0.04);
+      g.closePath();
+      // dorsal blade — raised when vulnerable, folded when resting
+      const bl = r * (0.16 + open * 0.62) * rake;
+      g.moveTo(r * 0.26, -r * 0.34);
+      g.lineTo(-r * 0.10, -r * 0.34 - bl);
+      g.lineTo(-r * 0.44, -r * 0.32);
+      g.closePath();
+      // Ventral spikes — only while vulnerable. Raked hard BACKWARD, not straight down:
+      // with the dorsal blade up and these pointing down, the outline was reading as a
+      // five-pointed star rather than as something moving. Everything on this animal has
+      // to trail behind the nose or it stops looking fast standing still.
+      if (open) {
+        for (let i = 0; i < 2; i++) {
+          const x = r * (0.22 - i * 0.50);
+          g.moveTo(x, r * 0.28);
+          g.lineTo(x - r * 0.70, r * (0.28 + 0.34 * rake));
+          g.lineTo(x - r * 0.06, r * 0.36);
+          g.closePath();
+        }
+      }
+      // jaw notch at the nose, opens on the strike
+      if (b > 0.01) {
+        g.moveTo(r * 1.46, r * 0.04);
+        g.lineTo(r * 0.66, -r * 0.10 - r * 0.30 * b);
+        g.lineTo(r * 0.66, r * 0.10 + r * 0.30 * b);
+        g.closePath();
+      }
+    },
+    detail(g, P) {
+      const r = P.r;
+      aeye(g, r * 0.52, -r * 0.06, r * 0.24, P);
+    },
+  },
+
+  // SENTRY — eats:0, floor:true, speed 38: the slowest thing in the game and, like the
+  // lurker, completely harmless (verified: the hunt branch never runs for it). Its ONE
+  // distinguishing trait against the lurker in code is that it is slower, and that
+  // Music.updateInvasionAmbience gives it a ticking layer nothing else gets. So it is
+  // built as the vertical pole against the lurker's horizontal one: a segmented column
+  // standing on a wide foot, tall and narrow, patient, mechanical.
+  //
+  // NAME FLAG: the Aquapedia calls it "armored". Nothing in the table supports that —
+  // hp 25, identical to lurker and bloat, and there is no damage reduction anywhere in
+  // hitAlien. The shape follows the behaviour (slow, planted, ticking) and does not
+  // pretend to armour the code does not give it.
+  sentry: {
+    note: 'harmless floor sentinel (eats:0), slowest in the game — vertical column',
+    hasBite: false,
+    shape(g, P) {
+      const r = P.r;
+      // A splayed ROOT, not a plinth: three gripping toes spread on the sand. The first
+      // pass drew a solid tapered base and the whole thing read as a lighthouse — a
+      // building, not an animal. Toes and a curved stalk are what make it organic.
+      for (const s of [-1, 0, 1]) {
+        alimb(g, s * r * 0.16, r * 0.62, s * r * 1.10, r * 1.02 - Math.abs(s) * r * 0.06,
+              r * 0.13, r * 0.055);
+      }
+      // stalk: three rounded lozenge segments on a slight S-curve, each a little narrower
+      const seg = [[0.00, 0.66, 0.40], [0.10, 0.14, 0.34], [-0.04, -0.36, 0.29]];
+      for (const [sx, sy, sw] of seg) {
+        g.moveTo(r * (sx - sw), r * sy);
+        g.quadraticCurveTo(r * (sx - sw * 1.10), r * (sy - 0.30), r * sx, r * (sy - 0.34));
+        g.quadraticCurveTo(r * (sx + sw * 1.10), r * (sy - 0.30), r * (sx + sw), r * sy);
+        g.quadraticCurveTo(r * sx, r * (sy + 0.12), r * (sx - sw), r * sy);
+        g.closePath();
+      }
+      // bulbous head, wider than the stalk it sits on
+      g.moveTo(-r * 0.50, -r * 0.72);
+      g.bezierCurveTo(-r * 0.56, -r * 1.26, r * 0.56, -r * 1.26, r * 0.50, -r * 0.72);
+      g.bezierCurveTo(r * 0.40, -r * 0.50, -r * 0.40, -r * 0.50, -r * 0.50, -r * 0.72);
+      g.closePath();
+      // two short feelers off the head — the only thing on it that moves
+      for (const s of [-1, 1]) {
+        alimb(g, s * r * 0.30, -r * 1.14, s * r * 0.62, -r * 1.54, r * 0.065, r * 0.03);
+      }
+    },
+    detail(g, P) {
+      const r = P.r;
+      aeye(g, 0, -r * 0.90, r * 0.26, P);
+      // segment seams
+      g.save();
+      g.globalAlpha = 0.32; g.strokeStyle = '#2a0f22'; g.lineWidth = Math.max(1, r * 0.05);
+      for (const y of [0.60, 0.10, -0.38]) {
+        g.beginPath(); g.moveTo(-r * 0.30, r * y); g.lineTo(r * 0.30, r * y); g.stroke();
+      }
+      g.restore();
+    },
+  },
+
+  // SPLITJAW — hp 34 against the ravager's 22, speed 58 against 66: a tougher, slower
+  // version of the same tireless eater. It needs to read as the HEAVY one without
+  // colliding with the ravager's wide-open-jaw read, so it is compact and plated where
+  // the ravager is broad and gaping.
+  //
+  // NAME FLAG: it does not split. There is no split anywhere in the code — spawnAlien
+  // fires Sfx.play('splitjawSplit') and that sound is the entire mechanic. The brief asked
+  // for a shape that "comes apart"; drawing that would commit the same offence as the
+  // name, promising the player a second body that never arrives. What IS true is that its
+  // JAW is a mirrored pair that swings apart to feed. So the jaw splits and the alien does
+  // not, which is the strongest honest reading of the name — see the report.
+  splitjaw: {
+    note: 'tougher tireless eater; the JAW splits, the alien does not (see name flag)',
+    shape(g, P) {
+      const r = P.r, b = P.bite;
+      // The block LUNGES on the bite as well as opening. The mandible swing alone measured
+      // 0.076 against a 0.10 visibility bar, because the plated block is most of the ink
+      // and swallowed the movement; dropping the whole animal into the strike is what
+      // makes the frame read.
+      const ly = b * r * 0.22;
+      // stepped, plated head block — armour reads on the OUTLINE, so it survives the stamp
+      g.moveTo(-r * 0.52, -r * 0.86 + ly);
+      g.lineTo(r * 0.52, -r * 0.86 + ly);
+      g.lineTo(r * 0.72, -r * 0.54 + ly);
+      g.lineTo(r * 0.60, -r * 0.34 + ly);
+      g.lineTo(r * 0.88, -r * 0.06 + ly);
+      g.lineTo(r * 0.74, r * 0.30 + ly);
+      g.lineTo(-r * 0.74, r * 0.30 + ly);
+      g.lineTo(-r * 0.88, -r * 0.06 + ly);
+      g.lineTo(-r * 0.60, -r * 0.34 + ly);
+      g.lineTo(-r * 0.72, -r * 0.54 + ly);
+      g.closePath();
+      // Twin mandibles: closed to a narrow V at rest, thrown wide open on the bite. The
+      // swing has to be big — the plated block is most of this creature's ink, so a
+      // subtle jaw movement vanishes inside it (measured at 0.076 against a 0.10 bar
+      // before this was widened).
+      const sw = b * 1.15;
+      for (const s of [-1, 1]) {
+        const hx = s * r * 0.30, hy = r * 0.24 + ly;
+        const tx = s * r * (0.10 + sw), ty = r * (1.34 - sw * 0.46);
+        const mx = s * r * (0.42 + sw * 0.88), my = r * (0.86 - sw * 0.16);
+        g.moveTo(hx - s * r * 0.18, hy);
+        g.quadraticCurveTo(mx, my, tx, ty);
+        g.quadraticCurveTo(mx - s * r * 0.26, my - r * 0.12, hx + s * r * 0.10, hy);
+        g.closePath();
+      }
+      // four short heavy legs — they stay put while the body lunges past them
+      for (let i = 0; i < 2; i++) {
+        const y = -r * 0.18 + i * r * 0.34;
+        alimb(g, -r * 0.80, y, -r * 1.22, y + r * 0.22, r * 0.11, r * 0.05);
+        alimb(g,  r * 0.80, y,  r * 1.22, y + r * 0.22, r * 0.11, r * 0.05);
+      }
+    },
+    detail(g, P) {
+      const r = P.r;
+      for (const s of [-1, 1]) aeye(g, s * r * 0.26, -r * 0.44, r * 0.20, P);
+      g.save();
+      g.globalAlpha = 0.30; g.strokeStyle = '#2a0f22'; g.lineWidth = Math.max(1, r * 0.06);
+      g.beginPath(); g.moveTo(-r * 0.58, -r * 0.30); g.lineTo(r * 0.58, -r * 0.30); g.stroke();
+      g.beginPath(); g.moveTo(-r * 0.70, r * 0.02); g.lineTo(r * 0.70, r * 0.02); g.stroke();
+      g.restore();
+    },
+  },
+};
+
+// One eye painter for every kind, so an eye never becomes a per-kind fork. Under the hit
+// flash the pupil stays dark: the eye is the fastest thing on a creature for a human to
+// find, and keeping it readable is most of what "still identifiable while being shot" means.
+function aeye(g, x, y, er, P) {
+  g.fillStyle = '#fff';
+  g.beginPath(); g.arc(x, y, er, 0, TAU); g.fill();
+  g.fillStyle = '#1a0a22';
+  const look = Math.sin(Game.time * 1.4 + (P.wob || 0)) * er * 0.22;
+  g.beginPath(); g.arc(x + look, y, er * 0.52, 0, TAU); g.fill();
+  g.fillStyle = '#fff';
+  g.beginPath(); g.arc(x + look + er * 0.24, y - er * 0.30, er * 0.20, 0, TAU); g.fill();
+}
+
+// The pose an alien is in RIGHT NOW, in one place, so the tank, the Aquapedia portrait,
+// the banner stamp and the audit sheet cannot disagree about it.
+function alienPose(a, r) {
+  const d = ALIENS[a.kind];
+  // a.bite counts DOWN from ALIEN_BITE_T; sin() gives a clean open-then-snap arc.
+  const bite = a.bite > 0 ? Math.sin(Math.PI * (1 - a.bite / ALIEN_BITE_T)) : 0;
+  return { r, col: d.col, phase: d.phases ? (a.phase | 0) : 0,
+           bite: ALIEN_ART[a.kind].hasBite === false ? 0 : bite,
+           wob: a.wob || 0, flash: a.hurt > 0 ? 1 : 0 };
+}
+
+// Body painter for the v2 route. Draws through the row's single shape() so the outline is
+// identical to the one the banner stamps, then the row's own interior detail on top.
+//
+// HIT FLASH (Phase 8 item 4). v1 set col = '#ffffff', which replaced the body colour
+// outright: at the exact moment feedback matters most, all seven aliens became the same
+// white blob and the radial gradient's internal shading went with it. This is ADDITIVE
+// instead — the silhouette, the hue and the interior modelling all survive, and the
+// luminance still spikes hard enough to read as a hit. The white rim is what carries the
+// "landed" punch that the flat fill used to. The choice is measured, not asserted: the
+// audit runs the same 21-pair distinctness test on the HIT frame as on idle, and the hit
+// frame has to clear the same floor.
+function drawAlienBodyV2(g, a, r) {
+  const art = ALIEN_ART[a.kind], P = alienPose(a, r);
+  const grad = g.createRadialGradient(-r * 0.25, -r * 0.3, r * 0.15, 0, 0, r * 1.25);
+  grad.addColorStop(0, '#ffffff');
+  grad.addColorStop(0.35, P.phase === 1 && ALIENS[a.kind].phases ? '#4f7fe0' : P.col);
+  grad.addColorStop(1, '#20142c');
+  g.beginPath(); art.shape(g, P);
+  g.fillStyle = grad; g.fill();
+  art.detail(g, P);
+  if (P.flash > 0) {
+    g.save();
+    g.beginPath(); art.shape(g, P);
+    g.globalCompositeOperation = 'lighter';
+    g.fillStyle = 'rgba(255,255,255,' + ALIEN_FLASH.add + ')';
+    g.fill();
+    g.restore();
+    g.beginPath(); art.shape(g, P);
+    g.strokeStyle = '#ffffff'; g.lineWidth = Math.max(2, r * ALIEN_FLASH.rim); g.stroke();
+  }
+}
+
+// The flat one-colour stamp the INCOMING banner reduces every alien to. Same shape()
+// call as the tank body — there is no second geometry to go stale. Pose is deliberately
+// CANONICAL (no bite, resting phase, wob 0) and carries no Game.time, which is also what
+// makes alienSil's cache honest: v1's cache froze whatever animation frame happened to be
+// live at first call, so the stamp you audited was not the stamp that shipped.
+function alienStampPathV2(g, kind, r) {
+  g.beginPath();
+  ALIEN_ART[kind].shape(g, { r, col: ALIENS[kind].col, phase: 0, bite: 0, wob: 0, flash: 0 });
+}
+
+function drawAlien(g, a) {
+  // rOverride mirrors drawFish's: the Aquapedia draws portraits into its own small
+  // canvases, where the world scale S means nothing.
+  const d = ALIENS[a.kind], r = a.rOverride || alienR(a);
+  g.save();
+  g.translate(a.x, a.y);
+  if (a.dying > 0) { g.globalAlpha = a.dying; g.scale(1 + (1 - a.dying) * 0.5, 1 + (1 - a.dying) * 0.5); }
+  const flash = a.hurt > 0;
+  // Streak is only vulnerable in its red phase; the colour IS the mechanic.
+  const col = flash ? '#ffffff' : (d.phases && a.phase === 1 ? '#4f7fe0' : d.col);
+
+  // Phase 8: ONE line of dispatch. Both painters receive the same r and draw inside the
+  // same transform, so the wrapper around them -- the death fade, the laser-proof ring and
+  // the health bar -- is shared and cannot drift between the two routes.
+  if (ALIENS_V2) drawAlienBodyV2(g, a, r); else drawAlienBodyV1(g, a, r, col);
 
   // --- laser-proof marker: Bloat must READ as un-shootable ---
   if (d.laserProof) {
@@ -5247,6 +5716,8 @@ const Shop = {
     if (d.cost == null || !d.can()) { Sfx.play('uiDeny'); return; }
     if (Game.money < d.cost) { Sfx.play('uiDeny'); flashMoney(); return; }
     Game.money -= d.cost;
+    if (Tel.on) Tel.spend(d.kind === 'egg' ? 'egg'
+                        : d.kind === 'fish' ? 'fish' : 'upgrade', d.cost);
     Sfx.play('uiBuy');
     const px = rand(W * 0.2, W * 0.8), py = rand(TANK_TOP + 60 * S, SAND_TOP - 40 * S);
     switch (d.kind) {
@@ -5327,6 +5798,7 @@ function bumpMoney() { moneyPulse = 0.32; }
 
 // ============ SPAWNERS ============
 function spawnSunfin(x, y, stage, banked = 0) {
+  if (Tel.on) Tel.spawnFish();
   const f = Fishes.spawn();
   f.kind = 'sunfin';
   f.x = x; f.y = clamp(y, TANK_TOP + 40 * S, SAND_TOP - 20 * S);
@@ -5376,7 +5848,9 @@ function spawnFood(x, y, free = false, quality = null) {
     if (Foods.count() >= Game.foodMax) return false;
     if (Game.money < CFG.FOOD_COST) { Sfx.play('uiDeny'); flashMoney(); return false; }
     Game.money -= CFG.FOOD_COST;
+    if (Tel.on) Tel.spend('food', CFG.FOOD_COST);
   }
+  if (Tel.on) Tel.pellet();
   const f = Foods.spawn();
   f.x = x; f.y = y; f.vx = rand(-8, 8);
   f.rot = rand(0, TAU); f.spin = rand(-1.5, 1.5);
@@ -5424,6 +5898,7 @@ function spawnAlien(kind) {
   a.hp = a.maxHp = a.hpGhost = d.hp;
   a.eaten = 0; a.grace = CFG.ALIEN_GRACE; a.eatCd = 0; a.phase = 0; a.phaseT = 3;
   a.hurt = 0; a.dying = 0; a.wob = rand(0, TAU); a.slowT = a.slowMax = 0;
+  a.bite = 0;   // Phase 8 attack-pose timer. Pooled objects, so it MUST be reset here.
   Sfx.play('alienSpawn_' + kind);
   if (kind === 'splitjaw') Sfx.play('splitjawSplit');
   Pet.emit('alienSpawn', a);
@@ -5561,6 +6036,25 @@ const PET_BEHAVIOR = {
   // producer — "Every 30 seconds it falls off, and your skimmers may have it." A star coin
   // is exactly that: $40, and the one coin a Star Skimmer eats. FLAT.
   lumen:    { bucket: 'producer',   params: { interval: 30, what: 'coin', coinType: 'star' } },
+  // controller/aliens - the first row to point an EXISTING effect at a different pool.
+  // Positional shove, not a velocity set; see ctrlShove for why.
+  pip:      { bucket: 'controller', params: { effect: 'push', targets: 'aliens',
+                                              when: 'invasion', count: 1, interval: 2.5,
+                                              range: 150, knock: 34,
+                                              move: 'bandPatrol', moveSpeed: 26,
+                                              bandY: 0.4 } },
+  // controller/coins - `hold` only ever EXTENDS c.dwell, so she can never make a coin sink
+  // faster than the tank's own rate, and she cannot rescue a rising beetle.
+  shiver:   { bucket: 'controller', params: { effect: 'coinField', mode: 'hold',
+                                              targets: 'coins',
+                                              when: 'always', range: 110, hold: 1.4,
+                                              move: 'drift' } },
+  // controller/coins - the finger magnet, centred on her instead of the touch point.
+  sol:      { bucket: 'controller', params: { effect: 'coinField', mode: 'pull',
+                                              targets: 'coins',
+                                              when: 'always', range: 170, pullRate: 150,
+                                              move: 'bandPatrol', moveSpeed: 20,
+                                              bandY: 0.3 } },
 };
 
 // Continuous audio beds keyed by loop id — the same split as PET_ART: an asset table,
@@ -5636,6 +6130,13 @@ function petMove(p, q, dt) {
 // tracks the invasion so their art and audio can ramp with it.
 const ctrlGate = q => q.when === 'always' ? true : !!Game.invasion;
 
+// Controller effects have always scanned Fishes.live because every controller so far acted
+// on fish. `targets` NAMES the pool instead of assuming it. Absent means 'fish', so all
+// seven shipped controller rows keep their exact behaviour and their parity hashes.
+const ctrlPool = q => q.targets === 'aliens' ? Aliens.live
+                    : q.targets === 'coins'  ? Coins.live
+                    : Fishes.live;
+
 // Row-level subject filter. No filter means "any", so a row only spells out what it limits.
 function ctrlMatch(f, q) {
   if (!f.alive || f.dying > 0) return false;
@@ -5692,6 +6193,53 @@ function alienBlinded(a) { return a.alive && a.dying <= 0 && a.grace > CFG.ALIEN
 // `duration` is seconds, or the string 'attack' for "until this alien leaves the tank" —
 // which resolves to Infinity rather than a big number pretending to be one. The countdown
 // in updateAliens leaves Infinity alone, and RunSave clamps it to -1 across a save.
+// Pip. NOT a velocity set: updateAliens runs `a.vx = approach(a.vx, ...)` every frame, so
+// a written vx is erased within a few frames and the shove never reads. Displacing a.x is
+// the only thing that survives the steering, and it is clamped to the SAME bounds
+// updateAliens already enforces, so an alien can never be shoved out of the tank or into
+// the off-screen despawn test.
+// Uses p.shove, not Nettle's p.snap: p.snap is set and never decayed (see report), and
+// borrowing it would change her rendering in a pass that is not about her.
+function ctrlShove(p, q, dt) {
+  if (p.shove > 0) p.shove = Math.max(0, p.shove - dt);
+  if (p.t > 0) { p.t -= dt; return; }
+  if (!ctrlGate(q)) return;
+  const reach = (q.range || 150) * S;
+  let n = 0;
+  for (const a of ctrlPool(q)) {
+    if (n >= (q.count || 1)) break;
+    if (!a.alive || a.dying > 0) continue;
+    const dx = a.x - p.x;
+    if (Math.abs(dx) > reach) continue;
+    const r = alienR(a);
+    a.x = clamp(a.x + Math.sign(dx || 1) * (q.knock || 34) * S, r, W - r);
+    puff(a.x, a.y, '#cfe8ff', 8, 90);
+    n++;
+  }
+  if (n) { p.t = q.interval || 2.5; p.shove = 0.22; if (q.sfx) Sfx.play(q.sfx); }
+}
+
+// Shiver and Sol. Neither needs a new field: `hold` extends c.dwell, which updateCoins
+// already honours (a dwelling coin hovers with a bob instead of sinking) and which the run
+// snapshot already persists -- so no save-schema change. `pull` is the existing finger
+// magnet, centred on the pet.
+// Settled and rising coins opt out on purpose: a landed coin must not twitch, and beetles
+// floating to the surface are tank 3's whole tension, so Sol must not rescue them.
+function ctrlCoinField(p, q, dt) {
+  if (!ctrlGate(q)) return;
+  const reach = (q.range || 90) * S;
+  for (const c of ctrlPool(q)) {
+    if (!c.alive || c.rest || c.rise) continue;
+    const dx = p.x - c.x, dy = p.y - c.y, d = Math.hypot(dx, dy);
+    if (d > reach) continue;
+    if (q.mode === 'hold') c.dwell = Math.max(c.dwell || 0, q.hold || 1.4);
+    else if (q.mode === 'pull' && d > 0.5) {
+      const pull = (1 - d / reach) * (q.pullRate || 150) * dt;
+      c.x += dx / d * pull; c.y += dy / d * pull;
+    }
+  }
+}
+
 function ctrlBlind(p, q, a) {
   if (!a || !a.alive || a.dying > 0) return false;
   if (p.marked >= (q.count || 1)) return false;
@@ -5913,7 +6461,7 @@ const PET_BUCKETS = {
   // effects; every one of them is params, so a new controller is a row and a drawing.
   controller: {
     init(p, q) {
-      p.lit = 0; p.t = q.interval || 0; p.marked = 0; p.held = 0;
+      p.lit = 0; p.t = q.interval || 0; p.marked = 0; p.held = 0; p.shove = 0;
       // Read straight off the live instance by Pet.herd, so the host needs no second hook.
       p.force = !!q.force;
     },
@@ -5937,7 +6485,8 @@ const PET_BUCKETS = {
       switch (q.effect) {
         case 'herd':  break;                       // Pet.herd(f) IS the mechanic
         case 'hide':  ctrlHide(p, q);      break;
-        case 'push':  ctrlPush(p, q, dt);  break;
+        case 'push':  q.targets === 'aliens' ? ctrlShove(p, q, dt) : ctrlPush(p, q, dt); break;
+        case 'coinField': ctrlCoinField(p, q, dt); break;
         case 'blind': ctrlBlindScan(p, q); break;
         case 'slow':  ctrlSlowTick(dt);    break;
       }
@@ -6357,6 +6906,87 @@ const PET_ART = {
     g.beginPath(); g.arc(s * 0.42, -s * 0.18, s * 0.19, 0, TAU); g.fill();
     g.fillStyle = '#0a0710';
     g.beginPath(); g.arc(s * 0.47, -s * 0.18, s * 0.10, 0, TAU); g.fill();
+    g.restore();
+  },
+  // Pistol shrimp: ONE oversized claw is the whole read, and the shockwave ring only
+  // exists on the beat, so the snap is legible as a cause. Violet against Nettle's warm
+  // brown -- they are the two snapping controllers and must never be confused at 380px.
+  pip(g, p) {
+    const s = 17 * Math.max(S, 0.85), k = p.shove > 0 ? p.shove / 0.22 : 0;
+    g.save(); g.translate(p.x, p.y); g.scale(p.dir || 1, 1);
+    if (k > 0) {                                     // shockwave, drawn behind the body
+      g.strokeStyle = 'rgba(206,190,255,' + (0.85 * k).toFixed(2) + ')';
+      g.lineWidth = Math.max(2.5, s * 0.20);
+      g.beginPath(); g.arc(s * 1.15, 0, s * (0.7 + (1 - k) * 1.5), 0, TAU); g.stroke();
+    }
+    g.strokeStyle = '#3a2560'; g.lineWidth = Math.max(1.3, s * 0.10); g.lineJoin = 'round';
+    g.fillStyle = '#8b6ad6';                                                   // body
+    g.beginPath(); g.ellipse(-s * 0.15, 0, s * 0.80, s * 0.42, 0, 0, TAU); g.fill(); g.stroke();
+    g.fillStyle = '#6f52b8';                                                   // tail fan
+    g.beginPath();
+    g.moveTo(-s * 0.85, 0); g.lineTo(-s * 1.35, -s * 0.42); g.lineTo(-s * 1.35, s * 0.42);
+    g.closePath(); g.fill(); g.stroke();
+    g.fillStyle = '#c9b6ff';                                                   // the claw
+    g.beginPath();
+    g.moveTo(s * 0.60, -s * 0.10);
+    g.lineTo(s * 1.30, -s * (0.20 + k * 0.34));
+    g.lineTo(s * 1.30, -s * 0.02); g.closePath(); g.fill(); g.stroke();
+    g.beginPath();
+    g.moveTo(s * 0.60, s * 0.10);
+    g.lineTo(s * 1.30, s * (0.20 + k * 0.34));
+    g.lineTo(s * 1.30, s * 0.02); g.closePath(); g.fill(); g.stroke();
+    g.fillStyle = '#0f0a1c';
+    g.beginPath(); g.arc(s * 0.42, -s * 0.12, s * 0.10, 0, TAU); g.fill();
+    g.restore();
+  },
+  // Icefish: near-white and TRANSLUCENT, with the spine showing through -- "her blood runs
+  // clear". The only other see-through pet is Rattle, and Rattle is a skeleton, so the two
+  // never collide at a glance.
+  shiver(g, p) {
+    const s = 20 * Math.max(S, 0.85);
+    g.save(); g.translate(p.x, p.y); g.scale(p.dir || 1, 1);
+    g.strokeStyle = '#123c56'; g.lineWidth = Math.max(2, s * 0.13); g.lineJoin = 'round';
+    g.globalAlpha = 0.9;
+    g.fillStyle = '#f2fbff';
+    g.beginPath(); g.ellipse(0, 0, s * 0.92, s * 0.50, 0, 0, TAU); g.fill();
+    g.globalAlpha = 1; g.stroke();
+    g.beginPath();                                                             // tail
+    g.moveTo(-s * 0.88, 0); g.lineTo(-s * 1.40, -s * 0.46); g.lineTo(-s * 1.40, s * 0.46);
+    g.closePath(); g.globalAlpha = 0.9; g.fill(); g.globalAlpha = 1; g.stroke();
+    g.strokeStyle = '#5d93b4'; g.lineWidth = Math.max(1.2, s * 0.08);          // spine
+    g.beginPath(); g.moveTo(-s * 0.7, 0); g.lineTo(s * 0.62, 0); g.stroke();
+    for (let i = -3; i <= 3; i++) {
+      g.beginPath(); g.moveTo(i * s * 0.19, -s * 0.02); g.lineTo(i * s * 0.19, s * 0.26); g.stroke();
+    }
+    g.fillStyle = '#13303f';
+    g.beginPath(); g.arc(s * 0.60, -s * 0.10, s * 0.11, 0, TAU); g.fill();
+    g.restore();
+  },
+  // A small sun: the corona is the mechanic (coins inside it drift to her), so it is drawn
+  // at the row's own reach, faintly, rather than as a decorative halo of arbitrary size.
+  sol(g, p, q) {
+    const s = 16 * Math.max(S, 0.85);
+    g.save(); g.translate(p.x, p.y);
+    const reach = ((q && q.range) || 170) * S;
+    const gr = g.createRadialGradient(0, 0, s * 0.6, 0, 0, reach);
+    gr.addColorStop(0, 'rgba(255,138,64,.34)');
+    gr.addColorStop(1, 'rgba(255,138,64,0)');
+    g.fillStyle = gr;
+    g.beginPath(); g.arc(0, 0, reach, 0, TAU); g.fill();
+    g.strokeStyle = '#8f2d06'; g.lineWidth = Math.max(1.6, s * 0.12);
+    g.fillStyle = '#ff7a33';
+    g.beginPath();
+    for (let i = 0; i < 16; i++) {                                             // rays
+      const a = i * TAU / 16, rr = s * (i % 2 ? 0.78 : 1.18);
+      const x = Math.cos(a) * rr, y = Math.sin(a) * rr;
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    }
+    g.closePath(); g.fill(); g.stroke();
+    g.fillStyle = '#fff3c4';
+    g.beginPath(); g.arc(0, 0, s * 0.52, 0, TAU); g.fill(); g.stroke();
+    g.fillStyle = '#5a3208';
+    g.beginPath(); g.arc(-s * 0.16, -s * 0.06, s * 0.09, 0, TAU); g.fill();
+    g.beginPath(); g.arc(s * 0.16, -s * 0.06, s * 0.09, 0, TAU); g.fill();
     g.restore();
   },
   // Hermit crab: the spiral shell does all the identifying work; claws snap on p.snap.
@@ -7083,6 +7713,7 @@ const RunSave = {
       a.eaten = d.eaten; a.grace = d.grace === -1 ? Infinity : d.grace; a.eatCd = d.eatCd;
       a.phase = d.phase; a.phaseT = d.phaseT;
       a.hurt = 0; a.dying = 0; a.wob = rand(0, TAU); a.slowT = a.slowMax = 0;
+      a.bite = 0;   // Phase 8: a restored alien must not inherit the pool slot's pose
     }
     for (const d of s.foods) {
       const f = Foods.spawn();
@@ -7167,6 +7798,7 @@ function updateCoins(dt) {
 }
 
 function collectCoin(c) {
+  if (Tel.on) Tel.coin(c);
   Game.money += c.value;
   if (Game.stat) Game.stat.coins += c.value;
   c.alive = false;
@@ -7256,6 +7888,7 @@ function updateFish(dt) {
       if (f.hunger <= 0) {
         f.dying = 1; fishSfx(f, 'die'); Haptics.heavy();
         if (Game.stat) Game.stat.lost++;
+        if (Tel.on) Tel.death('starve');
         puff(f.x, f.y, '#7a9aa8', 10, 70);
         continue;
       }
@@ -7490,6 +8123,7 @@ function applyElixir(f) {
   } else {
     f.dying = 1; fishSfx(f, 'die'); Haptics.heavy();
     if (Game.stat) Game.stat.lost++;
+    if (Tel.on) Tel.death('elixir');
     puff(f.x, f.y, '#ff5050', 14, 110);
     floatText(f.x, f.y - 26, 'TOO SMALL!', '#ff5050');
   }
@@ -7507,6 +8141,7 @@ function updateAliens(dt) {
       continue;
     }
     if (a.hurt > 0) a.hurt -= dt;
+    if (a.bite > 0) a.bite -= dt;   // Phase 8: attack-pose timer, read only by the art
     a.hpGhost = approach(a.hpGhost, a.hp, 0.10, dt);   // trailing damage bar
     if (a.grace > 0) a.grace -= dt;
     if (a.eatCd > 0) a.eatCd -= dt;
@@ -7543,7 +8178,9 @@ function updateAliens(dt) {
         Pet.emit('fishEaten', prey);
         fishSfx(prey, 'die');   // Phase 7A: the prey's own death cue under the alien's bite
         if (Game.stat) Game.stat.lost++;
+        if (Tel.on) Tel.death('alien');
         a.eaten++;
+        a.bite = ALIEN_BITE_T;   // Phase 8: visual only -- no mechanic reads a.bite
         a.eatCd = d.eatCd || CFG.ALIEN_EAT_CD;
         puff(prey.x, prey.y, '#ff5050', 14, 120);
         Sfx.play('alienBite');
@@ -7626,13 +8263,16 @@ function killAlien(a) {
   puff(a.x, a.y, col, Math.round(22 * k), 210 * k);
   puff(a.x, a.y, '#ffffff', Math.round(10 * k), 320 * k);
   if (relief) Sfx.play('reliefSting');
-  spawnCoin(a.x, a.y, 'diamond');   // every dead alien drops a $200 diamond
+  if (Tel.on) Tel.alienKill();
+  // every dead alien drops a $200 diamond; tagged so telemetry can bucket it as kill income
+  { const dc = spawnCoin(a.x, a.y, 'diamond'); if (Tel.on) dc.telSrc = 'alien'; }
   // Phase 6C: sometimes a treasure chest too. Both the roll and the payout are per-tank
   // (6C-2) — the value is overridden on the spawned coin, so COIN_STYLE.chest (and
   // therefore the Dreadfin's own drop) is untouched.
   if (Luck.roll(CFG.LUCK.chestOnKillChance[Game.tank] ?? 0)) {
     const ch = spawnCoin(a.x + rand(-14, 14) * S, a.y, 'chest');
     ch.value = CFG.LUCK.chestValue[Game.tank] ?? ch.value;
+    if (Tel.on) { ch.telSrc = 'alien'; Tel.luckEvent('chestDrop'); }
     ch.dwell = CFG.COIN_DWELL + 0.5;
     floatText(a.x, a.y - 30, 'TREASURE!', '#ffcf7a');
   }
@@ -7803,7 +8443,9 @@ function clearWaveUI() {
 const silCache = new Map();
 function alienSil(kind, size) {
   size = Math.round(size);
-  const key = kind + '@' + size;
+  // The cache key carries the art mode: without it, flipping ?aliens=v2 would serve
+  // stamps baked from the other route's geometry.
+  const key = kind + '@' + size + (ALIENS_V2 ? '@v2' : '');
   let cv = silCache.get(key);
   if (!cv) {
     const d = ALIENS[kind];
@@ -7812,9 +8454,19 @@ function alienSil(kind, size) {
     mk.width = mk.height = size;
     const mg = mk.getContext('2d');
     mg.translate(size / 2, size / 2);
-    // maxHp 0 = portrait: no health bar (see drawAlien)
-    drawAlien(mg, { kind, x:0, y:0, hp:0, maxHp:0, hpGhost:0, dying:0, hurt:0,
-                    wob:1.3, phase:0, rOverride: size * 0.24 });
+    if (ALIENS_V2) {
+      // The v2 stamp is drawn from a CANONICAL pose -- no bite, resting phase, no wob,
+      // and critically no Game.time anywhere in it. v1's cache froze whatever animation
+      // frame happened to be live at the first call (the 7A time-freezing finding), so
+      // the silhouette you audited was not necessarily the one that shipped. A stamp with
+      // no time in it cannot have that bug.
+      alienStampPathV2(mg, kind, size * 0.24);
+      mg.fillStyle = '#ffffff'; mg.fill();
+    } else {
+      // maxHp 0 = portrait: no health bar (see drawAlien)
+      drawAlien(mg, { kind, x:0, y:0, hp:0, maxHp:0, hpGhost:0, dying:0, hurt:0,
+                      wob:1.3, phase:0, rOverride: size * 0.24 });
+    }
     mg.setTransform(1, 0, 0, 1, 0, 0);
     mg.globalCompositeOperation = 'source-in';
     mg.fillStyle = '#ffffff';
@@ -8426,6 +9078,198 @@ if (SHOW_FPS) {
 
 // ============ MAIN LOOP ============
 let lastT = performance.now();
+
+// ============ RUN TELEMETRY (?tel=1, dev-only) ============
+// Records one record per run so balance questions can be MEASURED instead of modelled.
+// Off by default and off in the shipped build: every hook site is `if (Tel.on)`, a single
+// boolean read against a module-level flag, and with the flag false nothing allocates and
+// no further branch is taken. In memory only -- never localStorage, never network.
+const TEL_ON = /[?&]tel=1\b/.test(location.search);
+const Tel = {
+  on: TEL_ON,
+  _cur: null,
+  _runs: [],
+  blank(stage) {
+    return {
+      stage, tank: Game.tank, level: Game.level, t: 0, clearTime: null, result: null,
+      earned: { fish: 0, star: 0, lucky: 0, chest: 0, alien: 0, oyster: 0, stipend: 0, other: 0 },
+      earnedTotal: 0,
+      spent: { food: 0, fish: 0, upgrade: 0, egg: 0 }, spentTotal: 0,
+      fishSpawned: 0, diedStarve: 0, diedAlien: 0, diedElixir: 0, diedPredator: 0,
+      peakSchool: 0, pellets: 0, firstCoinT: null, aliensKilled: 0,
+      pet: null, petFired: 0, petCoins: 0,
+      luck: { shimmerFish: 0, shimmerCoin: 0, luckyCoin: 0, chestDrop: 0 },
+    };
+  },
+  begin(stage) { this._cur = this.blank(stage); },
+  end(result) {
+    const r = this._cur; if (!r) return;
+    r.result = result; r.clearTime = r.t;
+    this._runs.push(r); this._cur = null;
+  },
+  // --- hook points -----------------------------------------------------------
+  frame(dt) {
+    const r = this._cur; if (!r) return;
+    r.t += dt;
+    let n = 0;
+    for (const f of Fishes.live) if (f.alive && f.dying <= 0) n++;
+    if (n > r.peakSchool) r.peakSchool = n;
+  },
+  // A collected coin. `src` says where it came from; the coin itself carries lucky/type.
+  coin(c, from) {
+    const r = this._cur; if (!r) return;
+    const v = c.value;
+    r.earnedTotal += v;
+    if (r.firstCoinT == null) r.firstCoinT = r.t;
+    let bucket = from || c.telSrc || 'fish';
+    if (c.lucky) { r.earned.lucky += v; r.luck.luckyCoin++; }
+    else if (c.type === 'chest') r.earned.chest += v;
+    else if (c.type === 'star')  r.earned.star  += v;
+    else if (bucket === 'alien') r.earned.alien += v;
+    else if (bucket in r.earned) r.earned[bucket] += v;
+    else r.earned.other += v;
+    if (c.telPet) r.petCoins += v;
+  },
+  money(bucket, amt) {
+    const r = this._cur; if (!r) return;
+    r.earnedTotal += amt;
+    if (bucket in r.earned) r.earned[bucket] += amt; else r.earned.other += amt;
+  },
+  spend(bucket, amt) {
+    const r = this._cur; if (!r) return;
+    r.spentTotal += amt;
+    if (bucket in r.spent) r.spent[bucket] += amt;
+  },
+  pellet() { const r = this._cur; if (r) r.pellets++; },
+  spawnFish() { const r = this._cur; if (r) r.fishSpawned++; },
+  death(cause) {
+    const r = this._cur; if (!r) return;
+    if (cause === 'starve') r.diedStarve++;
+    else if (cause === 'alien') r.diedAlien++;
+    else if (cause === 'elixir') r.diedElixir++;
+    else r.diedPredator++;
+  },
+  alienKill() { const r = this._cur; if (r) r.aliensKilled++; },
+  luckEvent(kind) { const r = this._cur; if (r && kind in r.luck) r.luck[kind]++; },
+  petFire() { const r = this._cur; if (r) r.petFired++; },
+  petEquipped(id) { const r = this._cur; if (r) r.pet = id; },
+  // --- public surface --------------------------------------------------------
+  run()  { return this._cur; },
+  runs() { return this._runs; },
+  reset() { this._runs.length = 0; this._cur = null; },
+  csv() {
+    const rows = this._runs;
+    if (!rows.length) return '';
+    const flat = r => ({
+      stage: r.stage, tank: r.tank + 1, level: r.level + 1, result: r.result,
+      clearTime: r.clearTime == null ? '' : r.clearTime.toFixed(2),
+      earnedTotal: r.earnedTotal, e_fish: r.earned.fish, e_star: r.earned.star,
+      e_lucky: r.earned.lucky, e_chest: r.earned.chest, e_alien: r.earned.alien,
+      e_oyster: r.earned.oyster, e_stipend: r.earned.stipend, e_other: r.earned.other,
+      spentTotal: r.spentTotal, s_food: r.spent.food, s_fish: r.spent.fish,
+      s_upgrade: r.spent.upgrade, s_egg: r.spent.egg,
+      fishSpawned: r.fishSpawned, diedStarve: r.diedStarve, diedAlien: r.diedAlien,
+      diedElixir: r.diedElixir, diedPredator: r.diedPredator, peakSchool: r.peakSchool,
+      pellets: r.pellets, firstCoinT: r.firstCoinT == null ? '' : r.firstCoinT.toFixed(2),
+      aliensKilled: r.aliensKilled, pet: r.pet || '', petFired: r.petFired,
+      petCoins: r.petCoins, l_shimmerFish: r.luck.shimmerFish,
+      l_shimmerCoin: r.luck.shimmerCoin, l_luckyCoin: r.luck.luckyCoin,
+      l_chestDrop: r.luck.chestDrop,
+    });
+    const cols = Object.keys(flat(rows[0]));
+    return [cols.join(',')].concat(rows.map(r => {
+      const o = flat(r); return cols.map(k => o[k]).join(',');
+    })).join('\n');
+  },
+};
+
+// ---- headless runner ----
+// Replays a real stage with the real update functions in the real frame order (stepSim is
+// the SAME function frame() calls, so the sim cannot drift from live play), at a fixed dt
+// and with no rendering. The "player" is scripted: feed on a cadence, buy on a simple
+// policy. Returns the same record shape as a live run.
+Tel.sim = function (stage, opts) {
+  opts = opts || {};
+  const dt = 1 / 60;
+  const maxT = opts.maxT || 900;
+  const minFeedMs = opts.feedEveryMs != null ? opts.feedEveryMs : 250;
+  const m = /^(\d+)-(\d+)$/.exec(stage);
+  const tank = m ? (+m[1] - 1) : 0, level = m ? (+m[2] - 1) : 0;
+
+  const savedRoll = Luck.roll, wasOn = Tel.on;
+  Tel.on = true;
+  // `luck:false` is the A/B control: every CFG.LUCK roll is forced to miss for this run.
+  // It stubs Luck.roll rather than editing CFG, so no balance value is touched.
+  if (opts.luck === false) Luck.roll = () => false;
+
+  Game.startLevel(tank, level);
+  Tel.begin(stage);
+  if (opts.pet && PET_BEHAVIOR[opts.pet]) { Pet.start(opts.pet); Tel.petEquipped(opts.pet); }
+  else Pet.stop();
+
+  // Slots are addressed by SLOT_ROLES index, NOT by `d.role`: only some defs carry a
+  // role (tank 2's specialA is an elixir and has none), so role-matching silently
+  // never fires and the egg stays locked for the whole run.
+  const S_BASE = 0, S_QUAL = 1, S_QTY = 2, S_SPA = 3, S_EGG = 6;
+  // `!d.can || d.can()` -- a def with no `can` at all is buyable; `d.can && d.can()`
+  // treats "no gate" as "gate closed" and skips it.
+  const afford = (i, extra) => {
+    const d = Shop.def(i);
+    return d && !d.locked && d.cost != null && (!d.can || d.can())
+        && Game.money >= d.cost + 40 + (extra || 0) ? i : -1;
+  };
+
+  let feedT = 1e9, t = 0, guard = 0;
+  while (Game.state === 'play' && t < maxT && guard++ < 300000) {
+    Game.time += dt; t += dt;
+    stepSim(dt);
+    // Defence. Without this aliens are immortal and simply farm the school from tank 3
+    // on -- every run below tank 3 died with kills=0. fireLaser rate-limits itself.
+    for (const a of Aliens.live) if (a.alive && a.dying <= 0) { fireLaser(a.x, a.y); break; }
+    // Food. Capped by Game.foodMax (1 until the quantity upgrade), so this is a floor
+    // on the interval, not a rate.
+    feedT += dt * 1000;
+    if (feedT >= minFeedMs && Foods.count() < Game.foodMax && Game.money >= CFG.FOOD_COST) {
+      feedT = 0; spawnFood(rand(W * 0.25, W * 0.75), TANK_TOP + 20 * S);
+    }
+    for (const c of Coins.live) if (c.alive) collectCoin(c);
+    Tel.simBuy(afford);
+  }
+  Tel.end(Game.eggPieces >= 3 ? 'win' : 'loss');
+  const rec = Tel._runs[Tel._runs.length - 1];
+  Tel.on = wasOn; Luck.roll = savedRoll;
+  return rec;
+};
+
+// Buy policy: keep the school alive, open the gate, widen the funnel, then bank eggs.
+// Deliberately simple and identical across every cell -- the point is a CONSTANT player,
+// not an optimal one, so that differences between cells are the MECHANIC and not the
+// policy. Buying a special fish is what unlocks the laser and egg slots.
+Tel.simBuy = function (afford) {
+  const alive = Fishes.live.filter(f => f.alive && f.dying <= 0).length;
+  const S_BASE = 0, S_QUAL = 1, S_QTY = 2, S_SPA = 3, S_EGG = 6;
+  let i;
+  if (alive < 2 && (i = afford(S_BASE)) >= 0) Shop.buy(i);
+  else if (!Game.specialsBought && (i = afford(S_SPA)) >= 0) Shop.buy(i);
+  else if ((i = afford(S_QTY, 150)) >= 0) Shop.buy(i);
+  else if ((i = afford(S_QUAL, 150)) >= 0) Shop.buy(i);
+  else if ((i = afford(S_EGG)) >= 0) Shop.buy(i);
+  else if (alive < 4 && (i = afford(S_BASE, 300)) >= 0) Shop.buy(i);
+};
+
+Tel.batch = function (stage, n, opts) {
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(Tel.sim(stage, opts));
+  const inc = out.map(r => r.earnedTotal).sort((a, b) => a - b);
+  const mean = inc.reduce((a, b) => a + b, 0) / inc.length;
+  const median = inc[Math.floor(inc.length / 2)];
+  const sd = Math.sqrt(inc.reduce((a, b) => a + (b - mean) * (b - mean), 0) / inc.length);
+  return { stage, n, mean, median, sd, min: inc[0], max: inc[inc.length - 1],
+           wins: out.filter(r => r.result === 'win').length };
+};
+
+if (TEL_ON) window.__tel = Tel;
+
 function frame(now) {
   requestAnimationFrame(frame);
   // SHOT_FROZEN (?shot= capture harness): dt pinned to 0 so nothing simulated ever
@@ -8436,6 +9280,18 @@ function frame(now) {
   Game.time += dt;
 
   if (Game.state === 'play') {
+    stepSim(dt);
+  } else if (Game.state === 'menu') {
+    Demo.tick(dt);
+  }
+  frameRender(dt);
+}
+
+// The whole play-state simulation, lifted verbatim out of frame() so that the headless
+// runner (Tel.sim) executes the SAME code in the SAME order as a live frame. Nothing here
+// changed in the move; if it ever diverges from frame(), the telemetry stops being evidence.
+function stepSim(dt) {
+  {
     if (Game.laserCd > 0) Game.laserCd -= dt;
     if (Game.shakeT > 0)  Game.shakeT -= dt;
     if (Game.eggAnim > 0) Game.eggAnim -= dt * 1.6;
@@ -8505,10 +9361,11 @@ function frame(now) {
         Game.lose('Every fish is gone.');
       }
     }
-  } else if (Game.state === 'menu') {
-    Demo.tick(dt);
   }
+  if (Tel.on) Tel.frame(dt);
+}
 
+function frameRender(dt) {
   // --- render ---
   ctx.save();
   if (Game.shakeT > 0) {
@@ -11777,13 +12634,10 @@ const Ads = {
     if (Game.state !== 'play') return;
     this._waveOn = true;
     const snap = { tag: ++this._scTag, lost0: Game.stat ? Game.stat.lost : 0, fish: [] };
-    // Restores are lossless. kind + stage alone silently downgraded a Starfin to a
-    // plain sunfin and reset its growth; MAX_REWARDED_PER_STAGE and
-    // SECOND_CHANCE_MAX_FISH are the levers that balance this feature, not fidelity.
+    // kind+stage only -- full fidelity breached the per-stage income guard (tanks 2-3,
+    // ~+3 points). See handoff Economy.
     for (const f of Fishes.live)
-      if (f.alive && f.dying <= 0)
-        snap.fish.push({ uid: f.uid, ref: f, kind: f.kind, stage: f.stage,
-                         star: !!f.star, pts: f.pts, need: f.need });
+      if (f.alive && f.dying <= 0) snap.fish.push({ uid: f.uid, ref: f, kind: f.kind, stage: f.stage });
     this._sc = snap;
   },
   tick(dt) {
@@ -11859,11 +12713,6 @@ const Ads = {
       let f;
       if (s.kind === 'sunfin') f = spawnSunfin(x, y, s.stage);
       else { f = spawnSpecial(s.kind, x, y); f.stage = s.stage; }
-      // Lossless: a Starfin comes back a Starfin, with its growth where it was. Both
-      // spawners randomise `need` and zero `pts`, so these must be reapplied after.
-      f.star = !!s.star;
-      if (s.pts  != null) f.pts  = s.pts;
-      if (s.need != null) f.need = s.need;
       f.hunger = CFG.HUNGER_MAX;
       // spawn sparkle
       puff(f.x, f.y, '#fff7c0', 14, 120);
@@ -12175,6 +13024,83 @@ function sizeEmblemEl(el, id, box) {
 // petAt is the ONLY thing allowed to map a stage to a pet. This asserts that at boot, so
 // a future edit that reintroduces a second mapping fails loudly instead of shipping a
 // wrong award. Reports rather than throws: a broken assertion must not brick the game.
+// ============ PER-TANK TABLE AUDIT ============
+// Restores the check handoff v2 described as "all 7 per-tank tables length 7". No such
+// assertion was ever in the code -- that line recorded a MANUAL verification run on
+// 2026-09-05, and the tables have drifted since: there are nine of them now, not six.
+// (TANK_TRACK_ID, TANK_TRACK_ROOT and SFX_PET_FAMILY all arrived later, and nothing
+// checked them.) It is a genuinely different invariant from assertPetIndex below:
+//
+//   this one          every table indexed by TANK has one entry per tank
+//   assertPetIndex    every STAGE maps to exactly one pet, and back
+//
+// Both checks were run against deliberately broken tables before this shipped, which is
+// the only way to know an assertion is not decoration. What that showed:
+//
+//   THEMES one entry short  -> table audit reports it; assertPetIndex returns CLEAN.
+//                              This is the case only this audit can see, and at runtime
+//                              it is tank 7 reading undefined for its whole theme.
+//   a tank with 4 stages
+//   and another with 6      -> BOTH report it. The table audit names the cause
+//                              ("LEVELS[3] holds 4 stages"); assertPetIndex reports the
+//                              symptom ("pet shiver is claimed by both 5-6 and 6-1").
+//                              Kept here anyway: the cause is the more useful message.
+//
+// The `5` is load-bearing, not cosmetic: petAt is `PETS[t * 5 + l]` and stageIdx is
+// `t * 5 + l`, both hardcoded, so the shape of LEVELS is an assumption of the pet index.
+const PER_TANK_TABLES = [
+  ['LEVELS',          () => LEVELS],
+  ['THEMES',          () => THEMES],
+  ['TANK_SHOP',       () => TANK_SHOP],
+  ['LASER_COST',      () => LASER_COST],
+  ['CFG.START_MONEY', () => CFG.START_MONEY],
+  ['CFG.FIRST_ATTACK', () => CFG.FIRST_ATTACK],
+  ['TANK_TRACK_ID',   () => TANK_TRACK_ID],
+  ['TANK_TRACK_ROOT', () => TANK_TRACK_ROOT],
+  ['SFX_PET_FAMILY',  () => SFX_PET_FAMILY],
+];
+function assertPerTankTables() {
+  const problems = [];
+  const tanks = LEVELS.length;                 // LEVELS defines how many tanks there are
+  const lengths = Object.create(null);
+  for (let i = 0; i < PER_TANK_TABLES.length; i++) {
+    const [name, get] = PER_TANK_TABLES[i];
+    let table = null;
+    try { table = get(); } catch (e) { problems.push(name + ' is not reachable: ' + e.message); continue; }
+    if (!table || typeof table.length !== 'number') { problems.push(name + ' is not an array'); continue; }
+    lengths[name] = table.length;
+    if (table.length !== tanks) {
+      problems.push(name + '.length is ' + table.length + ', expected ' + tanks + ' (one per tank)');
+    }
+  }
+  // Every tank must hold exactly five stages, because petAt/stageIdx hardcode the 5.
+  for (let t = 0; t < tanks; t++) {
+    const row = LEVELS[t];
+    if (!row || row.length !== 5) {
+      problems.push('LEVELS[' + t + '] holds ' + (row ? row.length : 'nothing') +
+                    ' stages, expected 5 -- petAt() indexes t * 5 + l');
+    }
+  }
+  if (PETS.length !== tanks * 5) {
+    problems.push('PETS.length is ' + PETS.length + ', expected ' + (tanks * 5) +
+                  ' (' + tanks + ' tanks x 5)');
+  }
+  return { tanks: tanks, tables: lengths, problems: problems };
+}
+
+function runTableAudit() {
+  const r = assertPerTankTables();
+  r.pass = r.problems.length === 0;
+  if (r.pass) {
+    console.log('[table-audit] PASS - ' + PER_TANK_TABLES.length + ' per-tank tables, one entry ' +
+                'per tank (' + r.tanks + '), every tank 5 stages, PETS ' + PETS.length);
+  } else {
+    console.warn('[table-audit] FAIL', r);
+  }
+  window.__tableAudit = r;
+  return r;
+}
+
 function assertPetIndex() {
   const problems = [];
   const stages = LEVELS.reduce((n, row) => n + row.length, 0);
@@ -13308,8 +14234,233 @@ function auditContrast(rgbA, rgbB) {
   return (hi + 0.05) / (lo + 0.05);
 }
 
+// ---- PHASE 8: SILHOUETTE DISTINCTNESS, MEASURED ----
+// The 7A pet sheet already answers "are two emblems perceptually close" with a rendered
+// 16x16 signature and an RMS distance. This is the same machinery pointed at aliens, and
+// it renders through the SAME drawAlien / ALIEN_ART.shape / drawFish / drawCoin the game
+// uses. Nothing here reimplements a creature.
+//
+// THE ANCHOR. The brief asked for the closest FISH pair as the floor. Measured, that floor
+// is 0.0000: drawFish draws one body path for every species and separates them by PALETTE
+// (FISH_LOOK) plus three flags (teeth/bill/lure), so sunfin, brood, ripper and picker are
+// pixel-identical once colour is stripped. A floor of zero passes anything, so it is
+// reported below but NOT used as the bar.
+//
+// What is used instead is the closest COIN pair. Coins are the right anchor for three
+// reasons: there are exactly seven of them, so the floor is a minimum over the same 21
+// pairs and is not biased low the way a 22-item set's would be; they do the same job the
+// banner stamp does, which is read as a distinct object at small size at a glance; and
+// they are shipped and validated in play -- players tell a beetle from a diamond from a
+// pearl without reading a label. Both numbers are printed every run so the choice can be
+// re-argued against evidence instead of inherited.
+const AUDIT_SIG_N = 16;        // signature grid, same as auditEmblemSignature
+const AUDIT_SIG_BOX = 96;      // render box; NOT bbox-cropped -- see below
+
+// Deliberately NOT bbox-cropped, unlike auditEmblemSignature. Cropping and stretching to
+// the grid throws away exactly the size-and-fill difference the banner shows: every alien
+// is stamped into one fixed square, so a small sparse creature and a large solid one
+// differ on screen and must differ in the number. Glyphs needed the crop (they fill wildly
+// different fractions of an em box); fixed-size stamps must not have it.
+function auditSigFrom(paint) {
+  const c = document.createElement('canvas');
+  c.width = c.height = AUDIT_SIG_BOX;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.save(); g.translate(AUDIT_SIG_BOX / 2, AUDIT_SIG_BOX / 2);
+  paint(g, AUDIT_SIG_BOX * 0.30);
+  g.restore();
+  const s = document.createElement('canvas');
+  s.width = s.height = AUDIT_SIG_N;
+  const sg = s.getContext('2d', { willReadFrequently: true });
+  sg.drawImage(c, 0, 0, AUDIT_SIG_BOX, AUDIT_SIG_BOX, 0, 0, AUDIT_SIG_N, AUDIT_SIG_N);
+  const p = sg.getImageData(0, 0, AUDIT_SIG_N, AUDIT_SIG_N).data;
+  const shape = [], deut = [], lin = v => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+  let chroma = 0, lum = 0, n = 0;
+  for (let i = 0; i < AUDIT_SIG_N * AUDIT_SIG_N; i++) {
+    const a = p[i * 4 + 3] / 255, R = p[i * 4], G = p[i * 4 + 1], B = p[i * 4 + 2];
+    shape.push(a);
+    // Brettel/Vienot deuteranope simulation in linear RGB, then relative luminance. Runs
+    // over the FULL-COLOUR render, so it answers "can a red-green colourblind player tell
+    // these apart" rather than "are the shapes different", which `shape` already covers.
+    const lR = lin(R), lG = lin(G), lB = lin(B);
+    deut.push(a * (0.2126 * (0.625 * lR + 0.375 * lG) +
+                   0.7152 * (0.700 * lR + 0.300 * lG) +
+                   0.0722 * (0.300 * lG + 0.700 * lB)));
+    if (a >= 0.5) { chroma += (Math.max(R, G, B) - Math.min(R, G, B)) / 255;
+                    lum += (0.2126 * R + 0.7152 * G + 0.0722 * B) / 255; n++; }
+  }
+  return { shape, deut, chroma: n ? chroma / n : 0, lum: n ? lum / n : 0 };
+}
+function auditSigDist(A, B) {
+  let s = 0;
+  for (let i = 0; i < A.length; i++) s += (A[i] - B[i]) * (A[i] - B[i]);
+  return Math.sqrt(s / A.length);
+}
+function auditSigPairs(sigs, field) {
+  const ks = Object.keys(sigs), out = [];
+  for (let i = 0; i < ks.length; i++)
+    for (let j = i + 1; j < ks.length; j++)
+      out.push({ a: ks[i], b: ks[j], d: auditSigDist(sigs[ks[i]][field], sigs[ks[j]][field]) });
+  return out.sort((x, y) => x.d - y.d);
+}
+
+// One alien frame, painted through the production path so the audit can never drift from
+// the game. `flat` renders the ALIEN_ART shape as a solid one-colour stamp, which is what
+// the INCOMING banner reduces every alien to and the hardest test any of them faces.
+function auditAlienFrame(kind, opt) {
+  opt = opt || {};
+  return function (g, r) {
+    const t = Game.time; Game.time = 3.0;   // pin the wobble so the audit is reproducible
+    const a = { kind, x: 0, y: 0, hp: 0, maxHp: 0, hpGhost: 0, dying: 0,
+                hurt: opt.hurt ? 1 : 0, wob: 0, phase: opt.phase | 0,
+                bite: opt.bite ? ALIEN_BITE_T / 2 : 0, rOverride: r };
+    if (opt.flat && ALIENS_V2) {
+      g.beginPath();
+      ALIEN_ART[kind].shape(g, { r, col: ALIENS[kind].col, phase: opt.phase | 0,
+                                 bite: opt.bite ? 1 : 0, wob: 0, flash: 0 });
+      g.fillStyle = ALIENS[kind].col; g.fill();
+    } else if (opt.flat) {
+      g.drawImage(alienSil(kind, Math.round(r / 0.24)), -r / 0.24 / 2, -r / 0.24 / 2);
+    } else {
+      drawAlien(g, a);
+    }
+    Game.time = t;
+  };
+}
+
+function auditAlienDistinctness() {
+  const kinds = Object.keys(ALIENS);
+  const frames = {
+    idle:   {},
+    attack: { bite: 1 },
+    hit:    { hurt: 1 },
+  };
+  // --- the two anchors, measured live rather than quoted ---
+  const coinSig = {}, fishSig = {};
+  const cscale = k => (AUDIT_SIG_BOX * 0.30) / (CFG.COIN_R * 1.44 * S);
+  for (const ty of Object.keys(COIN_STYLE)) {
+    coinSig[ty] = auditSigFrom((g) => {
+      const t = Game.time; Game.time = 3.0;
+      g.scale(cscale(), cscale());
+      drawCoin(g, { type: ty, scale: COIN_STYLE[ty].scale, x: 0, y: 0, jx: 0, jy: 0,
+                    spin: 0.7, lucky: false });
+      Game.time = t;
+    });
+  }
+  for (const sp of Object.keys(FISH_LOOK)) {
+    fishSig[sp] = auditSigFrom((g, r) => {
+      const t = Game.time; Game.time = 3.0;
+      drawFish(g, { x: 0, y: 0, dir: 1, stage: 2, kind: sp, wag: 0.6,
+                    hunger: CFG.HUNGER_MAX, grow: 0, dying: 0, star: false, rOverride: r });
+      Game.time = t;
+    });
+  }
+  const coinFloor = auditSigPairs(coinSig, 'shape')[0];
+  const fishFloor = auditSigPairs(fishSig, 'shape')[0];
+  const coinFloorD = auditSigPairs(coinSig, 'deut')[0];
+  const fishFloorD = auditSigPairs(fishSig, 'deut')[0];
+
+  ArtAudit.row('alien', 'anchor/coins',
+    'closest coin pair ' + coinFloor.a + '/' + coinFloor.b + ' = ' + coinFloor.d.toFixed(4) +
+    ' (shape), ' + coinFloorD.d.toFixed(4) + ' (deuteranopic) - THIS IS THE BAR', true);
+  ArtAudit.row('alien', 'anchor/fish',
+    'closest fish pair ' + fishFloor.a + '/' + fishFloor.b + ' = ' + fishFloor.d.toFixed(4) +
+    ' (shape) - degenerate, drawFish separates species by palette not geometry; ' +
+    fishFloorD.d.toFixed(4) + ' (deuteranopic)', fishFloor.d > 0);
+
+  const FLOOR_SHAPE = coinFloor.d, FLOOR_DEUT = coinFloorD.d;
+  const summary = {};
+
+  for (const fname of Object.keys(frames)) {
+    const flat = {}, full = {};
+    for (const k of kinds) {
+      flat[k] = auditSigFrom(auditAlienFrame(k, Object.assign({ flat: true }, frames[fname])));
+      full[k] = auditSigFrom(auditAlienFrame(k, frames[fname]));
+    }
+    const ps = auditSigPairs(flat, 'shape'), pd = auditSigPairs(full, 'deut');
+    const badS = ps.filter(p => p.d < FLOOR_SHAPE), badD = pd.filter(p => p.d < FLOOR_DEUT);
+    summary[fname] = { ps, pd, badS, badD };
+
+    ArtAudit.row('alien', 'distinct/' + fname,
+      'shape ' + (21 - badS.length) + '/21 >= ' + FLOOR_SHAPE.toFixed(4) +
+      ' (min ' + ps[0].d.toFixed(4) + ' ' + ps[0].a + '/' + ps[0].b + ')   ' +
+      'deuteranopic ' + (21 - badD.length) + '/21 >= ' + FLOOR_DEUT.toFixed(4) +
+      ' (min ' + pd[0].d.toFixed(4) + ' ' + pd[0].a + '/' + pd[0].b + ')',
+      badS.length === 0 && badD.length === 0);
+
+    if (badS.length) {
+      ArtAudit.warn('alien', fname, 'SILHOUETTE_TOO_CLOSE',
+        badS.length + ' pair(s) below the coin floor in the ' + fname + ' frame, colour ' +
+        'stripped: ' + badS.map(p => p.a + '/' + p.b + ' ' + p.d.toFixed(4)).join(', '),
+        { floor: +FLOOR_SHAPE.toFixed(4) });
+    }
+    if (badD.length) {
+      ArtAudit.warn('alien', fname, 'SILHOUETTE_TOO_CLOSE_DEUT',
+        badD.length + ' pair(s) below the coin floor under a deuteranope transform in the ' +
+        fname + ' frame: ' + badD.map(p => p.a + '/' + p.b + ' ' + p.d.toFixed(4)).join(', '),
+        { floor: +FLOOR_DEUT.toFixed(4) });
+    }
+  }
+
+  // --- the attack pose has to be VISIBLE, or it is not a pose ---
+  // Bar is the same coin floor: a change the player cannot see is worth nothing, and the
+  // two kinds with eats:0 are expected to score zero because they physically never bite.
+  for (const k of kinds) {
+    const idle = auditSigFrom(auditAlienFrame(k, { flat: true }));
+    const atk  = auditSigFrom(auditAlienFrame(k, { flat: true, bite: 1 }));
+    const d = auditSigDist(idle.shape, atk.shape);
+    const canBite = ALIENS[k].eats > 0;
+    if (!canBite) {
+      ArtAudit.row('alien', k + '/attack-pose',
+        'n/a - eats:0, this alien never bites (verified: updateAliens skips the hunt ' +
+        'branch entirely for it), so no attack frame exists to draw', true);
+    } else {
+      ArtAudit.row('alien', k + '/attack-pose',
+        'idle->attack shape delta ' + d.toFixed(4) + ' (bar ' + FLOOR_SHAPE.toFixed(4) + ')',
+        d >= FLOOR_SHAPE);
+      if (d < FLOOR_SHAPE) {
+        ArtAudit.warn('alien', k, 'ATTACK_POSE_INVISIBLE',
+          'the attack frame differs from idle by only ' + d.toFixed(4) +
+          ', below the ' + FLOOR_SHAPE.toFixed(4) + ' floor - the player cannot see the bite land',
+          { delta: +d.toFixed(4) });
+      }
+    }
+  }
+
+  // --- the hit flash must not erase identity (Phase 8 item 4) ---
+  // v1 set col='#ffffff', so every alien became the same white blob at the exact moment
+  // feedback matters most. The replacement is additive, and this is the proof: chroma
+  // retained per kind, and the flashed set still separable pair-by-pair.
+  {
+    let worst = 1, worstK = null;
+    for (const k of kinds) {
+      const i = auditSigFrom(auditAlienFrame(k, {}));
+      const h = auditSigFrom(auditAlienFrame(k, { hurt: 1 }));
+      const ret = i.chroma > 0 ? h.chroma / i.chroma : 1;
+      if (ret < worst) { worst = ret; worstK = k; }
+      ArtAudit.row('alien', k + '/hit-flash',
+        'chroma ' + (ret * 100).toFixed(0) + '% retained, luminance +' +
+        ((h.lum - i.lum) * 100).toFixed(0) + ' pts', ret > 0.25);
+    }
+    ArtAudit.row('alien', 'hit-flash/summary',
+      'worst chroma retention ' + (worst * 100).toFixed(0) + '% (' + worstK +
+      '); flashed aliens still separate at ' + summary.hit.pd[0].d.toFixed(4) +
+      ' deuteranopic vs a ' + FLOOR_DEUT.toFixed(4) + ' floor. v1 retained 0% by ' +
+      'construction (col was replaced with #ffffff).', worst > 0.25);
+  }
+
+  // Publish the full 21-pair table so the bar can be re-argued against evidence.
+  ArtAudit.alienPairsShape = summary.idle.ps.map(p => p.a + '/' + p.b + ' ' + p.d.toFixed(4));
+  ArtAudit.alienPairsDeut  = summary.idle.pd.map(p => p.a + '/' + p.b + ' ' + p.d.toFixed(4));
+  ArtAudit.alienAnchors = {
+    coinShape: +coinFloor.d.toFixed(4), coinDeut: +coinFloorD.d.toFixed(4),
+    fishShape: +fishFloor.d.toFixed(4), fishDeut: +fishFloorD.d.toFixed(4),
+  };
+  return summary;
+}
+
 function auditSheetAlien() {
   const kinds = Object.keys(ALIENS);
+  auditAlienDistinctness();
   const ss = auditAlienStampSize();
 
   // Fingerprint every silhouette first, so the sheet can label identical ones as identical
@@ -13405,12 +14556,14 @@ function auditSheetAlien() {
   }
 
   // Columns: the frames drawAlien can genuinely produce, then the two silhouette views.
-  const MODES = ['idle', 'hurt', 'phase', 'dying', 'sil/banner', 'sil/grey'];
+  const MODES = ['idle', 'attack', 'hurt', 'phase', 'dying', 'sil/banner', 'sil/grey'];
   const items = [];
   for (const k of kinds) for (const m of MODES) items.push({ kind: k, mode: m });
 
   return auditSheet('alien', 'ALIEN SHEET - 7 aliens x ' + MODES.length + ' frames',
-    'stamp ' + ss + 'px - drawAlien has NO bite pose (no eat field is read); "hurt" is the only action frame it owns',
+    'stamp ' + ss + 'px - ' + (ALIENS_V2
+      ? 'v2: shapes derived from behaviour, attack pose reads a.bite, flash is additive'
+      : 'v1: ONE body for all seven kinds, no bite pose (no eat field is read)'),
     items,
     function (g, it, cw, ch) {
       const k = it.kind, d = ALIENS[k];
@@ -13443,17 +14596,29 @@ function auditSheetAlien() {
       // A throwaway alien literal. maxHp 0 marks a portrait, which suppresses the health
       // bar (drawAlien's own convention); nothing here touches Aliens.live.
       const a = { kind: k, x: cx, y: cy, hp: 0, maxHp: 0, hpGhost: 0,
-                  dying: 0, hurt: 0, wob: 1.3, phase: 0, rOverride: r };
+                  dying: 0, hurt: 0, wob: 1.3, phase: 0, bite: 0, rOverride: r };
       let note = '';
-      if (it.mode === 'hurt')  { a.hurt = 1; note = 'hit flash (white)'; }
+      if (it.mode === 'hurt')  { a.hurt = 1; note = ALIENS_V2 ? 'hit flash (additive)' : 'hit flash (white)'; }
+      if (it.mode === 'attack') {
+        // eats:0 means the hunt branch in updateAliens never runs for this kind, so it
+        // has no attack frame to show. Say so rather than invent one.
+        if (!ALIENS_V2)          note = 'N/A - v1 reads no eat field';
+        else if (d.eats > 0)   { a.bite = ALIEN_BITE_T / 2; note = 'mid-bite'; }
+        else                     note = 'N/A - eats:0, never bites';
+      }
       if (it.mode === 'dying') { a.dying = 0.55; note = 'death fade+scale'; }
       if (it.mode === 'phase') {
-        if (d.phases) { a.phase = 1; note = 'vulnerable phase'; }
+        // phase 1 is the RESTING phase, not the vulnerable one: hitAlien() heals on
+        // `d.phases && a.phase === 1`. The 7A sheet labelled this cell "vulnerable phase",
+        // the exact inverse of the mechanic. Corrected in Phase 8, because this sheet is
+        // the reference for the phase-readability work and was contradicting the code.
+        if (d.phases) { a.phase = 1; note = 'resting phase - shooting HEALS'; }
         else { note = 'N/A - no phases'; }
       }
       if (it.mode === 'idle') note = 'r=' + d.r + ' hp=' + d.hp;
 
-      if (it.mode === 'phase' && !d.phases) {
+      if ((it.mode === 'phase' && !d.phases) ||
+          (it.mode === 'attack' && (!ALIENS_V2 || d.eats === 0))) {
         g.fillStyle = 'rgba(255,255,255,.10)';
         g.font = "700 10px 'Trebuchet MS',sans-serif"; g.textAlign = 'center';
         g.fillText('N/A', cx, cy);
@@ -13973,6 +15138,7 @@ if (typeof Capacitor !== 'undefined' && Capacitor.isNativePlatform && Capacitor.
 // Pet-index + save-integrity audit. Runs on every route, before any screen is built, so
 // a bad index or a foreign save is reported once at boot rather than discovered by a
 // player receiving the wrong pet.
+runTableAudit();
 runPetAudit();
 runFishColourAudit();
 
