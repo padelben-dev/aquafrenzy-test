@@ -187,6 +187,47 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
 }
 .petChip.none{font-size:11px;font-weight:800;color:#9fd8ff;letter-spacing:.5px}
 .petChip.sel{border-color:#ffd35a;box-shadow:0 0 10px rgba(255,211,90,.7)}
+/* Phase 10: the chips are loadout SLOTS — '+' for an open empty one, a padlock for one
+   the player has not earned yet. Both open the sheet; the padlock also explains itself. */
+.petChip.add{font-size:22px;font-weight:900;color:#9fd8ff;border-style:dashed}
+/* The page-wide `canvas{position:absolute;top:0;left:0}` rule is for the game canvas; an
+   emblem drawn INTO a chip or slot tile must flow with its box, as .pedCard already does. */
+.petChip canvas,.loSlotArt canvas{position:static}
+.petChip.lock{font-size:16px;opacity:.65}
+
+/* ============ LOADOUT SHEET (Phase 10) ============ */
+#loadoutScreen{gap:10px}
+#loSlots{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;width:100%}
+.loSlot{
+  width:clamp(100px,27vw,156px);padding:8px 6px;border:2px solid #2a4a66;border-radius:12px;
+  background:rgba(8,26,44,.92);cursor:pointer;display:flex;flex-direction:column;
+  align-items:center;gap:4px;
+}
+.loSlot.full{border-color:#ffd35a;box-shadow:0 0 10px rgba(255,211,90,.5)}
+.loSlot.lock{opacity:.7;cursor:default}
+.loSlotArt{font-size:30px;line-height:44px;height:44px;width:44px;color:#9fd8ff}
+.loSlot.empty .loSlotArt{font-weight:900;border:2px dashed #2a4a66;border-radius:50%}
+.loSlotLbl{font-size:10.5px;font-weight:700;color:#9fd8ff;line-height:1.3}
+.loSlot.full .loSlotLbl{color:#ffd35a}
+#loCount{font-size:13px;font-weight:700;color:#9fd8ff;letter-spacing:1px}
+#loMsg{min-height:16px;font-size:12px;font-weight:700;color:#ffd35a;max-width:92vw}
+#loMsg.flash{animation:loFlash .5s ease-out}
+@keyframes loFlash{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+#loList{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;max-width:980px}
+.loCard{cursor:pointer}
+.loCard.on{border-color:#ffd35a;box-shadow:0 0 10px rgba(255,211,90,.6)}
+.loCard.on .where{color:#ffd35a}
+.loCard.unknown{cursor:default}
+.loTag{
+  display:inline-block;font-size:9px;font-weight:900;letter-spacing:1px;color:#04263a;
+  background:#7fd4ff;border-radius:6px;padding:2px 6px;margin-bottom:4px;
+}
+.loCard.unknown .loTag{background:#39536b;color:#9fd8ff}
+@media (max-width:699px){
+  #loList{gap:8px;max-width:430px}
+  .loSlot{width:calc(33.3% - 7px);padding:6px 4px}
+  .loSlotLbl{font-size:9.5px}
+}
 #dailyCard{
   border:2px solid #ffd35a;border-radius:12px;background:rgba(46,32,8,.92);color:#ffd35a;
   font:800 13px/1.5 'Trebuchet MS',sans-serif;letter-spacing:.5px;padding:10px 16px;
@@ -602,12 +643,21 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
   <div class="title" id="lvlTitle">TANK 1-1</div>
   <div class="subtitle" id="lvlGoal"></div>
   <div id="petRow" class="hidden">
-    <div id="petRowLbl">BRING A PET</div>
+    <div id="petRowLbl">LOADOUT</div>
     <div id="petChips"></div>
   </div>
   <button class="btn secondary hidden" id="hsBtn">+$120 head start &#128250;</button>
   <button class="btn" id="lvlBtn">START</button>
   <button class="btn secondary" id="lvlBack" style="padding:10px 22px;min-height:0;font-size:14px">BACK TO MAP</button>
+</div>
+
+<div class="overlay tall hidden" id="loadoutScreen">
+  <div class="title" style="font-size:clamp(20px,5vw,36px)">LOADOUT</div>
+  <div id="loSlots"></div>
+  <div id="loCount"></div>
+  <div id="loMsg"></div>
+  <div id="loList"></div>
+  <button class="btn" id="loDone" style="margin-bottom:8px">DONE</button>
 </div>
 
 <div class="overlay hidden" id="endScreen">
@@ -766,7 +816,7 @@ const ALIENS_V2 = BUILD_FLAGS.dev && QS.get('aliens') === 'v2';
 // procedural set is approved. Art only -- no behaviour, economy, persistence, or any
 // change to which pet hatches where.
 const PETS_V2 = BUILD_FLAGS.dev && QS.get('pets') === 'v2';
-const GAME_BUILD = 64;
+const GAME_BUILD = 65;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -2472,6 +2522,10 @@ const PETS = [
   { id:'sol',     name:'Sol the Sunstar',          desc:'The first sunrise the abyss has ever seen. Every coin in the tank drifts gently toward her.' },
 ];
 const petAt = (t, l) => PETS[t * 5 + l];
+// Loadout capacity (Phase 10). Slot 1 is open from the first brief; slots 2 and 3 open
+// as the early tanks are CLEARED (see slotOpen), so the player meets the buckets one at
+// a time in tank 1, pairs them in tank 2 and runs a full spine from tank 3 on.
+const PET_SLOTS = 3;
 
 // One readable emblem per pet — shared by the win-screen portrait and the Aquapedia.
 // Full in-tank pet art is a later pass.
@@ -2653,13 +2707,15 @@ const Save = {
   // re-guards them in case a hand-edited save carries best:null or the like.
   // `stars` (added 2026-09-06) maps stage index -> goal bitmask (1 cleared, 2 under
   // par, 4 third goal). `daily` tracks the daily-challenge streak by local ISO date.
-  // `pet` (added 2026-09-06) is the last pet chosen on the brief ('' = none) —
-  // persists so replays keep the pick; validated against hatched pets at startLevel.
+  // `loadout` (Phase 10, 2026-09-09) is the pets chosen on the brief, up to PET_SLOTS
+  // ids in slot order — persists so replays keep the picks; validated against hatched
+  // pets, behaviour rows and open slots by loadoutIds() at startLevel. It replaced the
+  // single `pet` string (2026-09-06); an old save's `pet` migrates into slot 1 in load().
   // `audio` (added 2026-09-06, Phase 9 music engine) holds the two volume categories
   // the Phase 15 sliders will expose; wired to the bus gains now so an old save that
   // never had this key still gets sane defaults instead of a silent bus at gain 0.
   data: { version:1, tank:0, level:0, pets:[], best:{}, pediaSeen:[],
-          stars:{}, daily:{ last:'', streak:0, bestStreak:0 }, pet:'',
+          stars:{}, daily:{ last:'', streak:0, bestStreak:0 }, loadout:[],
           audio:{ music:0.8, sfx:1.0 },
           // `ads` (added 2026-09-07, Phase 6): mid-ad gate counters + lifetime totals.
           // winsSinceMid starts AT the threshold on purpose so the first eligible win fires.
@@ -2677,7 +2733,16 @@ const Save = {
     if (!this.data.stars || typeof this.data.stars !== 'object') this.data.stars = {};
     if (!this.data.daily || typeof this.data.daily !== 'object')
       this.data.daily = { last:'', streak:0, bestStreak:0 };
-    if (typeof this.data.pet !== 'string') this.data.pet = '';
+    // Loadout: an array of pet ids, at most PET_SLOTS. A save from before Phase 10
+    // carried one `pet` string — it becomes slot 1, once, and the old key is dropped.
+    // The defaults already hold an empty array before the stored save is merged in, so
+    // the old key is the migration signal, not the missing new one: a `pet` string only
+    // exists on a save written before Phase 10, because this block deletes it.
+    if (!Array.isArray(this.data.loadout)) this.data.loadout = [];
+    if (typeof this.data.pet === 'string' && this.data.pet && !this.data.loadout.length)
+      this.data.loadout = [this.data.pet];
+    this.data.loadout = this.data.loadout.filter(id => typeof id === 'string' && id).slice(0, PET_SLOTS);
+    delete this.data.pet;
     if (!this.data.audio || typeof this.data.audio !== 'object') this.data.audio = { music:0.8, sfx:1.0 };
     if (typeof this.data.audio.music !== 'number') this.data.audio.music = 0.8;
     if (typeof this.data.audio.sfx   !== 'number') this.data.audio.sfx   = 1.0;
@@ -2721,7 +2786,7 @@ if (SHOT === 'pedia' || SHOT === 'map' || SHOT === 'hatch' || SHOT === 'invasion
   for (let i = 0; i < 15; i++) { shotStars[i] = 7; shotPediaSeen.push('p:' + shotPetIds[i]); }
   Storage.setSync(SAVE_KEY, JSON.stringify({
     version: 1, tank: 3, level: 0, pets: shotPetIds, best: {}, pediaSeen: shotPediaSeen,
-    stars: shotStars, daily: { last: '', streak: 0, bestStreak: 0 }, pet: '',
+    stars: shotStars, daily: { last: '', streak: 0, bestStreak: 0 }, loadout: [],
     audio: { music: 0.8, sfx: 1.0 },
     ads: { lastMidTs: 0, winsSinceMid: 2, totals: { mid: 0, rew: 0, dismissed: 0 } },
     haptics: true,
@@ -6156,7 +6221,7 @@ function ctrlMatch(f, q) {
 // later; clearing first is the only version of this that is safe with a pool. Safe to clear
 // unconditionally because this is the only writer of f.hidden in the game.
 function ctrlHide(p, q) {
-  ctrlRelease();
+  ctrlRelease(p);
   if (!ctrlGate(q)) return;
   const cap = q.cap || 6, reach = (q.range || 0) * S;
   let n = 0;
@@ -6164,15 +6229,20 @@ function ctrlHide(p, q) {
     if (n >= cap) break;
     if (!ctrlMatch(f, q)) continue;
     if (reach && Math.hypot(f.x - p.x, f.y - p.y) > reach) continue;
+    if (f.hidden) continue;   // already sheltered by the OTHER hide pet in the loadout
     // Safe in the mouth, but not fed there: hunger keeps ticking, and a pellet cannot
     // reach them. That is the whole weakness — shelter costs feeding time.
-    f.hidden = true; f.target = null; f.vx = 0; f.vy = 0;
+    f.hidden = true; f.hiddenBy = p; f.target = null; f.vx = 0; f.vy = 0;
     f.x = p.x + (q.mouthX || 0) * S; f.y = p.y + (q.mouthY || 4) * S;
     n++;
   }
   p.held = n;
 }
-function ctrlRelease() { for (const f of Fishes.live) if (f.hidden) f.hidden = false; }
+// Releases only the fish THIS pet holds: since the loadout, two hide controllers can run
+// side by side, and one letting go must not empty the other's mouth.
+function ctrlRelease(p) {
+  for (const f of Fishes.live) if (f.hidden && f.hiddenBy === p) { f.hidden = false; f.hiddenBy = null; }
+}
 
 // push — knocks a fish out of a zone on an interval. Reach and interval are the weakness.
 function ctrlPush(p, q, dt) {
@@ -6481,7 +6551,7 @@ const PET_BUCKETS = {
       // `count` is per ATTACK, so the edges are where the allowance resets, and anything
       // held has to come back out when the water is clear.
       invasionStart(p, q) { p.marked = 0; },
-      invasionEnd(p, q)   { p.marked = 0; if (q.effect === 'hide') ctrlRelease(); },
+      invasionEnd(p, q)   { p.marked = 0; if (q.effect === 'hide') ctrlRelease(p); },
     },
     update(p, q, dt) {
       // One "the gate is open" ramp every controller gets for free — art and audio read it.
@@ -6499,7 +6569,7 @@ const PET_BUCKETS = {
       petMove(p, q, dt);
     },
     // Unequipping must undo everything the pet did to the tank. Nothing else can.
-    stop(p, q) { if (q.effect === 'hide') ctrlRelease(); },
+    stop(p, q) { if (q.effect === 'hide') ctrlRelease(p); },
   },
 
   // Genuine one-offs — an effect that belongs to no other bucket. Each `effect` is a small
@@ -7216,103 +7286,133 @@ const PET_ART = {
 };
 
 const Pet = {
-  active: null,     // { id, x, y, dir, pulse, ...bucket scratch }
+  live: [],         // one { id, x, y, dir, pulse, ...bucket scratch } per filled loadout slot
   wasInvasion: false,
+  // The first running pet, or null. Kept for the QA suites and the dev overlay, which
+  // were written when there was only ever one; new code walks `live`.
+  get active() { return this.live[0] || null; },
 
   row(id) { return PET_BEHAVIOR[id] || null; },
   // Fall-speed multiplier, read by updateFood/updateCoins exactly as it always was. It is
-  // now DERIVED from the amplifier bucket instead of being assigned by a pet, so Plod is
-  // a row like everything else and nothing has to remember to reset it.
+  // DERIVED from the amplifier bucket instead of being assigned by a pet, so Plod is a
+  // row like everything else and nothing has to remember to reset it.
   get fall() { return this.amp('fallSpeed'); },
 
   loopOn(q)  { if (q.loop && PET_LOOPS[q.loop]) Sfx.startLoop(q.loop, PET_LOOPS[q.loop]); },
   loopOff(q) { if (q.loop) Sfx.stopLoop(q.loop); },
 
-  start(id) {
+  // One pet alone — the harness and the telemetry runner's `opts.pet` still speak this.
+  start(id) { this.startAll(id ? [id] : []); },
+  // The whole loadout at once, in slot order. An unknown id, a repeat, or an id with no
+  // behaviour row is skipped, exactly as start() always stayed inert for one. Pets are
+  // spread across the tank so three do not spawn on one point.
+  startAll(ids) {
     this.stop();
-    const row = PET_BEHAVIOR[id];
-    if (!id || !row) return;               // unknown id stays inert, exactly as before
-    this.active = { id, x: W * 0.5, y: TANK_TOP + TANK_H * 0.5, dir: 1, pulse: 0 };
-    PET_BUCKETS[row.bucket].init(this.active, row.params);
-    this.loopOn(row.params);
-    Sfx.play('petSummon');
+    const seen = new Set();
+    for (const id of ids || []) {
+      const row = PET_BEHAVIOR[id];
+      if (!id || !row || seen.has(id)) continue;
+      seen.add(id);
+      const p = { id, x: W * 0.5, y: TANK_TOP + TANK_H * 0.5, dir: 1, pulse: 0 };
+      this.live.push(p);
+      PET_BUCKETS[row.bucket].init(p, row.params);
+      this.loopOn(row.params);
+    }
+    const n = this.live.length;
+    this.live.forEach((p, i) => { p.x = W * (0.5 + (i - (n - 1) / 2) * 0.22); });
+    if (n) Sfx.play('petSummon');
   },
   stop() {
-    const row = this.active && PET_BEHAVIOR[this.active.id];
-    if (row) {
+    for (const p of this.live) {
+      const row = PET_BEHAVIOR[p.id];
+      if (!row) continue;
       // A bucket that writes state onto the tank gets to take it back before the pet goes.
       const b = PET_BUCKETS[row.bucket];
-      if (b.stop) b.stop(this.active, row.params);
+      if (b.stop) b.stop(p, row.params);
       this.loopOff(row.params);
     }
-    this.active = null; this.wasInvasion = false;
+    this.live = []; this.wasInvasion = false;
   },
-  is(id) { return !!this.active && this.active.id === id; },
+  is(id) { return this.live.some(p => p.id === id); },
 
   update(dt) {
-    if (!this.active) return;
+    if (!this.live.length) return;
     // One clock every pet's art can lean on, ticked here so no bucket has to remember it.
-    this.active.pulse += dt;
+    for (const p of this.live) p.pulse += dt;
     // Invasion edges become events here so no alien code has to know about pets.
     const inv = Game.invasion;
     if (inv !== this.wasInvasion) {
       this.emit(inv ? 'invasionStart' : 'invasionEnd');
       this.wasInvasion = inv;
     }
-    const row = PET_BEHAVIOR[this.active.id];
-    PET_BUCKETS[row.bucket].update(this.active, row.params, dt);
+    for (const p of this.live) {
+      const row = PET_BEHAVIOR[p.id];
+      PET_BUCKETS[row.bucket].update(p, row.params, dt);
+    }
   },
-  // Passive multiplier read by whichever system the amplifier bucket targets. Returns 1
-  // with no pet, a non-amplifier pet, or an amplifier aimed at a different stat — so a
-  // call site costs nothing and needs no null checks.
+  // Passive multiplier read by whichever system an amplifier targets. Returns 1 with no
+  // pet, no amplifier, or amplifiers aimed at other stats — so a call site costs nothing
+  // and needs no null checks. Two amplifiers on ONE stat multiply.
   amp(stat) {
-    const row = this.active && PET_BEHAVIOR[this.active.id];
-    if (!row || row.bucket !== 'amplifier' || row.params.stat !== stat) return 1;
-    return row.params.mult;
+    let m = 1;
+    for (const p of this.live) {
+      const row = PET_BEHAVIOR[p.id];
+      if (row.bucket === 'amplifier' && row.params.stat === stat) m *= row.params.mult;
+    }
+    return m;
   },
-  // Game events reach the equipped pet's BUCKET, which decides from params whether they
+  // Game events reach every running pet's BUCKET, which decides from params whether they
   // mean anything to it. Routed by bucket, so no caller and no handler names a pet.
   emit(ev, data) {
-    const row = this.active && PET_BEHAVIOR[this.active.id];
-    if (!row) return;
-    const on = PET_BUCKETS[row.bucket].on;
-    if (on && on[ev]) on[ev](this.active, row.params, data);
+    for (const p of this.live) {
+      const row = PET_BEHAVIOR[p.id];
+      const on = PET_BUCKETS[row.bucket].on;
+      if (on && on[ev]) on[ev](p, row.params, data);
+    }
   },
   // A herding controller's gather point for THIS fish, or null — updateFish steers to it.
-  // Derived entirely from the row, so a second herding pet needs no change here. The
-  // returned object is the live pet, and `p.force` on it says whether the pull outranks
-  // food and prey (Beacon) or only claims fish with nothing better to do (Cinder).
+  // Derived entirely from the row. The returned object is the live pet, and `p.force` on
+  // it says whether the pull outranks food and prey (Beacon) or only claims fish with
+  // nothing better to do (Cinder). With two herders the earlier SLOT wins.
   herd(f) {
-    const row = this.active && PET_BEHAVIOR[this.active.id];
-    if (!row || row.bucket !== 'controller' || row.params.effect !== 'herd') return null;
-    if (this.active.lit <= (row.params.litGate || 0.5)) return null;
-    return ctrlMatch(f, row.params) ? this.active : null;
+    for (const p of this.live) {
+      const row = PET_BEHAVIOR[p.id];
+      if (row.bucket !== 'controller' || row.params.effect !== 'herd') continue;
+      if (p.lit <= (row.params.litGate || 0.5)) continue;
+      if (ctrlMatch(f, row.params)) return p;
+    }
+    return null;
   },
   // Alien speed multiplier, read by updateAliens the way updateCoins reads `fall`. Returns
-  // 1 with no pet, a non-slowing pet, or an alien whose rattle has worn off.
+  // 1 with no pet, no slowing pet, or an alien whose rattle has worn off. Two slowers
+  // do not stack: the strongest (smallest) multiplier applies.
   alienSpeed(a) {
-    const row = this.active && PET_BEHAVIOR[this.active.id];
-    if (!row || row.bucket !== 'controller' || row.params.effect !== 'slow') return 1;
-    return a.slowT > 0 ? (row.params.mult || 1) : 1;
+    if (!(a.slowT > 0)) return 1;
+    let m = 1;
+    for (const p of this.live) {
+      const row = PET_BEHAVIOR[p.id];
+      if (row.bucket === 'controller' && row.params.effect === 'slow') m = Math.min(m, row.params.mult || 1);
+    }
+    return m;
   },
   draw(g) {
-    const p = this.active;
-    if (!p) return;
-    // Shared companion ring under every pet: a soft gold ellipse on the tank floor plane.
-    // Fish and aliens never have one, so at 380px "that one is mine" is readable before
-    // the silhouette even resolves. Drawn by the framework, not by any pet.
-    g.save();
-    g.globalAlpha = 0.22 + Math.sin(Game.time * 2.2) * 0.06;
-    g.fillStyle = '#ffd35a';
-    g.beginPath(); g.ellipse(p.x, p.y + 16 * S, 20 * S, 6 * S, 0, 0, TAU); g.fill();
-    g.restore();
-    const row = PET_BEHAVIOR[p.id];
-    if (PET_ART[p.id]) PET_ART[p.id](g, p, row ? row.params : {});
+    for (const p of this.live) {
+      // Shared companion ring under every pet: a soft gold ellipse on the tank floor plane.
+      // Fish and aliens never have one, so at 380px "that one is mine" is readable before
+      // the silhouette even resolves. Drawn by the framework, not by any pet.
+      g.save();
+      g.globalAlpha = 0.22 + Math.sin(Game.time * 2.2) * 0.06;
+      g.fillStyle = '#ffd35a';
+      g.beginPath(); g.ellipse(p.x, p.y + 16 * S, 20 * S, 6 * S, 0, 0, TAU); g.fill();
+      g.restore();
+      const row = PET_BEHAVIOR[p.id];
+      if (PET_ART[p.id]) PET_ART[p.id](g, p, row ? row.params : {});
+    }
   },
 };
 
-// Temporary stand-in for the loadout UI (that is a later phase): swap the equipped pet
-// from the console mid-run. Per-run only — it never writes Save.data.pet or .pets.
+// Console harness: swap the running pets mid-run. Per-run only — it never writes
+// Save.data.loadout or .pets. The player's route is the loadout sheet on the brief.
 window.__pet = {
   equip(id) {
     const row = PET_BEHAVIOR[id];
@@ -7320,6 +7420,8 @@ window.__pet = {
     Pet.start(id);
     return `equipped ${id} (${row.bucket})`;
   },
+  // Up to PET_SLOTS ids at once, slot order — what the loadout sheet does for the player.
+  equipAll(ids) { Pet.startAll(ids); return Pet.live.map(p => p.id); },
   unequip() { Pet.stop(); return 'no pet equipped'; },
   list() {
     return PETS.filter(x => PET_BEHAVIOR[x.id]).map(x => ({
@@ -7413,9 +7515,10 @@ const Game = {
     // was doing when it ended.
     Music._stopTension(); Music.stopAllSpecials(); Music._calmCooldown = 0;
     seedDecor();
-    // The chosen pet joins the run — validated against hatched pets, so a hand-edited
-    // save cannot summon what it never earned. Unimplemented pets stay inert.
-    Pet.start(Save.data.pets.includes(Save.data.pet) ? Save.data.pet : '');
+    // The loadout joins the run — loadoutIds() validates every id against hatched pets,
+    // behaviour rows and open slots, so a hand-edited save cannot summon what it never
+    // earned, and a pet with no row never reaches the tank.
+    Pet.startAll(loadoutIds());
     Oyster.reset();   // must follow seedDecor — it binds to the clam prop it just made
     // Tanks 1-3 start you with two sunfins holding 2 growth points; tank 4 gives you
     // a single Broodmother instead, because sunfins cannot be bought there at all.
@@ -7608,8 +7711,7 @@ const RunSave = {
       stat: Object.assign({}, Game.stat),
       mods: Object.assign({}, Game.mods), dailyRun: Game.dailyRun,
       dailyDate: Game.dailyRun ? isoDate(dailyNow()) : null,
-      pet: Pet.active ? { id: Pet.active.id, nx: nx(Pet.active.x), ny: ny(Pet.active.y),
-                          dir: Pet.active.dir || 1 } : null,
+      pets: Pet.live.map(p => ({ id: p.id, nx: nx(p.x), ny: ny(p.y), dir: p.dir || 1 })),
       oyster: Oyster.active ? { t: Oyster.t, open: Oyster.open, pearl: Oyster.pearl } : null,
       fishes: Fishes.live.filter(f => f.alive && f.dying <= 0).map(f => ({
         kind: f.kind, nx: nx(f.x), ny: ny(f.y), vx: f.vx / S, vy: f.vy / S, dir: f.dir,
@@ -7681,8 +7783,13 @@ const RunSave = {
     Game.dailyRun = !!s.dailyRun;
 
     const rx = n => n * W, ry = n => TANK_TOP + n * TANK_H;
-    Pet.start(s.pet && Save.data.pets.includes(s.pet.id) ? s.pet.id : '');
-    if (Pet.active && s.pet) { Pet.active.x = rx(s.pet.nx); Pet.active.y = ry(s.pet.ny); Pet.active.dir = s.pet.dir; }
+    // `pets` since Phase 10; a snapshot from before it carried one `pet`.
+    const sp = s.pets || (s.pet ? [s.pet] : []);
+    Pet.startAll(sp.map(d => d.id).filter(id => Save.data.pets.includes(id)));
+    for (const d of sp) {
+      const p = Pet.live.find(q => q.id === d.id);
+      if (p) { p.x = rx(d.nx); p.y = ry(d.ny); p.dir = d.dir; }
+    }
     if (s.oyster && Oyster.active) { Oyster.t = s.oyster.t; Oyster.open = s.oyster.open; Oyster.pearl = s.oyster.pearl; }
 
     for (const d of s.fishes) {
@@ -8775,13 +8882,15 @@ function drawStatus(g) {
     }
   }
   // Sheltered fish are not drawn at all, so the SHELTER has to be: a bubble on the pet
-  // holding them, with the count, or the player just sees their school disappear.
-  let hid = 0;
-  for (const f of Fishes.live) if (f.alive && f.hidden) hid++;
-  if (hid && Pet.active) {
+  // holding them, with the count, or the player just sees their school disappear. One
+  // bubble per holder — since the loadout two hide pets can be in the water together.
+  for (const p of Pet.live) {
+    let hid = 0;
+    for (const f of Fishes.live) if (f.alive && f.hidden && f.hiddenBy === p) hid++;
+    if (!hid) continue;
     // Big enough to ENCIRCLE the pet holding them — a bubble drawn inside the silhouette
     // just washes the pet out, which is exactly what the first 380px shot showed.
-    const p = Pet.active, r = Math.max(30, 46 * S);
+    const r = Math.max(30, 46 * S);
     g.globalAlpha = 0.16 + Math.sin(Game.time * 2.4) * 0.05;
     g.fillStyle = '#9fe8ff';
     g.beginPath(); g.arc(p.x, p.y, r, 0, TAU); g.fill();
@@ -9474,6 +9583,23 @@ const frontierIdx = () =>
 // and unlike the frontier this survives clearing the final level (which has no
 // stage after it for the frontier to point at).
 const stageDone = (t, l) => Save.data.pets.includes(petAt(t, l).id);
+
+// Loadout slots (Phase 10). Slot 1 is always open; slot n opens once tank n-1 is CLEARED
+// — its last stage's pet hatched — so slot 2 arrives with tank 2 and slot 3 with tank 3.
+const slotOpen = i => i === 0 || stageDone(i - 1, 4);
+const slotsOpen = () => { let n = 0; while (n < PET_SLOTS && slotOpen(n)) n++; return n; };
+const slotLockText = i => 'Clear ' + THEMES[i - 1].name + ' to open this slot';
+// The save's loadout, made honest: hatched, has a behaviour row, no repeats, and no more
+// than the open slots. This is what startLevel equips and what every screen renders.
+function loadoutIds() {
+  const cap = slotsOpen(), out = [];
+  for (const id of (Save.data.loadout || [])) {
+    if (out.length >= cap) break;
+    if (out.includes(id) || !Save.data.pets.includes(id) || !PET_BEHAVIOR[id]) continue;
+    out.push(id);
+  }
+  return out;
+}
 
 // A postcard of the tank: real water/sand palette plus two or three of the scene's
 // own signature pieces, drawn with the same painters the tank uses. Static — kelp and
@@ -10236,7 +10362,7 @@ $('resetBtn').addEventListener('click', () => {
   disarmReset();
   Save.wipe();
   Save.data = { version:1, tank:0, level:0, pets:[], best:{}, pediaSeen:[],
-                stars:{}, daily:{ last:'', streak:0, bestStreak:0 }, pet:'',
+                stars:{}, daily:{ last:'', streak:0, bestStreak:0 }, loadout:[],
                 audio:{ music:0.8, sfx:1.0 }, haptics:true,
                 ads:{ lastMidTs:0, winsSinceMid:CFG.ADS.WINS_PER_MID, totals:{ mid:0, rew:0, dismissed:0 } } };
   Snd.applyVolumes();
@@ -10274,31 +10400,125 @@ function showBrief(tank, level) {
   Game.state = 'brief';
 }
 
-// The pet-select chips on the brief. Hatched pets only, in PETS order, plus NONE;
-// the pick persists in Save.data.pet so replays keep it. A pet whose behaviour is
-// not built yet is still selectable — it swims nowhere and does nothing, as before.
+// The brief's pet row: one chip per loadout SLOT, not per pet. A filled slot shows its
+// pet's emblem, an open empty slot a '+', a locked slot a padlock; tapping any of them
+// opens the loadout sheet. The grid lives on the sheet, so the brief keeps fitting a
+// 380px viewport however many pets have hatched. Hidden until the first pet hatches.
 function buildPetRow() {
   const row = $('petRow'), chips = $('petChips');
-  const owned = PETS.filter(p => Save.data.pets.includes(p.id));
-  if (!owned.length) { row.classList.add('hidden'); return; }
+  if (!Save.data.pets.length) { row.classList.add('hidden'); return; }
   row.classList.remove('hidden');
-  if (!Save.data.pets.includes(Save.data.pet)) Save.data.pet = '';
+  Save.data.loadout = loadoutIds();
   chips.innerHTML = '';
-  const mk = (id, label, title) => {
+  for (let i = 0; i < PET_SLOTS; i++) {
+    const id = Save.data.loadout[i] || '', open = slotOpen(i);
     const c = document.createElement('div');
-    c.className = 'petChip' + (id === '' ? ' none' : '') + (Save.data.pet === id ? ' sel' : '');
-    c.textContent = label; c.title = title;
-    if (id) emblemInto(c, id, 26);   // Phase 9A: NONE keeps its word, pets get a drawing
-    c.addEventListener('click', () => {
-      Snd.init(); Snd.resume(); Sfx.play('uiPetSelect');
-      Save.data.pet = id; Save.write();
-      buildPetRow();
-    });
+    c.className = 'petChip' + (!open ? ' lock' : id ? ' sel' : ' add');
+    if (!open)   { c.textContent = '🔒'; c.title = slotLockText(i); }
+    else if (id) { c.textContent = PET_EMBLEM[id] || '🐠'; emblemInto(c, id, 26); c.title = petById(id).name; }
+    else         { c.textContent = '+'; c.title = 'Empty slot — tap to choose a pet'; }
+    c.addEventListener('click', () => { Snd.init(); Snd.resume(); Sfx.play('uiTap'); openLoadout(); });
     chips.appendChild(c);
-  };
-  mk('', 'NONE', 'No pet this run');
-  for (const p of owned) mk(p.id, PET_EMBLEM[p.id] || '🐠', p.name + ' — ' + p.desc);
+  }
 }
+
+// ---- loadout sheet (Phase 10) ----
+// Three slot tiles on top, then every pet that HAS a behaviour row, in stage order. The
+// roster is derived from PET_BEHAVIOR each build, never listed by hand, so a pet appears
+// the moment its row lands and a pet without one is not offered at all. Two card
+// states: hatched (tap to equip / unequip) and locked, which always names its stage.
+const BUCKET_LABEL = { collector: 'COLLECTOR', feeder: 'FEEDER', defender: 'DEFENDER',
+                       producer: 'PRODUCER', amplifier: 'AMPLIFIER', controller: 'CONTROLLER',
+                       utility: 'UTILITY' };
+const petById = id => PETS.find(p => p.id === id);
+
+function openLoadout() {
+  buildLoadout();
+  $('levelScreen').classList.add('hidden');
+  const sc = $('loadoutScreen');
+  sc.classList.remove('hidden');
+  sc.scrollTop = 0;
+}
+function closeLoadout() {
+  $('loadoutScreen').classList.add('hidden');
+  buildPetRow();   // the chips reflect whatever the sheet changed
+  $('levelScreen').classList.remove('hidden');
+}
+function loadoutMsg(text) {
+  const m = $('loMsg');
+  m.textContent = text;
+  m.classList.remove('flash'); void m.offsetWidth; m.classList.add('flash');
+}
+
+function buildLoadout() {
+  Save.data.loadout = loadoutIds();
+  const ids = Save.data.loadout, cap = slotsOpen();
+
+  const slots = $('loSlots'); slots.innerHTML = '';
+  for (let i = 0; i < PET_SLOTS; i++) {
+    const id = ids[i] || '', open = slotOpen(i);
+    const t = document.createElement('div');
+    t.className = 'loSlot' + (!open ? ' lock' : id ? ' full' : ' empty');
+    const art = document.createElement('div'); art.className = 'loSlotArt';
+    const lab = document.createElement('div'); lab.className = 'loSlotLbl';
+    if (!open)   { art.textContent = '🔒'; lab.textContent = slotLockText(i); }
+    else if (id) { art.textContent = PET_EMBLEM[id] || '🐠'; emblemInto(art, id, 44);
+                   lab.textContent = petById(id).name + ' — tap to remove'; }
+    else         { art.textContent = '+'; lab.textContent = 'Slot ' + (i + 1) + ' — tap a pet below'; }
+    t.appendChild(art); t.appendChild(lab);
+    t.addEventListener('click', () => {
+      Snd.init(); Snd.resume();
+      if (!open) { Sfx.play('uiDeny'); loadoutMsg(slotLockText(i)); return; }
+      if (!id)   { Sfx.play('uiTap');  loadoutMsg('Tap a hatched pet below to fill this slot'); return; }
+      Sfx.play('uiTap');
+      Save.data.loadout = ids.filter(x => x !== id); Save.write();
+      buildLoadout();
+    });
+    slots.appendChild(t);
+  }
+
+  const roster = PETS.map((p, i) => ({ p, i })).filter(e => PET_BEHAVIOR[e.p.id]);
+  const hatched = roster.filter(e => Save.data.pets.includes(e.p.id)).length;
+  $('loCount').textContent =
+    `${hatched} OF ${roster.length} PETS HATCHED \u00b7 ${ids.length}/${cap} SLOT${cap === 1 ? '' : 'S'} FILLED`;
+
+  const list = $('loList'); list.innerHTML = '';
+  for (const { p, i } of roster) {
+    const owned = Save.data.pets.includes(p.id), slot = ids.indexOf(p.id);
+    const card = document.createElement('div');
+    card.className = 'pedCard loCard' + (owned ? (slot >= 0 ? ' on' : '') : ' unknown');
+    const e = document.createElement('div'); e.className = 'emb';
+    e.textContent = owned ? (PET_EMBLEM[p.id] || '🐠') : '\u2753';
+    if (owned) emblemInto(e, p.id, 76);
+    card.appendChild(e);
+    const h = document.createElement('h4'); h.textContent = owned ? p.name : '???'; card.appendChild(h);
+    const tag = document.createElement('span'); tag.className = 'loTag';
+    const bucket = PET_BEHAVIOR[p.id].bucket;
+    tag.textContent = BUCKET_LABEL[bucket] || bucket.toUpperCase();
+    card.appendChild(tag);
+    const d = document.createElement('p'); d.textContent = owned ? p.desc : 'Not hatched yet.'; card.appendChild(d);
+    const w = document.createElement('span'); w.className = 'where';
+    w.textContent = !owned    ? 'Clear ' + stageName(i) + ' to hatch'
+                  : slot >= 0 ? 'EQUIPPED \u00b7 SLOT ' + (slot + 1)
+                  :             'TAP TO EQUIP';
+    card.appendChild(w);
+    card.addEventListener('click', () => {
+      Snd.init(); Snd.resume();
+      if (!owned) { Sfx.play('uiDeny'); loadoutMsg('Clear ' + stageName(i) + ' to hatch this pet'); return; }
+      if (slot >= 0) { Sfx.play('uiTap'); Save.data.loadout = ids.filter(x => x !== p.id); }
+      else if (ids.length >= cap) {
+        Sfx.play('uiDeny');
+        loadoutMsg(cap < PET_SLOTS ? slotLockText(cap) : 'Every slot is full \u2014 tap an equipped pet to remove it');
+        return;
+      }
+      else { Sfx.play('uiPetSelect'); Save.data.loadout = ids.concat(p.id); }
+      Save.write();
+      buildLoadout();
+    });
+    list.appendChild(card);
+  }
+}
+$('loDone').addEventListener('click', () => { Snd.init(); Snd.resume(); Sfx.play('uiTap'); closeLoadout(); });
 
 $('lvlBtn').addEventListener('click', () => {
   $('levelScreen').classList.add('hidden');
@@ -10314,7 +10534,7 @@ $('endBtn').addEventListener('click', () => {
 
 $('loseRetry').addEventListener('click', () => {
   $('loseScreen').classList.add('hidden');
-  // Save.data.pet already persists the player's last pick, so restarting the SAME
+  // Save.data.loadout already persists the player's picks, so restarting the SAME
   // stage through the normal startLevel path picks it right back up — no special
   // "remember the pet" plumbing needed here.
   Game.startLevel(Game.tank, Game.level);
@@ -10447,7 +10667,7 @@ function quitToMenu() {
   showHud(false);
 
   Save.data = { version:1, tank:0, level:0, pets:[], best:{}, pediaSeen:[],
-                stars:{}, daily:{ last:'', streak:0, bestStreak:0 }, pet:'',
+                stars:{}, daily:{ last:'', streak:0, bestStreak:0 }, loadout:[],
                 audio:{ music:0.8, sfx:1.0 }, haptics:true,
                 ads:{ lastMidTs:0, winsSinceMid:CFG.ADS.WINS_PER_MID, totals:{ mid:0, rew:0, dismissed:0 } } };
   Save.load();
@@ -10722,12 +10942,11 @@ const Dbg = {
     if (this.acc < 0.25) return;
     this.ftMs = (this.ftAcc / Math.max(1, this.ftN)) * 1000;
     this.acc = 0; this.ftAcc = 0; this.ftN = 0;
-    const p = Pet.active;
-    const petLine = p
-      ? `${p.id} @${Math.round(p.x)},${Math.round(p.y)} ${
+    const petLine = Pet.live.length
+      ? Pet.live.map(p => `${p.id} @${Math.round(p.x)},${Math.round(p.y)} ${
           Object.entries(p).filter(([k, v]) => !['id','x','y'].includes(k) && typeof v !== 'object' && typeof v !== 'function')
-            .map(([k, v]) => k + '=' + (typeof v === 'number' ? +v.toFixed(2) : v)).join(' ')}`
-      : (Save.data.pet ? Save.data.pet + ' (INERT — no behaviour object)' : 'none');
+            .map(([k, v]) => k + '=' + (typeof v === 'number' ? +v.toFixed(2) : v)).join(' ')}`).join(' | ')
+      : ((Save.data.loadout || []).length ? Save.data.loadout.join(',') + ' (loadout, not running)' : 'none');
     const alienYs = Aliens.live.filter(a => a.alive).map(a => Math.round(a.y)).join(',');
     this.lastText =
       `AQUA FRENZY build ${GAME_BUILD} (?v=${QS.get('v') || '?'})\n` +
@@ -13876,8 +14095,8 @@ function checkSaveIntegrity() {
   if (dupes.length) {
     console.warn('[save-check] Save.data.pets holds duplicate id(s):', dupes);
   }
-  if (Save.data && Save.data.pet && !valid.has(Save.data.pet)) {
-    console.warn('[save-check] equipped pet "' + Save.data.pet + '" is not a valid pet id');
+  for (const id of ((Save.data && Save.data.loadout) || [])) {
+    if (!valid.has(id)) console.warn('[save-check] loadout pet "' + id + '" is not a valid pet id');
   }
   return { invalid: bad, duplicates: dupes };
 }
