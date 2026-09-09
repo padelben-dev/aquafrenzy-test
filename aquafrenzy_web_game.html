@@ -816,7 +816,7 @@ const ALIENS_V2 = BUILD_FLAGS.dev && QS.get('aliens') === 'v2';
 // procedural set is approved. Art only -- no behaviour, economy, persistence, or any
 // change to which pet hatches where.
 const PETS_V2 = BUILD_FLAGS.dev && QS.get('pets') === 'v2';
-const GAME_BUILD = 65;
+const GAME_BUILD = 66;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -2436,6 +2436,31 @@ CFG.LUCK = {
   // NOTE: both arrays are the ALIEN-KILL chest only. The Dreadfin's own chest drop keeps
   // COIN_STYLE.chest.value ($2,000) — that is its whole reason for costing $10,000.
 };
+// ============ PHASE 9B — PET SYSTEM ============
+// Every pet tunable lives here, same contract as CFG.LUCK and CFG.ADS: zero a value to
+// switch that lever off, and nothing tunable sits in a PET_BEHAVIOR row unless it is a
+// per-pet constant that means nothing to any other pet.
+CFG.PETS = {
+  // ---- slots (Phase 10 shipped 3 untyped; 9B types them) ----
+  // Untyped, three slots measured at -42% clear time on 3-1 with three SHIPPED pets
+  // (rattle+plod+lumen), and collapsed the run-to-run spread from +-13.1s to +-1.0s.
+  // Unrestricted slots converge on "equip the three biggest numbers", and 22 pets give
+  // 1,540 triples, which cannot be balanced by measurement. Typing bounds the exposure
+  // to ONE income pet and makes the loadout screen a decision instead of a ranking.
+  slotTypes: ['income', 'defence', 'free'],
+  // ---- the guard (9B) ----
+  // REPLACES the income guard for pets. Measured: Rattle cuts clear time 31% while run
+  // income FALLS 5.9%, so an income test passes it. A run ends when the third egg piece
+  // is bought, so earning faster finishes sooner rather than richer -- income is
+  // demand-bounded and barely moves. Clear time is what a pet actually changes.
+  clearTimeBudget:     0.08,   // one pet, fraction of median clear time it may remove
+  clearTimeBudgetLoad: 0.15,   // a full legal loadout
+  incomeBudget:        0.25,   // secondary only -- catches "trivially rich", not "fast"
+  guardRuns:           10,     // cells per side; +-1 SE is reported with every verdict
+  // ---- one dial over every pet income faucet, so the system can be tuned without
+  // touching 35 rows. Producers and pet coin multipliers read it. ----
+  globalRate: 1,
+};
 // One roll helper so a seeded RNG can be swapped in later without touching callers.
 // The game has no seeded RNG today (rand/randi are Math.random), so this is Math.random.
 const Luck = {
@@ -2456,8 +2481,17 @@ function luckBless(f) {
 // sink as any other coin — it CAN be missed). Alien diamonds and chests don't roll.
 function fishCoin(f, x, y, type) {
   const c = spawnCoin(x, y, type);
-  if (f.shimmer) { c.value *= CFG.LUCK.shimmerCoinMult; c.shimmer = true; }
-  if (Luck.roll(CFG.LUCK.luckyCoinChance)) { c.lucky = true; c.value *= CFG.LUCK.luckyCoinMult; }
+  // Phase 9B: coin-value multipliers DO NOT COMPOUND -- the largest one applies and the
+  // rest are ignored, the way damage resistances usually are. They used to multiply, so a
+  // lucky shimmer coin was already 5x2 = 10x base, and the pet roster adds more of them
+  // (Lull, Tinsel, Orla): a lucky shimmer pearl under Tinsel would have been 5x2x1.5 =
+  // 15x. Taking the max removes that entire class of breach in one place instead of
+  // rationing each multiplier against every other one.
+  let mult = 1;
+  if (f.shimmer) { mult = Math.max(mult, CFG.LUCK.shimmerCoinMult); c.shimmer = true; }
+  if (Luck.roll(CFG.LUCK.luckyCoinChance)) { c.lucky = true; mult = Math.max(mult, CFG.LUCK.luckyCoinMult); }
+  mult = Math.max(mult, Pet.coinMult(c));   // pet multipliers join the same max
+  c.value = Math.round(c.value * mult);
   if (Tel.on && c.shimmer) Tel.luckEvent('shimmerCoin');
   return c;
 }
@@ -3047,6 +3081,10 @@ const FISH_LOOK = {
 const FISH_LOOK_STAR = { body:'#FFE98A', shade:'#E6CC5A', belly:'#E8A21A' };
 // The starving ring's two urgency colours. Chrome, not body tint, but still colour data.
 const FISH_RING_DESPERATE = '#ff3b3b', FISH_RING_STARVING = '#ff8c3b';
+// The pet-buffed rim colour (Phase 7D reserved the channel; 9B gives it a source). One
+// colour for every pet that acts on a fish, deliberately far from the two starving reds
+// and from the shimmer gold so it cannot be read as either.
+const PET_BUFF_RIM = '#7fe8ff';
 const FISH_SICK_HUE = 68;        // degrees toward green-grey; the sick channel
 const FISH_FED_PULSE = 0.28;     // seconds — the "just fed" brightness pulse
 const FISH_EAT_FLASH = 0.05;     // seconds — roughly two frames of white
@@ -3086,6 +3124,13 @@ function fishTint(f) {
   if (f.shimmer && f.dying <= 0) tint.rim = FISH_SHIMMER_RIM;
 
   // PET-BUFFED — rim colour only. Set by a pet controller; null when no pet touches it.
+  // Phase 9B: buffRim is the ONE pet channel, and it means exactly "a pet is acting on
+  // this fish". Echo's starvation flag is the pre-warning: it fires while a fish is
+  // merely HUNGRY, one band above STARVING, because starving already owns its own ring
+  // colour and two markers on the same state would be the 7D collision again. Set here
+  // rather than on the fish so nothing has to remember to clear it.
+  if (Pet.flagsStarve() && f.hunger < CFG.HUNGRY_AT && f.hunger >= CFG.STARVING_AT)
+    tint.rim = PET_BUFF_RIM;
   if (f.buffRim) tint.rim = f.buffRim;
 
   // BEING EATEN — two frames of white.
@@ -3419,6 +3464,9 @@ const COIN_STYLE = {
   diamond: { scale:1.20, value:200,  a:'#f2ffff', b:'#5fd0f0', c:'#1f86ac', glow:'#9fe8ff', shape:'gem' },
   pearl:   { scale:1.26, value:500,  a:'#ffffff', b:'#f2e4f2', c:'#b294bd', glow:'#f6e6ff', shape:'pearl' },
   chest:   { scale:1.44, value:2000, a:'#ffdf9a', b:'#c07028', c:'#5e3410', glow:'#ffcf7a', shape:'chest' },
+  // Widget's bomb (Phase 9B). Value is overwritten per drop from the pet's row; the entry
+  // exists so every coin path -- draw, tap, collect, telemetry -- treats it as a coin.
+  bomb:    { scale:1.16, value:150,  a:'#8f9aa6', b:'#49525c', c:'#22282e', glow:'#ff8f5a', shape:'bomb' },
 };
 
 // Phase 7B: THE pearl shader, shared by the pearl coin and the oyster's pearl. Before
@@ -3480,6 +3528,33 @@ function drawCoin(g, c) {
     g.globalAlpha = 1;
   }
 
+  if (st.shape === 'bomb') {
+    // Dark iron sphere, a band, and a fuse whose spark shortens with the real timer, so
+    // the danger is legible without a number: what you see IS c.fuse.
+    const t = c.fuse != null ? Math.max(0, Math.min(1, c.fuse / 5)) : 1;
+    const bg = g.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.1, 0, 0, r);
+    bg.addColorStop(0, st.a); bg.addColorStop(0.55, st.b); bg.addColorStop(1, st.c);
+    g.fillStyle = bg; g.beginPath(); g.arc(0, r * 0.08, r * 0.92, 0, TAU); g.fill();
+    g.strokeStyle = 'rgba(10,12,16,.75)'; g.lineWidth = Math.max(1.4, r * 0.10);
+    g.beginPath(); g.arc(0, r * 0.08, r * 0.92, 0, TAU); g.stroke();
+    g.fillStyle = '#2a3038';
+    g.fillRect(-r * 0.26, -r * 1.02, r * 0.52, r * 0.30);
+    g.strokeStyle = '#c9a06a'; g.lineWidth = Math.max(1.4, r * 0.13); g.lineCap = 'round';
+    g.beginPath(); g.moveTo(r * 0.06, -r * 1.0);
+    g.quadraticCurveTo(r * (0.34 + 0.30 * t), -r * (1.24 + 0.26 * t),
+                       r * (0.20 + 0.44 * t), -r * (1.52 + 0.40 * t));
+    g.stroke();
+    // the spark burns brighter and faster as the fuse runs out
+    const sp = 0.55 + 0.45 * Math.sin(Game.time * (10 + (1 - t) * 26));
+    g.globalAlpha = sp;
+    g.fillStyle = '#fff2c8';
+    g.beginPath(); g.arc(r * (0.20 + 0.44 * t), -r * (1.52 + 0.40 * t), r * (0.20 + (1 - t) * 0.18), 0, TAU); g.fill();
+    g.fillStyle = st.glow; g.globalAlpha = sp * 0.45;
+    g.beginPath(); g.arc(r * (0.20 + 0.44 * t), -r * (1.52 + 0.40 * t), r * (0.40 + (1 - t) * 0.36), 0, TAU); g.fill();
+    g.globalAlpha = 1;
+    g.restore();
+    return;
+  }
   if (st.shape === 'gem') {
     // brilliant cut: flat crown, table facet, then facets tapering to a point
     const gg = g.createLinearGradient(0, -r, 0, r);
@@ -4274,6 +4349,29 @@ function drawAlien(g, a) {
     }
     g.restore();
   }
+}
+
+// Grim's shield, drawn OVER the fish by drawFish's caller. Deliberately a bubble and not
+// a rim: 7D's rim channel means "a pet is acting on this fish", and a one-shot save that
+// the player placed by hand is a different fact. Two meanings on one channel is the
+// collision 7D existed to end.
+function drawFishShield(g, f) {
+  if (!f.shield) return;
+  const r = fishR(f) * 1.34;
+  const pz = 0.72 + 0.28 * Math.sin(Game.time * 3.4 + f.x * 0.01);
+  g.save();
+  g.globalAlpha = 0.30 * pz;
+  const bg = g.createRadialGradient(f.x - r * 0.3, f.y - r * 0.3, r * 0.2, f.x, f.y, r);
+  bg.addColorStop(0, 'rgba(200,245,255,.55)'); bg.addColorStop(0.72, 'rgba(120,205,255,.22)');
+  bg.addColorStop(1, 'rgba(120,205,255,0)');
+  g.fillStyle = bg;
+  g.beginPath(); g.arc(f.x, f.y, r, 0, TAU); g.fill();
+  g.globalAlpha = 0.75 * pz;
+  g.strokeStyle = '#8fd8ff'; g.lineWidth = Math.max(1.4, r * 0.055);
+  g.beginPath(); g.arc(f.x, f.y, r, 0, TAU); g.stroke();
+  g.globalAlpha = 0.9 * pz; g.fillStyle = '#ffffff';
+  g.beginPath(); g.ellipse(f.x - r * 0.42, f.y - r * 0.46, r * 0.18, r * 0.10, -0.6, 0, TAU); g.fill();
+  g.restore();
 }
 
 // ============ ART: TANK BACKGROUND ============
@@ -5283,7 +5381,9 @@ const Shop = {
     const shop = TANK_SHOP[Game.tank];
     // Laser and egg stay locked until a special fish is bought: the special fish is the
     // pacing gate for the whole level, so nothing downstream of it opens early.
-    const gated = !Game.specialsBought;
+    // Phase 9B: Echo grants this gate. Named, not id-matched -- Shop.def never learns a
+    // pet exists, and a second pet could open the same gate later without touching it.
+    const gated = !Game.specialsBought && !Pet.grants('specialGate');
     switch (role) {
       case 'base': return this.fishDef(role, shop.base);
       case 'quality': return { kind:'quality', name:'Better Food',
@@ -5885,7 +5985,7 @@ function spawnSunfin(x, y, stage, banked = 0) {
   f.shimmer = false; f.sparkT = rand(0, 2); f.eaten = false;
   // Phase 7D visual-only state channels. None of these touch hunger, thresholds or any
   // CFG number -- they exist purely so fishTint has one unambiguous input per state.
-  f.fedT = 0; f.eatFlash = 0; f.buffRim = null;
+  f.fedT = 0; f.eatFlash = 0; f.buffRim = null; f.shield = false;
   return f;
 }
 
@@ -5910,7 +6010,7 @@ function spawnSpecial(kind, x, y) {
   f.shimmer = false; f.sparkT = rand(0, 2); f.eaten = false;
   // Phase 7D visual-only state channels. None of these touch hunger, thresholds or any
   // CFG number -- they exist purely so fishTint has one unambiguous input per state.
-  f.fedT = 0; f.eatFlash = 0; f.buffRim = null;
+  f.fedT = 0; f.eatFlash = 0; f.buffRim = null; f.shield = false;
   return f;
 }
 
@@ -5954,6 +6054,14 @@ function spawnCoin(x, y, type) {
   c.spin = rand(0, TAU); c.rest = false; c.jx = 0; c.jy = 0;
   c.age = 0; c.bounced = false;       // Dollop's claim gate / Kite's one-bounce flag
   c.lucky = false; c.shimmer = false; c.trailT = 0;   // Phase 6C luck flags
+  c.fuse = null;                                     // Phase 9B: Widget's bomb timer
+  // Phase 9B P0. Coins come from a POOL, and these two were the only fields spawnCoin
+  // never reset. Once an alien kill stamped a slot with telSrc='alien', every coin that
+  // later reused that slot reported as alien income for the rest of the run -- which is
+  // why a 7-1 run showed $41,414 of "alien" income from 9.2 kills while earned.fish sat
+  // at 0. Run TOTALS were never wrong; the per-source split and petCoins were, and
+  // petCoins is exactly what a pet's contribution would have been tuned against.
+  c.telSrc = null; c.telPet = false;
   Pet.emit('coinDrop', c);
   return c;
 }
@@ -5962,7 +6070,11 @@ function spawnAlien(kind) {
   const d = ALIENS[kind];
   const a = Aliens.spawn();
   a.kind = kind;
-  a.x = Math.random() < 0.5 ? -d.r * S : W + d.r * S;
+  // Phase 9B: a pre-rolled side is consumed here when Sonar foresaw this wave; with no
+  // pre-roll this is the original expression, untouched.
+  const fromLeft = (Game.warnSides && Game.warnSides.length) ? Game.warnSides.shift()
+                                                             : (Math.random() < 0.5);
+  a.x = fromLeft ? -d.r * S : W + d.r * S;
   a.y = d.floor ? SAND_TOP - d.r * 0.5 * S : rand(TANK_TOP + TANK_H * 0.25, SAND_TOP - 40 * S);
   a.vx = a.x < 0 ? d.speed * S * CFG.PACE : -d.speed * S * CFG.PACE;
   a.vy = 0;
@@ -6120,12 +6232,88 @@ const PET_BEHAVIOR = {
                                               targets: 'coins',
                                               when: 'always', range: 110, hold: 1.4,
                                               move: 'drift' } },
+  // ================= Phase 9B-1: exemplars, one per risk band =================
+  // Chosen so the guard is exercised across its whole range in one pass, including one
+  // pet that is EXPECTED to fail it. A guard never observed rejecting anything is not a
+  // guard, so Widget ships at full strength and the harness is asked to condemn it.
+
+  // NYX - income, kill-linked. "Wraps each alien you kill in her cloak and squeezes one
+  // extra diamond out of it." An amplifier over the alien drop, so it needs no new
+  // bucket branch at all -- killAlien already asks how many diamonds to spawn.
+  // Costed: +$200 x 0.71 kills/min = $142/min against tank 7's measured $3,364/min = 4.2%.
+  // Deliberately the one exemplar that overlaps CFG.LUCK (chestOnKillChance rides the
+  // same kill event), so the overlap is exercised rather than assumed harmless.
+  nyx:      { bucket: 'amplifier',  params: { stat: 'alienDrop', mult: 1.5,
+                                              move: 'drift' } },
+
+  // SONAR - cosmetic. "Sees through the dark. Shows you where the next alien will warp
+  // in." Pure information: it moves no number in the game. The spawn side is pre-rolled
+  // ONLY while Sonar is live, so the default route's RNG draw order is untouched.
+  sonar:    { bucket: 'controller', params: { effect: 'foresee', when: 'always',
+                                              move: 'bandPatrol', moveSpeed: 22,
+                                              bandY: 0.25, bandMin: 0.15, bandMax: 0.85 } },
+
+  // ECHO - convenience, and the reserved buffRim channel finally gets a source.
+  // "Opens the laser and egg slots without making you buy a special fish first, and
+  // flags any fish that is about to starve." The unlock is a SPEND-ORDER change, not a
+  // refund -- the special fish still costs what it costs if you want it -- so it is
+  // typed income and has to clear the guard like any faucet.
+  echo:     { bucket: 'controller', params: { effect: 'unlock', grants: 'specialGate',
+                                              flagStarve: true, move: 'drift' } },
+
+  // WIDGET - income, AND THE ONE EXPECTED TO FAIL THE GUARD. "Drops a bomb every 18
+  // seconds. Worth $150 if you tap it -- and it kills any fish it touches." As a plain
+  // faucet that is $150/18s = $500/min against tank 3's measured $1,221/min = 41%, which
+  // is bigger than Rattle and Rattle already breaches. Shipped at FULL STRENGTH with the
+  // downside made real instead of the number cut: an untapped bomb kills a GROWN sunfin,
+  // which is $35/5.5s = $382/min of destroyed engine. That turns a flat faucet into an
+  // attention check with a genuine loss, and it is the version the guard should judge.
+  widget:   { bucket: 'producer',   params: { interval: 18, what: 'bomb', fuse: 5,
+                                              value: 150 } },
+
+  // GRIM - defence, BANKED. "His mouth is bigger than he is. Once per attack he swallows
+  // an alien bite meant for your fish." Sleet's card cashes out as the same thing -- one
+  // prevented bite per attack -- and two tanks apart with identical function is one pet
+  // wearing two skins. So Grim BANKS the save instead of spending it automatically: he
+  // gains a charge when a wave arrives, and the player taps him to place the shield on a
+  // fish. Sleet stays passive, Grim is active and aimed; the same budget, two playstyles.
+  grim:     { bucket: 'controller', params: { effect: 'bank', when: 'invasion', cap: 1,
+                                              tapR: 46, shieldR: 200, move: 'drift' } },
+
   // controller/coins - the finger magnet, centred on her instead of the touch point.
   sol:      { bucket: 'controller', params: { effect: 'coinField', mode: 'pull',
                                               targets: 'coins',
                                               when: 'always', range: 170, pullRate: 150,
                                               move: 'bandPatrol', moveSpeed: 20,
                                               bandY: 0.3 } },
+};
+
+// Slot type for every pet, for the typed loadout. Classified on MECHANISM, not on feel:
+//   income   - opens a faucet, multiplies a coin, or reduces a spend
+//   defence  - removes, weakens or absorbs alien pressure
+//   free     - convenience or cosmetic; changes how the tank is played or looks
+// The four design categories are a good vocabulary but they do not predict economic
+// impact -- Plod is "convenience" and is the second largest economic lever in the game
+// (-24.2% clear time), so it is typed income here. Anything not listed is 'free'.
+const PET_TYPE = {
+  // --- income: faucets, multipliers, spend reductions, rate changes on the money loop
+  tuck:'income', dollop:'income', rattle:'income', lumen:'income', lull:'income',
+  plod:'income', kite:'income', shiver:'income', sol:'income', marigold:'income',
+  fennel:'income', widget:'income', jolt:'income', tinsel:'income', nyx:'income',
+  orla:'income', echo:'income', aurora:'income',
+  // --- defence: alien pressure
+  quill:'defence', clatter:'defence', sable:'defence', growler:'defence', pip:'defence',
+  barnaby:'defence', gunther:'defence', beacon:'defence', cinder:'defence',
+  vesper:'defence', bruiser:'defence', fathom:'defence', sleet:'defence', grim:'defence',
+  // --- free: convenience and cosmetic
+  nettle:'free', moxie:'free', sonar:'free',
+};
+const petType = id => PET_TYPE[id] || 'free';
+// A pet may go in a slot of its own type, or in any 'free' slot. Income pets are the
+// only ones the guard has to bound, so exactly one income slot bounds the whole loadout.
+const petFitsSlot = (id, slot) => {
+  const want = CFG.PETS.slotTypes[slot];
+  return want === 'free' || petType(id) === want;
 };
 
 // Continuous audio beds keyed by loop id — the same split as PET_ART: an asset table,
@@ -6136,6 +6324,44 @@ const PET_LOOPS = {
   petCinderCrackle: () => sfxLoopCrackle(Snd.sfxBus, { rate: 3, hp: 1500, lp: 6000, vel: 0.025 }),
 };
 
+// A pet with no hand-drawn PET_ART entry still has to be VISIBLE, or an equipped pet is
+// a gold ring gliding around with nothing above it -- which is exactly what the 13
+// behaviourless pets did. Its 9A emblem shape is already a drawing of that creature, so
+// it is reused here at tank scale. This is a floor, not the finish: 9A-2 replaces these
+// with real sprites that can animate. Falls back again to a plain blob if the procedural
+// emblem set is not present, so this can never draw nothing.
+function petFallbackArt(g, p) {
+  const s = 17 * Math.max(S, 0.85);
+  g.save();
+  g.translate(p.x, p.y);
+  g.scale(p.dir || 1, 1);
+  const art = (typeof PET_EMBLEM_ART !== 'undefined') && PET_EMBLEM_ART[p.id];
+  if (art) {
+    // drawEmblemArt centres on measured ink and fits the long side, exactly as the
+    // medallion does -- so the thing in the tank is the thing on the card.
+    drawEmblemArt(g, p.id, 0, 0, s * 2.6);
+  } else {
+    const gr = g.createRadialGradient(-s * 0.3, -s * 0.35, s * 0.2, 0, 0, s);
+    gr.addColorStop(0, '#cfe4f2'); gr.addColorStop(1, '#5f7f9a');
+    g.fillStyle = gr;
+    g.beginPath(); g.arc(0, 0, s, 0, TAU); g.fill();
+  }
+  g.restore();
+  // Grim advertises a banked charge -- an ability you cannot see you have is not an
+  // ability the player will use.
+  if (p.charges > 0) {
+    const pz = 0.6 + 0.4 * Math.sin(Game.time * 4);
+    g.save();
+    g.globalAlpha = 0.55 + 0.45 * pz;
+    g.strokeStyle = '#8fd8ff'; g.lineWidth = 2.4;
+    g.beginPath(); g.arc(p.x, p.y, s * 1.6, 0, TAU); g.stroke();
+    g.restore();
+  }
+}
+
+// Sonar's private stream. Seeded once per load; nothing else reads it, so the sides it
+// foresees cost the main sequence nothing.
+const petForesightRng = mulberry32(0x5017a2);
 const PET_CORNERS = [[0.12, 0.20], [0.88, 0.20], [0.12, 0.80], [0.88, 0.80]];
 
 // Movement styles for buckets with nothing to chase. Each mode keeps the exact constants
@@ -6503,6 +6729,14 @@ const PET_BUCKETS = {
         puff(p.x, p.y + 8 * S, '#ffd0e8', 10, 70);
         p.birth = 0.5;
         Sfx.play('petMarigoldBirth');
+      } else if (q.what === 'bomb') {
+        // A bomb IS a coin with a fuse: it reuses the whole coin lifecycle -- fall, tap,
+        // collect, value, telemetry -- and only adds the fuse and what happens at zero.
+        const b = spawnCoin(p.x, p.y + 6, 'bomb');
+        b.value = Math.round((q.value || 150) * CFG.PETS.globalRate);
+        b.fuse = q.fuse || 5;
+        if (Tel.on) b.telPet = true;
+        Sfx.play('petWidgetDrop');
       } else if (q.what === 'coin') {
         spawnCoin(p.x, p.y + 6, q.coinType || 'gold');
         Sfx.play('petMarigoldBirth');
@@ -6550,7 +6784,15 @@ const PET_BUCKETS = {
       },
       // `count` is per ATTACK, so the edges are where the allowance resets, and anything
       // held has to come back out when the water is clear.
-      invasionStart(p, q) { p.marked = 0; },
+      invasionStart(p, q) {
+        p.marked = 0;
+        // Phase 9B Grim: the arriving wave is what he swallows. Capped, so sitting out
+        // three attacks without spending does not bank three saves.
+        if (q.effect === 'bank') {
+          p.charges = Math.min(q.cap || 1, (p.charges || 0) + 1);
+          floatText(p.x, p.y - 30, 'READY', '#8fd8ff');
+        }
+      },
       invasionEnd(p, q)   { p.marked = 0; if (q.effect === 'hide') ctrlRelease(p); },
     },
     update(p, q, dt) {
@@ -6560,6 +6802,11 @@ const PET_BUCKETS = {
       if (lp && lp.setIntensity) lp.setIntensity(1 + p.lit * (q.loopIntensity || 2));
       switch (q.effect) {
         case 'herd':  break;                       // Pet.herd(f) IS the mechanic
+        // Both of these are READ by their host, exactly like herd: Sonar by the warning
+        // banner and the tank overlay, Echo by Shop.def and by fishTint. Nothing to tick.
+        case 'foresee': break;                     // Pet.foresight() IS the mechanic
+        case 'bank':   break;                      // charged on invasionStart, spent by tap
+        case 'unlock':  break;                     // Pet.grants()/Pet.flagsStarve() are
         case 'hide':  ctrlHide(p, q);      break;
         case 'push':  q.targets === 'aliens' ? ctrlShove(p, q, dt) : ctrlPush(p, q, dt); break;
         case 'coinField': ctrlCoinField(p, q, dt); break;
@@ -7350,6 +7597,48 @@ const Pet = {
       PET_BUCKETS[row.bucket].update(p, row.params, dt);
     }
   },
+  // True when some live pet grants a named gate. One helper rather than a Pet.is('echo')
+  // at the call site, so the shop never learns a pet id and a second pet could grant the
+  // same gate later without touching Shop.def.
+  grants(what) {
+    for (const p of this.live) {
+      const q = (PET_BEHAVIOR[p.id] || {}).params;
+      if (q && q.effect === 'unlock' && q.grants === what) return true;
+    }
+    return false;
+  },
+  // True when a live pet marks fish that are about to starve. Read by fishTint, which is
+  // the ONLY authority on fish colour (Phase 7D) -- this sets buffRim and nothing else.
+  flagsStarve() {
+    for (const p of this.live) {
+      const q = (PET_BEHAVIOR[p.id] || {}).params;
+      if (q && q.flagStarve) return true;
+    }
+    return false;
+  },
+  // The pet that foresees the next wave, or null. The spawn sides it pre-rolled live on
+  // Game.warnSides; this only says whether anyone is looking.
+  foresight() {
+    for (const p of this.live) {
+      const q = (PET_BEHAVIOR[p.id] || {}).params;
+      if (q && q.effect === 'foresee') return p;
+    }
+    return null;
+  },
+  // Coin-value multiplier contributed by pets, for ONE coin. Returns the largest single
+  // pet multiplier that applies -- fishCoin then takes the max of this and the luck
+  // multipliers, so nothing in the game compounds coin value. `coinMult` rows name the
+  // coin types they touch, or omit `types` for all of them.
+  coinMult(c) {
+    let m = 1;
+    for (const p of this.live) {
+      const q = (PET_BEHAVIOR[p.id] || {}).params;
+      if (!q || !q.coinMult) continue;
+      if (q.types && q.types.indexOf(c.type) < 0) continue;
+      m = Math.max(m, 1 + (q.coinMult - 1) * CFG.PETS.globalRate);
+    }
+    return m;
+  },
   // Passive multiplier read by whichever system an amplifier targets. Returns 1 with no
   // pet, no amplifier, or amplifiers aimed at other stats — so a call site costs nothing
   // and needs no null checks. Two amplifiers on ONE stat multiply.
@@ -7407,6 +7696,7 @@ const Pet = {
       g.restore();
       const row = PET_BEHAVIOR[p.id];
       if (PET_ART[p.id]) PET_ART[p.id](g, p, row ? row.params : {});
+      else petFallbackArt(g, p);
     }
   },
 };
@@ -7440,7 +7730,7 @@ const Game = {
   money: 0, eggPrice: 150, eggPieces: 0,
   foodQuality: 0, foodMax: 1, laser: 1,
   unlock: [], specialsBought: false, elixirArmed: false,
-  attackT: 0, warnT: 0, pendingAttack: null,
+  attackT: 0, warnT: 0, pendingAttack: null, warnSides: null,
   laserCd: 0, shakeT: 0, stipendT: 0,
   noFishT: 0,   // seconds the tank has had zero fish, continuously — 3s grace before lose()
   // Presentation-only state: banner slide-out after a wave spawns, and the cosmetic
@@ -7497,7 +7787,7 @@ const Game = {
     this.specialsBought = !def.unlock.includes('specialA');
     this.foodQuality = 0; this.foodMax = 1; this.laser = 1; this.elixirArmed = false;
     this.attackT = def.aliens.length ? CFG.FIRST_ATTACK[tank] * this.mods.firstAttack : Infinity;
-    this.warnT = 0; this.pendingAttack = null;
+    this.warnT = 0; this.pendingAttack = null; this.warnSides = null;
     this.warnOut = 0; this.lastAttack = null;
     this.combo = 0; this.comboT = 0; this.comboPop = 0;
     this.laserCd = 0; this.shakeT = 0; this.time = 0;
@@ -7892,6 +8182,13 @@ function updateCoins(dt) {
       if (c.y < TANK_TOP - coinR(c)) c.alive = false;
       continue;
     }
+    // Phase 9B: a bomb burns whether it is falling or resting. At zero it takes the
+    // nearest GROWN sunfin -- the earner, not a baby -- which is the whole cost that pays
+    // for Widget's faucet. Tapping it first collects it as an ordinary coin.
+    if (c.fuse != null) {
+      c.fuse -= dt;
+      if (c.fuse <= 0) { detonateBomb(c); continue; }
+    }
     if (c.dwell > 0) { c.dwell -= dt; c.y += Math.sin(Game.time * 3 + c.x) * 6 * dt; }
     else if (!c.rest) {
       // Kite's bounce lives in c.vy: launched upward on landing, decaying back to
@@ -7908,6 +8205,34 @@ function updateCoins(dt) {
     }
   }
   Coins.reap();
+}
+
+// A bomb that was not tapped in time. Kills the nearest grown sunfin; if there is no
+// grown sunfin in the tank it simply fizzles, so it can never wipe a school that has
+// nothing to lose, and it is never the thing that ends a run on its own.
+function detonateBomb(c) {
+  c.alive = false;
+  const r = coinR(c);
+  shockRing(c.x, c.y, '#ffb46a', r * 4.5, 0.40, 3);
+  puff(c.x, c.y, '#ff8f5a', 16, 190);
+  puff(c.x, c.y, '#3a4048', 10, 120);
+  Sfx.play('petWidgetBoom');
+  Game.shakeT = 0.22;
+  let best = null, bd = Infinity;
+  for (const f of Fishes.live) {
+    if (!f.alive || f.dying > 0 || f.hidden) continue;
+    if (f.kind !== 'sunfin' || f.stage < 3) continue;      // grown earners only
+    const d = dist2(c.x, c.y, f.x, f.y);
+    if (d < bd) { bd = d; best = f; }
+  }
+  if (!best) { floatText(c.x, c.y - 12, 'FIZZLE', '#9fb4c4'); return; }
+  best.dying = 1; best.eaten = true;          // eaten:true so Vesper cannot undo it
+  best.eatFlash = FISH_EAT_FLASH;
+  if (Game.stat) Game.stat.lost++;
+  if (Tel.on) Tel.death('predator');
+  puff(best.x, best.y, '#ff5050', 14, 120);
+  floatText(best.x, best.y - 26, 'BOOM!', '#ff8f5a');
+  if (Music.on) Music.wrongChord();
 }
 
 function collectCoin(c) {
@@ -8286,6 +8611,19 @@ function updateAliens(dt) {
       a.vx = approach(a.vx, (dx / dd) * spd, 0.05, dt);
       if (!d.floor) a.vy = approach(a.vy, (dy / dd) * spd, 0.05, dt);
       if (dd < r + fishR(prey) * 0.7) {
+        // Phase 9B: a shielded fish eats the bite instead of dying. The shield is spent,
+        // the alien is pushed off and put back on its eat cooldown, and the fish swims
+        // on -- one save, aimed by the player, exactly as Grim banked it.
+        if (prey.shield) {
+          prey.shield = false;
+          a.eatCd = d.eatCd || CFG.ALIEN_EAT_CD;
+          a.vx = -a.vx; a.vy = -Math.abs(a.vy) - 30 * S;
+          shockRing(prey.x, prey.y, '#8fd8ff', fishR(prey) * 3.2, 0.30, 3);
+          floatText(prey.x, prey.y - 26, 'BLOCKED', '#8fd8ff');
+          Sfx.play('petGrimBlock');
+          Game.shakeT = 0.10;
+          continue;
+        }
         prey.dying = 1; prey.eaten = true;   // eaten, so Vesper cannot bring it back
         prey.eatFlash = FISH_EAT_FLASH;      // Phase 7D: ~2 frames of white
         Pet.emit('fishEaten', prey);
@@ -8377,8 +8715,24 @@ function killAlien(a) {
   puff(a.x, a.y, '#ffffff', Math.round(10 * k), 320 * k);
   if (relief) Sfx.play('reliefSting');
   if (Tel.on) Tel.alienKill();
-  // every dead alien drops a $200 diamond; tagged so telemetry can bucket it as kill income
-  { const dc = spawnCoin(a.x, a.y, 'diamond'); if (Tel.on) dc.telSrc = 'alien'; }
+  // Every dead alien drops a $200 diamond; tagged so telemetry can bucket it as kill
+  // income. Phase 9B: Pet.amp('alienDrop') is 1 with no pet and 2 under Nyx, so the count
+  // is a table value and killAlien names no pet. Extras fan out so they do not stack into
+  // one unreadable pile, and each is tagged so the telemetry split stays honest.
+  {
+    // FRACTIONAL. Math.round made this dial binary -- 1.5 and 2.0 both gave two diamonds,
+    // so the only settings were "off" and "double". The fraction is now a CHANCE of the
+    // extra drop, which is what makes the amplifier tunable at all. Measured: at mult 2
+    // (always) Nyx took 9.6% off clear time at 7-1 against an 8% budget.
+    const m = Pet.amp('alienDrop');
+    let drops = Math.max(1, Math.floor(m));
+    if (Math.random() < m - Math.floor(m)) drops++;
+    for (let i = 0; i < drops; i++) {
+      const dc = spawnCoin(a.x + (i ? rand(-18, 18) * S : 0), a.y, 'diamond');
+      if (Tel.on) { dc.telSrc = 'alien'; if (i) dc.telPet = true; }
+    }
+    if (drops > 1) floatText(a.x, a.y - 34, 'x' + drops, '#c9a8ff');
+  }
   // Phase 6C: sometimes a treasure chest too. Both the roll and the payout are per-tank
   // (6C-2) — the value is overridden on the spawned coin, so COIN_STYLE.chest (and
   // therefore the Dreadfin's own drop) is untouched.
@@ -8407,6 +8761,36 @@ function feedAlien(a, quality) {
   puff(a.x, a.y, '#ffe6b0', 6, 60);
   if (a.hp <= 0) killAlien(a);
   return true;
+}
+
+// ============ GRIM'S BANKED SHIELD (Phase 9B) ============
+// He gains a charge when a wave arrives and holds it until the player spends it. Tapping
+// him puts the shield on the nearest fish, which then survives exactly one bite. The
+// shield is NOT buffRim: 7D's rim channel means "a pet is acting on this fish", and a
+// one-shot save is a different fact that needs its own mark, or the two collide the way
+// hunger and shimmer once did.
+function petTapShield(x, y) {
+  for (const p of Pet.live) {
+    const q = (PET_BEHAVIOR[p.id] || {}).params;
+    if (!q || q.effect !== 'bank' || !(p.charges > 0)) continue;
+    const tr = (q.tapR || 46) * S;
+    if (dist2(x, y, p.x, p.y) > tr * tr) continue;
+    let best = null, bd = Infinity;
+    const rr = (q.shieldR || 200) * S;
+    for (const f of Fishes.live) {
+      if (!f.alive || f.dying > 0 || f.shield) continue;
+      const d = dist2(p.x, p.y, f.x, f.y);
+      if (d < bd && d <= rr * rr) { bd = d; best = f; }
+    }
+    if (!best) { floatText(p.x, p.y - 26, 'NO ONE NEAR', '#9fb4c4'); return true; }
+    best.shield = true;
+    p.charges--;
+    Sfx.play('petGrimShield');
+    shockRing(best.x, best.y, '#8fd8ff', fishR(best) * 2.6, 0.34, 2.4);
+    floatText(best.x, best.y - 26, 'SHIELDED', '#8fd8ff');
+    return true;
+  }
+  return false;
 }
 
 // ============ UPDATE: LASER SHOTS ============
@@ -8521,10 +8905,56 @@ function updateAttacks(dt) {
   Game.attackT -= dt;
   if (Game.attackT <= 0) {
     Game.pendingAttack = def.aliens[randi(0, def.aliens.length - 1)];
+    // Phase 9B Sonar: pre-roll which side each alien of this wave will enter from, so it
+    // can be shown during the warning. ONLY when a foreseeing pet is live -- otherwise
+    // warnSides stays null and spawnAlien rolls its own side exactly as it always did,
+    // so the default route's random draw order is byte-for-byte unchanged.
+    Game.warnSides = null;
+    if (Pet.foresight()) {
+      const n = Game.pendingAttack.split('+').length * Game.mods.waveDup;
+      Game.warnSides = [];
+      // Drawn from Sonar's OWN stream, never Math.random. Sonar is pure information --
+      // it must not move a single other roll in the run, or the act of equipping it
+      // changes everything downstream and it is no longer cosmetic in the sense the
+      // guard cares about. Measured: with a shared stream it read -10.1% clear time,
+      // which was entirely re-sequenced randomness and not a mechanic.
+      for (let i = 0; i < n; i++) Game.warnSides.push(petForesightRng() < 0.5);
+    }
     Game.warnT = CFG.WARN_TIME;
     // Scheduled against the real spawn instant (now + WARN_TIME) the moment the
     // countdown starts — not re-armed every frame it counts down.
     if (Music.on) Music.startBuildUp(CFG.WARN_TIME);
+  }
+}
+
+// SONAR (Phase 9B): while a wave is pending and a foreseeing pet is live, mark the side
+// each alien will enter from. Game.warnSides is only ever populated when such a pet is
+// equipped, so with no Sonar this draws nothing and costs one null check.
+function drawWarpMarks(g) {
+  const sides = Game.warnSides;
+  if (!sides || !sides.length || Game.warnT <= 0) return;
+  const left = sides.filter(s => s).length, right = sides.length - left;
+  const y = TANK_TOP + TANK_H * 0.42;
+  const pz = 0.55 + 0.45 * Math.sin(Game.time * 5);
+  for (const [n, x, dir] of [[left, 26 * S, 1], [right, W - 26 * S, -1]]) {
+    if (!n) continue;
+    g.save();
+    g.globalAlpha = 0.30 + 0.35 * pz;
+    const gr = g.createRadialGradient(x, y, 4, x, y, 62 * S);
+    gr.addColorStop(0, 'rgba(127,232,255,.75)'); gr.addColorStop(1, 'rgba(127,232,255,0)');
+    g.fillStyle = gr;
+    g.beginPath(); g.arc(x, y, 62 * S, 0, TAU); g.fill();
+    g.globalAlpha = 0.55 + 0.45 * pz;
+    g.fillStyle = '#7fe8ff';
+    for (let i = 0; i < n; i++) {
+      const yy = y + (i - (n - 1) / 2) * 26 * S;
+      g.beginPath();
+      g.moveTo(x + dir * 22 * S, yy);
+      g.lineTo(x - dir * 8 * S, yy - 11 * S);
+      g.lineTo(x - dir * 8 * S, yy + 11 * S);
+      g.closePath(); g.fill();
+    }
+    g.restore();
   }
 }
 
@@ -8767,6 +9197,7 @@ function drawWarning(g) {
   g.font = `900 ${Math.round(bh * 0.34)}px 'Trebuchet MS',sans-serif`;
   g.textAlign = 'center'; g.textBaseline = 'middle';
   g.fillText('⚠  INCOMING', W / 2, by + bh * 0.34);
+  drawWarpMarks(g);
   g.font = `700 ${Math.round(bh * 0.24)}px 'Trebuchet MS',sans-serif`;
   g.fillStyle = '#ffd0d0';
   const names = kinds.map(k => ALIENS[k].name).join(' + ');
@@ -9042,6 +9473,11 @@ const Input = {
     // Collectables always win over feeding — the single most important touch rule.
     if (this.tryCollect(p.x, p.y)) return;
 
+    // Phase 9B: a tap on Grim while he is holding a swallowed bite places it as a shield
+    // on the nearest fish. Sits below collecting (a coin under him still wins) and above
+    // the laser, or he would be untappable during the only time he matters.
+    if (petTapShield(p.x, p.y)) return;
+
     // During an invasion taps fire the laser instead of dropping food...
     if (Game.invasion) {
       // ...except at Bloat, who is killed BY food and immune to the laser.
@@ -9207,6 +9643,10 @@ const Tel = {
   blank(stage) {
     return {
       stage, tank: Game.tank, level: Game.level, t: 0, clearTime: null, result: null,
+      // On a loss: 'wiped' (the school died and Game.lose fired) or 'timeout' (the run
+      // was still playable when the sim cap expired). Null on a win. Win rate without
+      // the cause split cannot tell an unwinnable stage from a slow one.
+      lossCause: null,
       earned: { fish: 0, star: 0, lucky: 0, chest: 0, alien: 0, oyster: 0, stipend: 0, other: 0 },
       earnedTotal: 0,
       spent: { food: 0, fish: 0, upgrade: 0, egg: 0 }, spentTotal: 0,
@@ -9217,9 +9657,10 @@ const Tel = {
     };
   },
   begin(stage) { this._cur = this.blank(stage); },
-  end(result) {
+  end(result, cause) {
     const r = this._cur; if (!r) return;
     r.result = result; r.clearTime = r.t;
+    r.lossCause = result === 'win' ? null : (cause || null);
     this._runs.push(r); this._cur = null;
   },
   // --- hook points -----------------------------------------------------------
@@ -9312,6 +9753,13 @@ Tel.sim = function (stage, opts) {
   const tank = m ? (+m[1] - 1) : 0, level = m ? (+m[2] - 1) : 0;
 
   const savedRoll = Luck.roll, wasOn = Tel.on;
+  // A seeded run. Every source of randomness in the game bottoms out in Math.random
+  // (rand/randi/Luck.roll all call it), so swapping it for a seeded generator for the
+  // duration makes one run exactly repeatable -- which is what lets the guard compare a
+  // pet against its OWN baseline instead of against a different sample of the same
+  // distribution. Restored in the same place Luck.roll is.
+  const savedRandom = Math.random;
+  if (opts.seed != null) Math.random = mulberry32(opts.seed >>> 0);
   Tel.on = true;
   // `luck:false` is the A/B control: every CFG.LUCK roll is forced to miss for this run.
   // It stubs Luck.roll rather than editing CFG, so no balance value is touched.
@@ -9319,7 +9767,13 @@ Tel.sim = function (stage, opts) {
 
   Game.startLevel(tank, level);
   Tel.begin(stage);
-  if (opts.pet && PET_BEHAVIOR[opts.pet]) { Pet.start(opts.pet); Tel.petEquipped(opts.pet); }
+  Tel._spb = 0;
+  // Phase 9B: `pets` is a loadout (array); `pet` stays for the single-pet callers that
+  // predate slots. Equipped through Pet.startAll, the same entry point startLevel uses,
+  // so a guard cell runs the pets exactly as a player's loadout would.
+  const simPets = Array.isArray(opts.pets) ? opts.pets : (opts.pet ? [opts.pet] : []);
+  const simOk = simPets.filter(id => PET_BEHAVIOR[id]);
+  if (simOk.length) { Pet.startAll(simOk); Tel.petEquipped(simOk.join('+')); }
   else Pet.stop();
 
   // Slots are addressed by SLOT_ROLES index, NOT by `d.role`: only some defs carry a
@@ -9350,10 +9804,104 @@ Tel.sim = function (stage, opts) {
     for (const c of Coins.live) if (c.alive) collectCoin(c);
     Tel.simBuy(afford);
   }
-  Tel.end(Game.eggPieces >= 3 ? 'win' : 'loss');
+  // Three endings. Game.lose() sets state 'over' with fewer than 3 eggs (the school
+  // was wiped); Game.win() sets 'over' with 3 (cleared); still 'play' means the loop
+  // hit maxT with the run alive but unfinished.
+  const won = Game.eggPieces >= 3;
+  Tel.end(won ? 'win' : 'loss', Game.state === 'play' ? 'timeout' : 'wiped');
   const rec = Tel._runs[Tel._runs.length - 1];
-  Tel.on = wasOn; Luck.roll = savedRoll;
+  Tel.on = wasOn; Luck.roll = savedRoll; Math.random = savedRandom;
   return rec;
+};
+
+// ============ Tel.guard — THE PET GATEKEEPER (Phase 9B-0) ============
+// Runs a matched pair of cells, with and without the pets, and reports the change in
+// MEDIAN CLEAR TIME. That is the metric, not income: measured over 1,900 runs, Rattle
+// cuts clear time 31% while run income FALLS 5.9%, because a run ends when the third egg
+// piece is bought -- earn faster and you finish sooner, not richer. An income test cannot
+// see that, and an income test is what shipped. Income is kept as a SECONDARY read, to
+// catch a pet that makes a stage trivially rich rather than fast.
+//
+// Median, not mean: a cell that times out contributes its cap and would drag a mean.
+// The verdict is reported with +-1 SE of the mean so a borderline call is visibly
+// borderline instead of a number pretending to be exact.
+//
+//   Tel.guard('rattle', '1-2')                 one pet
+//   Tel.guard(['rattle','plod'], '3-1')        a loadout
+//   Tel.guard('nyx', '7-1', { runs: 20 })
+Tel.guard = function (pets, stage, opts) {
+  opts = opts || {};
+  const ids = Array.isArray(pets) ? pets.slice() : (pets ? [pets] : []);
+  const n = opts.runs || CFG.PETS.guardRuns;
+  const maxT = opts.maxT || 900;
+  const budget = ids.length > 1 ? CFG.PETS.clearTimeBudgetLoad : CFG.PETS.clearTimeBudget;
+  // PAIRED cells. Both sides run the SAME list of seeds, so run k with the pet and run k
+  // without it start from an identical world and differ only by the pet. Unpaired, the
+  // instrument's own noise was measured at 12.4% on a null comparison (no pet vs no pet)
+  // -- larger than the 8% it is meant to enforce, which would have made every verdict
+  // below ~15% meaningless. Seeds are fixed, not random, so a verdict is reproducible.
+  const seeds = [];
+  for (let k = 0; k < n; k++) seeds.push(0x9E37 + k * 0x85EB);
+  const cell = (loadout) => {
+    const T = [], E = []; let wins = 0;
+    for (let k = 0; k < n; k++) {
+      // luck off by default: CFG.LUCK has its own budget, and leaving it on adds variance
+      // that is nothing to do with the pet. Pass { luck: true } to test the OVERLAP.
+      const r = Tel.sim(stage, { maxT: maxT, pets: loadout, seed: seeds[k],
+                                 luck: opts.luck === undefined ? false : opts.luck });
+      if (r.result === 'win') { wins++; T.push(r.clearTime == null ? r.t : r.clearTime); }
+      E.push(r.earnedTotal);
+    }
+    T.sort((a, b) => a - b);
+    const med = T.length ? (T.length % 2 ? T[(T.length - 1) / 2]
+                                        : (T[T.length / 2 - 1] + T[T.length / 2]) / 2) : NaN;
+    const mean = a => a.reduce((s, x) => s + x, 0) / (a.length || 1);
+    const sd = a => { if (a.length < 2) return NaN; const m = mean(a);
+      return Math.sqrt(a.reduce((s, x) => s + (x - m) * (x - m), 0) / (a.length - 1)); };
+    return { n, wins, med, se: sd(T) / Math.sqrt(Math.max(1, T.length)), earn: mean(E) };
+  };
+  const A = cell([]), B = cell(ids);
+  const dClear = (B.med - A.med) / A.med;          // negative = faster = what we bound
+  const dEarn  = (B.earn - A.earn) / A.earn;
+  // A pet that moved NOTHING at all -- identical medians and identical income across every
+  // paired seed -- was not measured, it was missed. Reporting that as PASS is the same
+  // failure mode as the income guard passing Rattle: a green light that means "the
+  // instrument never touched it". Two of the 9B-1 exemplars land here, and both for a
+  // reason in the scripted PLAYER, not in the pet:
+  //   grim  - his shield is placed by TAPPING him, and the scripted player never taps a pet.
+  //   echo  - he opens the laser/egg gate early, but the buy policy buys the special fish
+  //           first regardless, so the open gate changes none of its decisions.
+  // Fixing either means changing the scripted player, which moves every baseline in the
+  // file, so it is a deliberate later step and not a side effect of this one.
+  const untested = A.med === B.med && A.earn === B.earn;
+  const pass   = !(-dClear > budget) && !(dEarn > CFG.PETS.incomeBudget);
+  const res = {
+    pets: ids.join('+') || '(none)', stage, runs: n,
+    baseMedian: +A.med.toFixed(1), petMedian: +B.med.toFixed(1),
+    baseSe: +A.se.toFixed(1), petSe: +B.se.toFixed(1),
+    baseWins: A.wins, petWins: B.wins,
+    clearDelta: +(dClear * 100).toFixed(1),
+    incomeDelta: +(dEarn * 100).toFixed(1),
+    budget: +(budget * 100).toFixed(1),
+    verdict: untested ? 'UNTESTED' : (pass ? 'PASS' : 'BREACH'),
+    untested: untested,
+  };
+  res.line = (res.verdict === 'UNTESTED' ? 'UNTEST ' : res.verdict === 'PASS' ? 'PASS   ' : 'BREACH ') +
+    res.pets.padEnd(22) + stage.padEnd(6) +
+    'clear ' + res.baseMedian + 's -> ' + res.petMedian + 's  ' +
+    (res.clearDelta > 0 ? '+' : '') + res.clearDelta + '%' +
+    '  (budget ' + res.budget + '%)   income ' +
+    (res.incomeDelta > 0 ? '+' : '') + res.incomeDelta + '%' +
+    '   wins ' + res.baseWins + '/' + n + ' -> ' + res.petWins + '/' + n +
+    (untested ? '   <- NOT EXERCISED by the scripted player' : '');
+  return res;
+};
+// Every implemented pet against the guard, on one stage. The report a balance pass reads.
+Tel.guardAll = function (stage, opts) {
+  const out = [];
+  for (const id of Object.keys(PET_BEHAVIOR)) out.push(Tel.guard(id, stage, opts));
+  out.sort((a, b) => a.clearDelta - b.clearDelta);
+  return out;
 };
 
 // Buy policy: keep the school alive, open the gate, widen the funnel, then bank eggs.
@@ -9362,14 +9910,55 @@ Tel.sim = function (stage, opts) {
 // policy. Buying a special fish is what unlocks the laser and egg slots.
 Tel.simBuy = function (afford) {
   const alive = Fishes.live.filter(f => f.alive && f.dying <= 0).length;
-  const S_BASE = 0, S_QUAL = 1, S_QTY = 2, S_SPA = 3, S_EGG = 6;
+  const S_BASE = 0, S_QUAL = 1, S_QTY = 2, S_SPA = 3, S_SPB = 4, S_LAS = 5, S_EGG = 6;
   let i;
   if (alive < 2 && (i = afford(S_BASE)) >= 0) Shop.buy(i);
   else if (!Game.specialsBought && (i = afford(S_SPA)) >= 0) Shop.buy(i);
   else if ((i = afford(S_QTY, 150)) >= 0) Shop.buy(i);
   else if ((i = afford(S_QUAL, 150)) >= 0) Shop.buy(i);
+  // Defence, and it must come before eggs. Game.laser is literally the damage per shot
+  // (hitAlien(target, Game.laser)) and starts at 1; alien HP climbs by tank. With the
+  // laser left at 1 the scripted player lost 89 fish for 11 kills on 5-5 and 107 for 6
+  // on 6-5 -- it was firing, but not killing, which reads as a brutal stage rather than
+  // as a player who never bought a weapon.
+  else if (Game.laser < 1 + Game.tank && (i = afford(S_LAS, 200)) >= 0) Shop.buy(i);
+  // The cash-out fish. Tanks 6-7 run base -> prey -> converter, so with specialB never
+  // bought the last conversion never exists: 7-5 earned 8,345 in 30 simulated minutes.
+  else if (Tel._spb < 2 && (i = afford(S_SPB, 200)) >= 0) { Tel._spb++; Shop.buy(i); }
   else if ((i = afford(S_EGG)) >= 0) Shop.buy(i);
   else if (alive < 4 && (i = afford(S_BASE, 300)) >= 0) Shop.buy(i);
+};
+
+// Chunked collection. Every call appends to a NAMED accumulator and returns the full
+// running summary, so the numbers live in the caller's log after each chunk instead of
+// only in page memory at the end -- a killed tab then costs one chunk, not a cell.
+Tel._acc = Object.create(null);
+Tel.chunk = function (key, stage, n, opts) {
+  const a = Tel._acc[key] || (Tel._acc[key] = { key, stage, opts, inc: [], clear: [], win: 0, wiped: 0, timeout: 0 });
+  for (let i = 0; i < n; i++) {
+    const r = Tel.sim(stage, opts);
+    a.inc.push(Math.round(r.earnedTotal));
+    // Clear time is banked for WINS only -- a timeout always reads as maxT and a wipe as
+    // the moment the school died, so mixing them in makes a hard stage look fast.
+    if (r.result === 'win') { a.clear.push(+r.clearTime.toFixed(1)); a.win++; }
+    else if (r.lossCause === 'timeout') a.timeout++;
+    else a.wiped++;
+    Tel._runs.length = 0;            // records are summarised here; do not grow unbounded
+  }
+  return Tel.stat(key);
+};
+Tel.stat = function (key) {
+  const a = Tel._acc[key]; if (!a) return null;
+  const q = (arr, p) => { const s = arr.slice().sort((x, y) => x - y);
+    return s.length ? s[Math.min(s.length - 1, Math.floor(p * s.length))] : null; };
+  const mean = arr => arr.reduce((x, y) => x + y, 0) / (arr.length || 1);
+  const N = a.inc.length;
+  const cw = a.clear;
+  return { key: a.key, stage: a.stage, n: N,
+    winPct: N ? Math.round(a.win / N * 100) : 0, wiped: a.wiped, timeout: a.timeout,
+    incMean: Math.round(mean(a.inc)), incMed: q(a.inc, 0.5),
+    clrMed: q(cw, 0.5), clrP10: q(cw, 0.1), clrP90: q(cw, 0.9),
+    clrMean: +mean(cw).toFixed(1) };
 };
 
 Tel.batch = function (stage, n, opts) {
@@ -9502,7 +10091,10 @@ function frameRender(dt) {
   for (const f of Fishes.live) if (f.alive && !f.hidden) _depth.push(f);
   for (const a of Aliens.live) if (a.alive) _depth.push(a);
   _depth.sort((p, q) => p.y - q.y);
-  for (const e of _depth) (e.kind in ALIENS ? drawAlien : drawFish)(ctx, e);
+  for (const e of _depth) {
+    (e.kind in ALIENS ? drawAlien : drawFish)(ctx, e);
+    if (e.shield) drawFishShield(ctx, e);   // Phase 9B: over the fish, never a rim
+  }
   drawStatus(ctx);   // controller effects that landed on a fish or an alien
   for (const c of Coins.live)  if (c.alive) drawCoin(ctx, c);
   drawShots(ctx);
@@ -9591,11 +10183,16 @@ const slotsOpen = () => { let n = 0; while (n < PET_SLOTS && slotOpen(n)) n++; r
 const slotLockText = i => 'Clear ' + THEMES[i - 1].name + ' to open this slot';
 // The save's loadout, made honest: hatched, has a behaviour row, no repeats, and no more
 // than the open slots. This is what startLevel equips and what every screen renders.
+// Phase 9B: the save stores loadout BY SLOT INDEX, so a pet must clear its slot's type
+// as well as being hatched and implemented. A saved pet in a slot it no longer fits --
+// because the types changed, or the save predates typing -- is dropped from the run
+// rather than silently retyped, and the loadout sheet shows the slot as empty.
 function loadoutIds() {
-  const cap = slotsOpen(), out = [];
-  for (const id of (Save.data.loadout || [])) {
-    if (out.length >= cap) break;
-    if (out.includes(id) || !Save.data.pets.includes(id) || !PET_BEHAVIOR[id]) continue;
+  const cap = slotsOpen(), src = Save.data.loadout || [], out = [];
+  for (let i = 0; i < cap; i++) {
+    const id = src[i];
+    if (!id || out.includes(id) || !Save.data.pets.includes(id) || !PET_BEHAVIOR[id]) continue;
+    if (!petFitsSlot(id, i)) continue;
     out.push(id);
   }
   return out;
@@ -12059,6 +12656,7 @@ const SFX_GAIN_TRIM = {
   petTuckScrape:4, petTuckClamp:3.549, petDollopBurble:3.39, petPlodHum:4, petKiteBoing:3.193,
   petCinderCrackle:4, petSummon:2.853,
   petFennelSpit:3.4, petQuillJab:3.8, petMarigoldBirth:3.2, petLullChord:3.6, petVesperRevive:2.9,
+  petWidgetDrop:3.2, petWidgetBoom:2.4, petGrimShield:3.0, petGrimBlock:2.6,
   alienSpawn_mite:4, alienDeath_mite:4, alienSpawn_ravager:3.59, alienDeath_ravager:4,
   alienSpawn_bloat:4, alienDeath_bloat:4, alienSpawn_lurker:4, alienDeath_lurker:4,
   alienSpawn_streak:4, alienDeath_streak:4, alienSpawn_sentry:3.848, alienDeath_sentry:3.906,
@@ -12459,6 +13057,31 @@ Sfx.register('petMarigoldBirth', { category: 'pets', maxVoices: 1, minInterval: 
     { type: 'sine',     freq: 520, dur: 0.12, vel: 0.16 },
     { type: 'triangle', freq: 780, dur: 0.16, vel: 0.14, t: 0.08 },
     { type: 'sine',     freq: 1040, dur: 0.20, vel: 0.11, t: 0.16 },
+  ]);
+} });
+// ---- Phase 9B-1 pet voices ----
+// Widget is machinery: a sprung clunk on the drop, a real blast on the fuse. Grim is
+// water and shell: a rising swell as the shield lands, a dull thud when it eats a bite.
+Sfx.register('petWidgetDrop', { category: 'pets', maxVoices: 1, minInterval: 0.4, build(ctx, dest) {
+  return sfxNotes(ctx, dest, [
+    { type: 'square',   freq: 220, dur: 0.07, vel: 0.13 },
+    { type: 'triangle', freq: 150, dur: 0.14, vel: 0.11, t: 0.05 },
+  ]);
+} });
+Sfx.register('petWidgetBoom', { category: 'pets', maxVoices: 2, minInterval: 0.15, build(ctx, dest) {
+  return sfxNoiseSweep(ctx, dest, { dur: 0.5, vel: 0.30, f0: 900, f1: 90, type: 'lowpass', qv: 1.1 });
+} });
+Sfx.register('petGrimShield', { category: 'pets', maxVoices: 1, minInterval: 0.25, build(ctx, dest) {
+  return sfxNotes(ctx, dest, [
+    { type: 'sine', freq: 330, dur: 0.26, vel: 0.13 },
+    { type: 'sine', freq: 495, dur: 0.30, vel: 0.10, t: 0.09 },
+    { type: 'sine', freq: 660, dur: 0.34, vel: 0.07, t: 0.18 },
+  ]);
+} });
+Sfx.register('petGrimBlock', { category: 'pets', maxVoices: 2, minInterval: 0.12, build(ctx, dest) {
+  return sfxNotes(ctx, dest, [
+    { type: 'triangle', freq: 174, dur: 0.16, vel: 0.20 },
+    { type: 'sine',     freq: 87,  dur: 0.24, vel: 0.16, t: 0.02 },
   ]);
 } });
 Sfx.register('petLullChord', { category: 'pets', maxVoices: 1, minInterval: 1.0, build(ctx, dest) {
