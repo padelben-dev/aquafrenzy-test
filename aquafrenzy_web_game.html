@@ -177,9 +177,9 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
 .stageCard .starPips span.on{color:#ffd35a}
 /* Pet select on the stage brief: one chip per hatched pet + NONE, gold ring on the
    pick. Hidden entirely until the first pet hatches. */
-#petRow{display:flex;flex-direction:column;align-items:center;gap:7px;max-width:92vw}
-#petRowLbl{font-size:12px;font-weight:800;letter-spacing:1.5px;color:#9fd8ff}
-#petChips{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;max-width:min(430px,92vw)}
+#petRow,#losePetRow{display:flex;flex-direction:column;align-items:center;gap:7px;max-width:92vw}
+#petRowLbl,#losePetRowLbl{font-size:12px;font-weight:800;letter-spacing:1.5px;color:#9fd8ff}
+#petChips,#losePetChips{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;max-width:min(430px,92vw)}
 .petChip{
   width:46px;height:46px;border-radius:50%;border:2px solid #2a4a66;cursor:pointer;
   background:rgba(8,26,44,.92);display:flex;align-items:center;justify-content:center;
@@ -190,6 +190,13 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
 /* Phase 10: the chips are loadout SLOTS — '+' for an open empty one, a padlock for one
    the player has not earned yet. Both open the sheet; the padlock also explains itself. */
 .petChip.add{font-size:22px;font-weight:900;color:#9fd8ff;border-style:dashed}
+/* The EDIT chip is the row's visible affordance — the slot chips alone never said the
+   loadout could be changed, they only said what was in it. Pill, not circle, so it does
+   not read as a fourth slot, and wide enough to stay a real thumb target at 380px. */
+.petChip.edit{
+  width:auto;min-width:60px;padding:0 12px;border-radius:23px;border-style:dashed;
+  font-size:11px;font-weight:900;letter-spacing:1.2px;color:#ffd35a;border-color:#ffd35a;
+}
 /* The page-wide `canvas{position:absolute;top:0;left:0}` rule is for the game canvas; an
    emblem drawn INTO a chip or slot tile must flow with its box, as .pedCard already does. */
 .petChip canvas,.loSlotArt canvas{position:static}
@@ -209,6 +216,10 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
 .loSlot.empty .loSlotArt{font-weight:900;border:2px dashed #2a4a66;border-radius:50%}
 .loSlotLbl{font-size:10.5px;font-weight:700;color:#9fd8ff;line-height:1.3}
 .loSlot.full .loSlotLbl{color:#ffd35a}
+/* The slot's TYPE, stated on the tile. Phase 9B made slot 1 income-only and slot 2
+   defence-only but said so nowhere, so a refused tap read as a dead button. */
+.loSlotType{font-size:9px;font-weight:900;letter-spacing:1px;color:#7fd4ff;opacity:.9}
+.loSlot.lock .loSlotType{color:#7a8fa4}
 #loCount{font-size:13px;font-weight:700;color:#9fd8ff;letter-spacing:1px}
 #loMsg{min-height:16px;font-size:12px;font-weight:700;color:#ffd35a;max-width:92vw}
 #loMsg.flash{animation:loFlash .5s ease-out}
@@ -218,6 +229,14 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
 .loCard.on{border-color:#ffd35a;box-shadow:0 0 10px rgba(255,211,90,.6)}
 .loCard.on .where{color:#ffd35a}
 .loCard.unknown{cursor:default}
+/* Hatched, but its behaviour is not built yet: the emblem and name stay VISIBLE and in
+   colour-but-dimmed, so the collection reads complete, while the card refuses the tap
+   and says why. Distinct from .unknown, which is a black silhouette for a pet the player
+   has never seen. */
+.loCard.inert{cursor:default;opacity:.62;border-style:dashed}
+.loCard.inert h4{color:#cbb26a}
+.loCard.inert .where{color:#9fd8ff}
+.loCard.inert .loTag{background:#5a4a2a;color:#ffd9a0}
 .loTag{
   display:inline-block;font-size:9px;font-weight:900;letter-spacing:1px;color:#04263a;
   background:#7fd4ff;border-radius:6px;padding:2px 6px;margin-bottom:4px;
@@ -548,12 +567,14 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
    where the viewport is actually short, so desktop keeps its full-size card. */
 
 /* --- pet row: one line, label beside the chips instead of stacked above them --- */
-#petRow{flex-direction:row;align-items:center;gap:9px;flex-wrap:wrap;justify-content:center}
+/* The retry card carries the same strip, so it takes the same compaction: a second
+   stacked row there would push RETRY off a 380px screen. */
+#petRow,#losePetRow{flex-direction:row;align-items:center;gap:9px;flex-wrap:wrap;justify-content:center}
 /* buildPetRow() hides the row by adding .hidden, but `.hidden{display:none}` is a CLASS
    rule and `#petRow{display:flex}` is an ID rule, so the ID won and a save with no
    hatched pets still painted a bare "BRING A PET" label with no chips under it. */
-#petRow.hidden{display:none}
-#petRowLbl{font-size:11px;letter-spacing:1px;white-space:nowrap}
+#petRow.hidden,#losePetRow.hidden{display:none}
+#petRowLbl,#losePetRowLbl{font-size:11px;letter-spacing:1px;white-space:nowrap}
 #petChips{gap:6px;max-width:min(430px,70vw)}
 .petChip{width:34px;height:34px;font-size:17px;border-width:2px}
 .petChip.none{font-size:9px;letter-spacing:0}
@@ -576,6 +597,23 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
   #levelScreen #lvlBtn{min-height:46px;padding-top:10px;padding-bottom:10px;font-size:18px}
   #levelScreen #hsBtn{min-height:44px;padding-top:8px;padding-bottom:8px;font-size:14px}
   #levelScreen #lvlBack{min-height:34px;padding-top:7px;padding-bottom:7px;font-size:13px}
+
+  /* --- the retry card gets the same treatment, for the same reason ---
+     Measured on the 844x380 rig: the ALL FISH LOST card already overflowed before the
+     loadout strip existed (466px of content in 380px, RETRY starting at y=383 — below
+     the fold, reachable only by scrolling a card nobody expects to scroll), and the
+     strip added 50px more. Tightening the title, the stat grid and the button stack
+     brings the whole card, RETRY included, back inside one screen. */
+  #loseScreen{gap:7px;padding-top:calc(8px + env(safe-area-inset-top));
+              padding-bottom:calc(8px + env(safe-area-inset-bottom))}
+  #loseScreen .title{font-size:clamp(20px,4.6vw,28px)!important}
+  #loseScreen .statGrid{gap:3px 20px;padding:8px 18px;font-size:13px;border-radius:11px}
+  #loseScreen .subtitle{font-size:12px;line-height:1.3;max-width:62ch}
+  #loseScreen #losePetRowLbl{font-size:10px}
+  #loseScreen .petChip{width:30px;height:30px;font-size:15px}
+  #loseScreen .flowBtns{gap:7px;margin-top:6px;padding-bottom:calc(2px + env(safe-area-inset-bottom))}
+  #loseScreen .flowBtns .btn.big{min-height:46px;padding:10px 20px;font-size:18px}
+  #loseScreen .flowBtns .btn.small{min-height:34px;padding-top:7px;padding-bottom:7px;font-size:13px}
 }
 </style>
 
@@ -705,9 +743,18 @@ canvas{display:block;position:absolute;top:0;left:0;touch-action:none}
   </div>
   <div class="subtitle" id="loseMsg"></div>
   <div class="subtitle" id="loseStatus" style="color:#ffd35a;font-weight:800"></div>
+  <!-- The loadout is changeable from the retry card: losing IS the moment you want to
+       trade an income pet for a defender, and RETRY skips the brief, so without this the
+       only route was MAP -> stage card -> brief -> chips. The chips here are read-only
+       (whole row taps through to the sheet); the sheet returns to this card on DONE. -->
+  <div id="losePetRow" class="hidden">
+    <div id="losePetRowLbl">LOADOUT</div>
+    <div id="losePetChips"></div>
+  </div>
   <div class="flowBtns" id="loseBtns">
     <div class="row">
       <button class="btn secondary small" id="loseMap">MAP</button>
+      <button class="btn secondary small" id="loseLoadout">LOADOUT</button>
     </div>
     <button class="btn big" id="loseRetry">RETRY</button>
   </div>
@@ -816,7 +863,7 @@ const ALIENS_V2 = BUILD_FLAGS.dev && QS.get('aliens') === 'v2';
 // procedural set is approved. Art only -- no behaviour, economy, persistence, or any
 // change to which pet hatches where.
 const PETS_V2 = BUILD_FLAGS.dev && QS.get('pets') === 'v2';
-const GAME_BUILD = 66;
+const GAME_BUILD = 68;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -2556,9 +2603,11 @@ const PETS = [
   { id:'sol',     name:'Sol the Sunstar',          desc:'The first sunrise the abyss has ever seen. Every coin in the tank drifts gently toward her.' },
 ];
 const petAt = (t, l) => PETS[t * 5 + l];
-// Loadout capacity (Phase 10). Slot 1 is open from the first brief; slots 2 and 3 open
-// as the early tanks are CLEARED (see slotOpen), so the player meets the buckets one at
-// a time in tank 1, pairs them in tank 2 and runs a full spine from tank 3 on.
+// Loadout capacity (Phase 10; schedule reset 2026-09-14). Slot 1 is open from the first
+// brief; slots 2 and 3 open as their GATE TANKS are cleared (see SLOT_GATE_TANK beside
+// slotOpen), giving 1 slot in tanks 1-2, 2 in tanks 3-5 and 3 in tanks 6-7. The player
+// meets the buckets one at a time for two tanks, pairs them through the middle third,
+// and only runs a full spine in the finale.
 const PET_SLOTS = 3;
 
 // One readable emblem per pet — shared by the win-screen portrait and the Aquapedia.
@@ -2741,10 +2790,12 @@ const Save = {
   // re-guards them in case a hand-edited save carries best:null or the like.
   // `stars` (added 2026-09-06) maps stage index -> goal bitmask (1 cleared, 2 under
   // par, 4 third goal). `daily` tracks the daily-challenge streak by local ISO date.
-  // `loadout` (Phase 10, 2026-09-09) is the pets chosen on the brief, up to PET_SLOTS
-  // ids in slot order — persists so replays keep the picks; validated against hatched
-  // pets, behaviour rows and open slots by loadoutIds() at startLevel. It replaced the
-  // single `pet` string (2026-09-06); an old save's `pet` migrates into slot 1 in load().
+  // `loadout` (Phase 10, 2026-09-09) is the pets chosen on the brief: exactly PET_SLOTS
+  // entries, one per SLOT, '' for an empty one — persists so replays keep the picks, and
+  // a pick in a slot that is locked today survives until that slot opens. Legality
+  // (hatched, has a row, fits the slot type, slot open) is decided at READ time by
+  // loadoutSlots()/loadoutIds(), never by rewriting this array. It replaced the single
+  // `pet` string (2026-09-06); an old save's `pet` migrates into slot 1 in load().
   // `audio` (added 2026-09-06, Phase 9 music engine) holds the two volume categories
   // the Phase 15 sliders will expose; wired to the bus gains now so an old save that
   // never had this key still gets sane defaults instead of a silent bus at gain 0.
@@ -2767,15 +2818,32 @@ const Save = {
     if (!this.data.stars || typeof this.data.stars !== 'object') this.data.stars = {};
     if (!this.data.daily || typeof this.data.daily !== 'object')
       this.data.daily = { last:'', streak:0, bestStreak:0 };
-    // Loadout: an array of pet ids, at most PET_SLOTS. A save from before Phase 10
-    // carried one `pet` string — it becomes slot 1, once, and the old key is dropped.
-    // The defaults already hold an empty array before the stored save is merged in, so
-    // the old key is the migration signal, not the missing new one: a `pet` string only
-    // exists on a save written before Phase 10, because this block deletes it.
+    // Loadout: exactly PET_SLOTS entries, one per SLOT, '' for an empty slot. A save from
+    // before Phase 10 carried one `pet` string — it becomes slot 1, once, and the old key
+    // is dropped. The defaults already hold an empty array before the stored save is
+    // merged in, so the old key is the migration signal, not the missing new one: a `pet`
+    // string only exists on a save written before Phase 10, because this block deletes it.
+    //
+    // Normalised BY INDEX, never by compacting. The old `filter(...).slice(...)` slid
+    // slot 3's pick down into slot 1 whenever an earlier slot was empty or illegal, which
+    // is how removing one pet used to silently unequip the rest. Anything that is not a
+    // string becomes '' in place, so junk is dropped without moving its neighbours, and a
+    // pick in a slot that is currently locked or mistyped is KEPT — loadoutSlots() simply
+    // does not run it, and it comes back the day the slot opens.
     if (!Array.isArray(this.data.loadout)) this.data.loadout = [];
     if (typeof this.data.pet === 'string' && this.data.pet && !this.data.loadout.length)
       this.data.loadout = [this.data.pet];
-    this.data.loadout = this.data.loadout.filter(id => typeof id === 'string' && id).slice(0, PET_SLOTS);
+    const lo = [], seenLo = new Set();
+    for (let i = 0; i < PET_SLOTS; i++) {
+      const v = typeof this.data.loadout[i] === 'string' ? this.data.loadout[i] : '';
+      // First slot wins a repeat; later copies become empty. No run was ever able to
+      // equip the same pet twice, but leaving the repeats in the SAVE meant clearing
+      // slot 1 could make the pet reappear in slot 3 (the only slot whose type accepts
+      // anything), which reads as the remove button putting a pet back.
+      lo.push(v && !seenLo.has(v) ? v : '');
+      if (v) seenLo.add(v);
+    }
+    this.data.loadout = lo;
     delete this.data.pet;
     if (!this.data.audio || typeof this.data.audio !== 'object') this.data.audio = { music:0.8, sfx:1.0 };
     if (typeof this.data.audio.music !== 'number') this.data.audio.music = 0.8;
@@ -6472,6 +6540,10 @@ function ctrlRelease(p) {
 
 // push — knocks a fish out of a zone on an interval. Reach and interval are the weakness.
 function ctrlPush(p, q, dt) {
+  // p.snap is the claw-open pulse drawn by nettle's PET_ART. It was set on the beat and
+  // never decayed, so the claws opened once and stayed open for the whole run. Decayed
+  // here, next to the timer it belongs with, exactly as ctrlShove decays p.shove.
+  if (p.snap > 0) p.snap = Math.max(0, p.snap - dt);
   if (p.t > 0) { p.t -= dt; return; }
   const band = SAND_TOP - (q.zoneH || 70) * S, reach = (q.range || 90) * S;
   let n = 0;
@@ -6500,8 +6572,8 @@ function alienBlinded(a) { return a.alive && a.dying <= 0 && a.grace > CFG.ALIEN
 // the only thing that survives the steering, and it is clamped to the SAME bounds
 // updateAliens already enforces, so an alien can never be shoved out of the tank or into
 // the off-screen despawn test.
-// Uses p.shove, not Nettle's p.snap: p.snap is set and never decayed (see report), and
-// borrowing it would change her rendering in a pass that is not about her.
+// Uses p.shove, not Nettle's p.snap: the two pulses have different lengths (0.22 vs 0.18)
+// and are drawn by different art, so they stay separate fields.
 function ctrlShove(p, q, dt) {
   if (p.shove > 0) p.shove = Math.max(0, p.shove - dt);
   if (p.t > 0) { p.t -= dt; return; }
@@ -6771,7 +6843,7 @@ const PET_BUCKETS = {
   // effects; every one of them is params, so a new controller is a row and a drawing.
   controller: {
     init(p, q) {
-      p.lit = 0; p.t = q.interval || 0; p.marked = 0; p.held = 0; p.shove = 0;
+      p.lit = 0; p.t = q.interval || 0; p.marked = 0; p.held = 0; p.shove = 0; p.snap = 0;
       // Read straight off the live instance by Pet.herd, so the host needs no second hook.
       p.force = !!q.force;
     },
@@ -7844,6 +7916,9 @@ const Game = {
     clearWaveUI();          // the INCOMING strip must not outlive the run (Phase 7C)
     RunSave.clear();
     showHud(false);
+    // Same reason as lose(): the pets stop acting the instant state leaves 'play', but a
+    // bucket's audio loop is a Web Audio node and keeps running until something stops it.
+    Sfx.stopAllLoops();
     // The tank track keeps playing under the results screen — a win isn't a reason
     // for silence, and openMap()'s own Music.play('map', ...) handles the eventual
     // crossfade back. Only the stinger fires here, transposed into this tank's key.
@@ -7937,12 +8012,18 @@ const Game = {
     showHud(false);
     Music._stopTension(); Music.stopAllSpecials();
     Music.stop();
+    // Pets do not TICK once the run is over (Pet.update only runs from stepSim's 'play'
+    // branch) but their continuous audio beds are Web Audio loops, which do not care
+    // about game state — Tuck's scrape, Plod's hum and Cinder's crackle used to keep
+    // sounding over the GAME OVER card, under a track this line has just faded out.
+    Sfx.stopAllLoops();
     Save.write();
     $('loseCoins').textContent = money(this.stat ? this.stat.coins : 0);
     $('loseKills').textContent = this.stat ? this.stat.kills : 0;
     $('loseLost').textContent  = this.stat ? this.stat.lost  : 0;
     $('loseTime').textContent  = fmtClock(this.time);
     $('loseMsg').textContent = reason;
+    buildLosePetRow();   // the retry card shows, and can change, what RETRY will equip
     // Phase 6B: a loss reads as progress, not a wall.
     const nLost = this.stat ? this.stat.lost : 0;
     $('loseStatus').textContent =
@@ -10176,27 +10257,73 @@ const frontierIdx = () =>
 // stage after it for the frontier to point at).
 const stageDone = (t, l) => Save.data.pets.includes(petAt(t, l).id);
 
-// Loadout slots (Phase 10). Slot 1 is always open; slot n opens once tank n-1 is CLEARED
-// — its last stage's pet hatched — so slot 2 arrives with tank 2 and slot 3 with tank 3.
-const slotOpen = i => i === 0 || stageDone(i - 1, 4);
+// Loadout slots. Slot 1 is always open; slot n opens once its GATE TANK is CLEARED — that
+// tank's last stage pet hatched. SLOT_GATE_TANK is the whole schedule in one table rather
+// than an offset spread over three call sites: gate index 1 (Rosewater Ruins, tank 2)
+// opens slot 2, gate index 4 (Ember Trench, tank 5) opens slot 3. Net ramp, by the tank
+// the player is standing in: 1 slot in tanks 1-2, 2 slots in tanks 3-5, 3 in tanks 6-7.
+// Change the schedule HERE and the padlock copy follows, because slotLockText reads the
+// same table — the old form wrote the gate out twice and the two could disagree.
+const SLOT_GATE_TANK = [null, 1, 4];
+const slotOpen = i => i === 0 || stageDone(SLOT_GATE_TANK[i], 4);
 const slotsOpen = () => { let n = 0; while (n < PET_SLOTS && slotOpen(n)) n++; return n; };
-const slotLockText = i => 'Clear ' + THEMES[i - 1].name + ' to open this slot';
-// The save's loadout, made honest: hatched, has a behaviour row, no repeats, and no more
-// than the open slots. This is what startLevel equips and what every screen renders.
-// Phase 9B: the save stores loadout BY SLOT INDEX, so a pet must clear its slot's type
-// as well as being hatched and implemented. A saved pet in a slot it no longer fits --
-// because the types changed, or the save predates typing -- is dropped from the run
-// rather than silently retyped, and the loadout sheet shows the slot as empty.
-function loadoutIds() {
-  const cap = slotsOpen(), src = Save.data.loadout || [], out = [];
-  for (let i = 0; i < cap; i++) {
-    const id = src[i];
-    if (!id || out.includes(id) || !Save.data.pets.includes(id) || !PET_BEHAVIOR[id]) continue;
-    if (!petFitsSlot(id, i)) continue;
-    out.push(id);
+const slotLockText = i => 'Clear ' + THEMES[SLOT_GATE_TANK[i]].name + ' to open this slot';
+
+// The save's loadout read BY SLOT: entry i is slot i's pet, or '' when that slot is empty,
+// still locked, or holds a pick that is no longer legal — not hatched, no behaviour row,
+// wrong type for the slot (Phase 9B typing), or a repeat of an earlier slot. Always
+// PET_SLOTS long, so the index IS the slot.
+//
+// Nothing is written back from here, and that is the point. The renderers used to store
+// the validated DENSE list into Save.data.loadout, which meant a pick parked in a locked
+// slot was destroyed the next time a brief opened — so tightening the slot schedule, or
+// emptying slot 1, silently threw away the other picks. The save now keeps what the
+// player chose; legality is decided at read time, every time.
+function loadoutSlots() {
+  const cap = slotsOpen(), src = Save.data.loadout || [], out = [], seen = new Set();
+  for (let i = 0; i < PET_SLOTS; i++) {
+    const id = typeof src[i] === 'string' ? src[i] : '';
+    const ok = !!id && i < cap && !seen.has(id) && Save.data.pets.includes(id) &&
+               !!PET_BEHAVIOR[id] && petFitsSlot(id, i);
+    if (ok) seen.add(id);
+    out.push(ok ? id : '');
   }
   return out;
 }
+// The pets that actually join a run, in slot order — the dense view of loadoutSlots().
+// This is what startLevel equips.
+function loadoutIds() { return loadoutSlots().filter(id => id); }
+// Write one slot (id or '') without disturbing the others. The only writer of the loadout.
+function setLoadoutSlot(i, id) {
+  const lo = [];
+  for (let k = 0; k < PET_SLOTS; k++) {
+    const v = (Save.data.loadout || [])[k];
+    lo.push(k === i ? (id || '') : (typeof v === 'string' ? v : ''));
+  }
+  Save.data.loadout = lo;
+  Save.write();
+}
+// The slot this pet currently occupies, or -1. Reads the SAVE, not the validated view, so
+// a parked pick still counts as equipped-somewhere and can never be duplicated.
+const petSlotOf = id => {
+  const src = Save.data.loadout || [];
+  for (let i = 0; i < PET_SLOTS; i++) if (src[i] === id) return i;
+  return -1;
+};
+// What a slot accepts, in the player's words. CFG.PETS.slotTypes is the rule; this is the
+// only place it is turned into copy, so the sheet and its refusals can never disagree.
+// Two forms, because both are needed: a BADGE for the tile, and a noun phrase that reads
+// as English inside a sentence ("tap an income pet below", not "tap a income pet below").
+const SLOT_TYPE_LABEL  = { income: 'INCOME', defence: 'DEFENCE', free: 'ANY PET' };
+const SLOT_TYPE_PHRASE = { income: 'an income pet', defence: 'a defence pet', free: 'any pet' };
+// A pet's own type as a phrase. A 'free'-typed pet is the convenience/cosmetic class and
+// fits ONLY a 'free' slot, so it is named for what it is — calling it "any pet" would
+// wrongly suggest it goes anywhere.
+const PET_TYPE_PHRASE  = { income: 'an income pet', defence: 'a defence pet', free: 'a utility pet' };
+const slotTypeLabel = i  => SLOT_TYPE_LABEL[CFG.PETS.slotTypes[i]] || 'ANY PET';
+const slotWantsText = i  => SLOT_TYPE_PHRASE[CFG.PETS.slotTypes[i]] || 'any pet';
+const petTypeLabel  = id => SLOT_TYPE_LABEL[petType(id)] || 'ANY PET';
+const petTypePhrase = id => PET_TYPE_PHRASE[petType(id)] || 'a pet';
 
 // A postcard of the tank: real water/sand palette plus two or three of the scene's
 // own signature pieces, drawn with the same painters the tank uses. Static — kelp and
@@ -11005,41 +11132,59 @@ function buildPetRow() {
   const row = $('petRow'), chips = $('petChips');
   if (!Save.data.pets.length) { row.classList.add('hidden'); return; }
   row.classList.remove('hidden');
-  Save.data.loadout = loadoutIds();
+  const slots = loadoutSlots();   // read-only: the brief never rewrites the player's picks
   chips.innerHTML = '';
   for (let i = 0; i < PET_SLOTS; i++) {
-    const id = Save.data.loadout[i] || '', open = slotOpen(i);
+    const id = slots[i], open = slotOpen(i);
     const c = document.createElement('div');
     c.className = 'petChip' + (!open ? ' lock' : id ? ' sel' : ' add');
     if (!open)   { c.textContent = '🔒'; c.title = slotLockText(i); }
     else if (id) { c.textContent = PET_EMBLEM[id] || '🐠'; emblemInto(c, id, 26); c.title = petById(id).name; }
-    else         { c.textContent = '+'; c.title = 'Empty slot — tap to choose a pet'; }
-    c.addEventListener('click', () => { Snd.init(); Snd.resume(); Sfx.play('uiTap'); openLoadout(); });
+    else         { c.textContent = '+'; c.title = 'Slot ' + (i + 1) + ' (' + slotTypeLabel(i) + ') — tap to choose a pet'; }
+    c.addEventListener('click', () => { Snd.init(); Snd.resume(); Sfx.play('uiTap'); openLoadout('levelScreen'); });
     chips.appendChild(c);
   }
+  // The chips are slots, not a button, so the row carries its own EDIT affordance: the
+  // brief must say out loud that the loadout can be changed, not rely on a hover title
+  // or on an empty slot happening to show a '+'.
+  const edit = document.createElement('div');
+  edit.className = 'petChip edit';
+  edit.textContent = 'EDIT';
+  edit.title = 'Open the loadout sheet';
+  edit.addEventListener('click', () => { Snd.init(); Snd.resume(); Sfx.play('uiTap'); openLoadout('levelScreen'); });
+  chips.appendChild(edit);
 }
 
 // ---- loadout sheet (Phase 10) ----
-// Three slot tiles on top, then every pet that HAS a behaviour row, in stage order. The
-// roster is derived from PET_BEHAVIOR each build, never listed by hand, so a pet appears
-// the moment its row lands and a pet without one is not offered at all. Two card
-// states: hatched (tap to equip / unequip) and locked, which always names its stage.
+// Three slot tiles on top, then ALL 35 pets in stage order. The roster is the pet table
+// itself, never a hand list. Three card states:
+//   hatched + behaviour row  — tap to equip / unequip, and the slot it would fill is named
+//   hatched, no row yet      — greyed but PRESENT: emblem, name, "NO ABILITY YET". The
+//                              collection has to read complete without claiming the pet
+//                              does something, so it is shown and refused, not hidden.
+//   not hatched              — silhouette + '???' + the stage that reveals it
 const BUCKET_LABEL = { collector: 'COLLECTOR', feeder: 'FEEDER', defender: 'DEFENDER',
                        producer: 'PRODUCER', amplifier: 'AMPLIFIER', controller: 'CONTROLLER',
                        utility: 'UTILITY' };
 const petById = id => PETS.find(p => p.id === id);
 
-function openLoadout() {
+// The sheet is opened from the brief AND from the retry card, so it remembers where to
+// go back to. Hardcoding #levelScreen here is what used to tie the picker to the brief.
+let loadoutReturnTo = 'levelScreen';
+function openLoadout(from) {
+  loadoutReturnTo = from || 'levelScreen';
   buildLoadout();
-  $('levelScreen').classList.add('hidden');
+  $(loadoutReturnTo).classList.add('hidden');
   const sc = $('loadoutScreen');
   sc.classList.remove('hidden');
   sc.scrollTop = 0;
 }
 function closeLoadout() {
   $('loadoutScreen').classList.add('hidden');
-  buildPetRow();   // the chips reflect whatever the sheet changed
-  $('levelScreen').classList.remove('hidden');
+  // Whichever card opened the sheet gets its chips rebuilt, so the row the player
+  // returns to shows what they just chose rather than what they had before.
+  if (loadoutReturnTo === 'loseScreen') buildLosePetRow(); else buildPetRow();
+  $(loadoutReturnTo).classList.remove('hidden');
 }
 function loadoutMsg(text) {
   const m = $('loMsg');
@@ -11047,73 +11192,105 @@ function loadoutMsg(text) {
   m.classList.remove('flash'); void m.offsetWidth; m.classList.add('flash');
 }
 
+// Where a pet would go if tapped: the first OPEN, EMPTY slot whose type accepts it.
+// Returns -1 with a reason, so a refusal can say which of the two walls it hit — every
+// fitting slot already taken, or no slot of that type open yet. The sheet used to append
+// blindly and let the validator drop the pick, which played the equip chime and did
+// nothing; a tap now either lands somewhere real or explains itself.
+function slotForPet(id) {
+  const cap = slotsOpen(), slots = loadoutSlots();
+  let fitsSomewhere = false;
+  for (let i = 0; i < cap; i++) {
+    if (!petFitsSlot(id, i)) continue;
+    fitsSomewhere = true;
+    if (!slots[i]) return { slot: i, why: '' };
+  }
+  if (fitsSomewhere)
+    return { slot: -1, why: 'Every slot that takes ' + petTypePhrase(id) + ' is full — tap an equipped pet to free one' };
+  let nextI = -1;
+  for (let i = 0; i < PET_SLOTS; i++) if (petFitsSlot(id, i)) { nextI = i; break; }
+  return { slot: -1, why: nextI >= 0
+    ? slotLockText(nextI) + ' — it takes ' + petTypePhrase(id) + ' like this one'
+    : 'No slot takes ' + petTypePhrase(id) };
+}
+
 function buildLoadout() {
-  Save.data.loadout = loadoutIds();
-  const ids = Save.data.loadout, cap = slotsOpen();
+  const slotIds = loadoutSlots(), cap = slotsOpen();
+  const filled = slotIds.filter(id => id).length;
 
   const slots = $('loSlots'); slots.innerHTML = '';
   for (let i = 0; i < PET_SLOTS; i++) {
-    const id = ids[i] || '', open = slotOpen(i);
+    const id = slotIds[i], open = slotOpen(i);
     const t = document.createElement('div');
     t.className = 'loSlot' + (!open ? ' lock' : id ? ' full' : ' empty');
     const art = document.createElement('div'); art.className = 'loSlotArt';
     const lab = document.createElement('div'); lab.className = 'loSlotLbl';
+    // Every tile names the TYPE it takes. Without this the rule is invisible: a player
+    // tapping a defender into an income slot has no way to know why it was refused.
+    const ty = document.createElement('div'); ty.className = 'loSlotType';
+    ty.textContent = 'SLOT ' + (i + 1) + ' · ' + slotTypeLabel(i);
     if (!open)   { art.textContent = '🔒'; lab.textContent = slotLockText(i); }
     else if (id) { art.textContent = PET_EMBLEM[id] || '🐠'; emblemInto(art, id, 44);
                    lab.textContent = petById(id).name + ' — tap to remove'; }
-    else         { art.textContent = '+'; lab.textContent = 'Slot ' + (i + 1) + ' — tap a pet below'; }
-    t.appendChild(art); t.appendChild(lab);
+    else         { art.textContent = '+'; lab.textContent = 'Empty — tap ' + slotWantsText(i) + ' below'; }
+    t.appendChild(ty); t.appendChild(art); t.appendChild(lab);
     t.addEventListener('click', () => {
       Snd.init(); Snd.resume();
       if (!open) { Sfx.play('uiDeny'); loadoutMsg(slotLockText(i)); return; }
-      if (!id)   { Sfx.play('uiTap');  loadoutMsg('Tap a hatched pet below to fill this slot'); return; }
+      if (!id)   { Sfx.play('uiTap');  loadoutMsg('Slot ' + (i + 1) + ' takes ' + slotWantsText(i) + ' — tap one below'); return; }
       Sfx.play('uiTap');
-      Save.data.loadout = ids.filter(x => x !== id); Save.write();
+      setLoadoutSlot(i, '');   // clears THIS slot only; the others keep their pets
       buildLoadout();
     });
     slots.appendChild(t);
   }
 
-  const roster = PETS.map((p, i) => ({ p, i })).filter(e => PET_BEHAVIOR[e.p.id]);
-  const hatched = roster.filter(e => Save.data.pets.includes(e.p.id)).length;
+  // The denominator is the whole cast, so the sheet agrees with the Aquapedia's 35 and a
+  // hatched pet never goes missing from the count because its behaviour is still unbuilt.
+  const hatched = PETS.filter(p => Save.data.pets.includes(p.id)).length;
   $('loCount').textContent =
-    `${hatched} OF ${roster.length} PETS HATCHED \u00b7 ${ids.length}/${cap} SLOT${cap === 1 ? '' : 'S'} FILLED`;
+    `${hatched} OF ${PETS.length} PETS HATCHED \u00b7 ${filled}/${cap} SLOT${cap === 1 ? '' : 'S'} FILLED`;
 
   const list = $('loList'); list.innerHTML = '';
-  for (const { p, i } of roster) {
-    const owned = Save.data.pets.includes(p.id), slot = ids.indexOf(p.id);
+  PETS.forEach((p, i) => {
+    const owned = Save.data.pets.includes(p.id);
+    const row = PET_BEHAVIOR[p.id];                            // undefined = no ability built yet
+    const slot = petSlotOf(p.id), live = slot >= 0 && slotIds[slot] === p.id;
+    const inert = owned && !row;
     const card = document.createElement('div');
-    card.className = 'pedCard loCard' + (owned ? (slot >= 0 ? ' on' : '') : ' unknown');
+    card.className = 'pedCard loCard' + (!owned ? ' unknown' : inert ? ' inert' : live ? ' on' : '');
     const e = document.createElement('div'); e.className = 'emb';
-    e.textContent = owned ? (PET_EMBLEM[p.id] || '🐠') : '\u2753';
+    e.textContent = owned ? (PET_EMBLEM[p.id] || '\ud83d\udc20') : '\u2753';
     if (owned) emblemInto(e, p.id, 76);
     card.appendChild(e);
     const h = document.createElement('h4'); h.textContent = owned ? p.name : '???'; card.appendChild(h);
     const tag = document.createElement('span'); tag.className = 'loTag';
-    const bucket = PET_BEHAVIOR[p.id].bucket;
-    tag.textContent = BUCKET_LABEL[bucket] || bucket.toUpperCase();
+    tag.textContent = row ? ((BUCKET_LABEL[row.bucket] || row.bucket.toUpperCase()) + ' \u00b7 ' + petTypeLabel(p.id))
+                          : 'NO ABILITY YET';
     card.appendChild(tag);
     const d = document.createElement('p'); d.textContent = owned ? p.desc : 'Not hatched yet.'; card.appendChild(d);
     const w = document.createElement('span'); w.className = 'where';
     w.textContent = !owned    ? 'Clear ' + stageName(i) + ' to hatch'
-                  : slot >= 0 ? 'EQUIPPED \u00b7 SLOT ' + (slot + 1)
+                  : inert     ? 'NOT YET ACTIVE'
+                  : live      ? 'EQUIPPED \u00b7 SLOT ' + (slot + 1)
+                  : slot >= 0 ? 'PARKED \u00b7 SLOT ' + (slot + 1)
                   :             'TAP TO EQUIP';
     card.appendChild(w);
     card.addEventListener('click', () => {
       Snd.init(); Snd.resume();
       if (!owned) { Sfx.play('uiDeny'); loadoutMsg('Clear ' + stageName(i) + ' to hatch this pet'); return; }
-      if (slot >= 0) { Sfx.play('uiTap'); Save.data.loadout = ids.filter(x => x !== p.id); }
-      else if (ids.length >= cap) {
-        Sfx.play('uiDeny');
-        loadoutMsg(cap < PET_SLOTS ? slotLockText(cap) : 'Every slot is full \u2014 tap an equipped pet to remove it');
-        return;
-      }
-      else { Sfx.play('uiPetSelect'); Save.data.loadout = ids.concat(p.id); }
-      Save.write();
+      // Shown, named and refused out loud: the pet IS in the collection, its ability is
+      // not built yet, and the sheet says so rather than pretending it is equippable.
+      if (inert)  { Sfx.play('uiDeny'); loadoutMsg(p.name + ' has no ability yet \u2014 nothing to equip'); return; }
+      if (slot >= 0) { Sfx.play('uiTap'); setLoadoutSlot(slot, ''); buildLoadout(); return; }
+      const target = slotForPet(p.id);
+      if (target.slot < 0) { Sfx.play('uiDeny'); loadoutMsg(target.why); return; }
+      Sfx.play('uiPetSelect');
+      setLoadoutSlot(target.slot, p.id);
       buildLoadout();
     });
     list.appendChild(card);
-  }
+  });
 }
 $('loDone').addEventListener('click', () => { Snd.init(); Snd.resume(); Sfx.play('uiTap'); closeLoadout(); });
 
@@ -11129,11 +11306,36 @@ $('endBtn').addEventListener('click', () => {
   openMap();
 });
 
+// The retry card's own loadout strip: the same slot chips as the brief, so a player can
+// SEE what is about to be re-equipped before tapping RETRY, and change it in place. The
+// chips are rendered read-only here (the sheet is the editor) but the whole row and the
+// LOADOUT button both open it, and DONE comes back to this card, not the brief.
+function buildLosePetRow() {
+  const row = $('losePetRow'), chips = $('losePetChips');
+  if (!Save.data.pets.length) { row.classList.add('hidden'); return; }
+  row.classList.remove('hidden');
+  const slots = loadoutSlots();
+  chips.innerHTML = '';
+  for (let i = 0; i < PET_SLOTS; i++) {
+    const id = slots[i], open = slotOpen(i);
+    const c = document.createElement('div');
+    c.className = 'petChip' + (!open ? ' lock' : id ? ' sel' : ' add');
+    if (!open)   { c.textContent = '🔒'; c.title = slotLockText(i); }
+    else if (id) { c.textContent = PET_EMBLEM[id] || '🐠'; emblemInto(c, id, 26); c.title = petById(id).name; }
+    else         { c.textContent = '+'; c.title = 'Slot ' + (i + 1) + ' (' + slotTypeLabel(i) + ') — tap to choose a pet'; }
+    c.addEventListener('click', () => { Snd.init(); Snd.resume(); Sfx.play('uiTap'); openLoadout('loseScreen'); });
+    chips.appendChild(c);
+  }
+}
+$('loseLoadout').addEventListener('click', () => {
+  Snd.init(); Snd.resume(); Sfx.play('uiTap');
+  openLoadout('loseScreen');
+});
 $('loseRetry').addEventListener('click', () => {
   $('loseScreen').classList.add('hidden');
   // Save.data.loadout already persists the player's picks, so restarting the SAME
-  // stage through the normal startLevel path picks it right back up — no special
-  // "remember the pet" plumbing needed here.
+  // stage through the normal startLevel path picks it right back up — including any
+  // change just made through the LOADOUT button on this card.
   Game.startLevel(Game.tank, Game.level);
 });
 $('loseMap').addEventListener('click', () => {
@@ -11543,7 +11745,12 @@ const Dbg = {
       ? Pet.live.map(p => `${p.id} @${Math.round(p.x)},${Math.round(p.y)} ${
           Object.entries(p).filter(([k, v]) => !['id','x','y'].includes(k) && typeof v !== 'object' && typeof v !== 'function')
             .map(([k, v]) => k + '=' + (typeof v === 'number' ? +v.toFixed(2) : v)).join(' ')}`).join(' | ')
-      : ((Save.data.loadout || []).length ? Save.data.loadout.join(',') + ' (loadout, not running)' : 'none');
+      // The saved loadout is slot-indexed with '' holes, so print the slots that hold a
+      // pet — joining the raw array would read "tuck,," and look like a bug.
+      : ((Save.data.loadout || []).filter(Boolean).length
+          ? (Save.data.loadout || []).map((id, i) => id ? (i + 1) + ':' + id : null).filter(Boolean).join(' ') +
+            ' (loadout, not running)'
+          : 'none');
     const alienYs = Aliens.live.filter(a => a.alive).map(a => Math.round(a.y)).join(',');
     this.lastText =
       `AQUA FRENZY build ${GAME_BUILD} (?v=${QS.get('v') || '?'})\n` +
@@ -14718,8 +14925,10 @@ function checkSaveIntegrity() {
   if (dupes.length) {
     console.warn('[save-check] Save.data.pets holds duplicate id(s):', dupes);
   }
+  // '' is an EMPTY SLOT, not a bad id: the loadout is slot-indexed, so only non-empty
+  // entries are claims about a pet.
   for (const id of ((Save.data && Save.data.loadout) || [])) {
-    if (!valid.has(id)) console.warn('[save-check] loadout pet "' + id + '" is not a valid pet id');
+    if (id && !valid.has(id)) console.warn('[save-check] loadout pet "' + id + '" is not a valid pet id');
   }
   return { invalid: bad, duplicates: dupes };
 }
