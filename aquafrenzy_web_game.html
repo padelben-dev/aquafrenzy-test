@@ -863,7 +863,7 @@ const ALIENS_V2 = BUILD_FLAGS.dev && QS.get('aliens') === 'v2';
 // procedural set is approved. Art only -- no behaviour, economy, persistence, or any
 // change to which pet hatches where.
 const PETS_V2 = BUILD_FLAGS.dev && QS.get('pets') === 'v2';
-const GAME_BUILD = 72;
+const GAME_BUILD = 73;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -872,13 +872,30 @@ const GAME_BUILD = 72;
 // the page so it catches literally anything, including a future accidental import.
 // The actual pass/fail line prints once the DOM is ready (see runBootAudit below);
 // this object is just the live counters it reads.
-const __bootNet = { calls: 0, log: [] };
+const __bootNet = { calls: 0, beds: 0, log: [] };
 (function installNetworkGuard() {
   try {
     const _fetch = window.fetch ? window.fetch.bind(window) : null;
     if (_fetch) {
       window.fetch = function (...args) {
-        __bootNet.calls++; __bootNet.log.push(['fetch', String(args[0])]);
+        const u = String(args[0]);
+        // BUILD 73 -- the ONE declared exception to zero-external-asset. The recorded
+        // music beds (see the Beds layer near the boot chain) are fetched as separate
+        // .mp3 files rather than embedded as base64, which would have added ~2.2 MB to
+        // this file. They are counted separately so the guard keeps its real job:
+        // catching a network call nobody declared. Anything that is not a bed still
+        // errors exactly as before.
+        //
+        // NATIVE NOTE: under a Capacitor/webview wrapper these resolve against the
+        // LOCAL bundle, not the network, provided music/ ships inside the app payload.
+        // If a native build ever reports these as real network calls, that is the
+        // signal that music/ was left out of the bundle -- not that the guard is wrong.
+        if (/(^|\/)music\/[a-z0-9_]+\.mp3(\?|$)/i.test(u)) {
+          __bootNet.beds = (__bootNet.beds || 0) + 1;
+          __bootNet.log.push(['bed', u]);
+          return _fetch(...args);
+        }
+        __bootNet.calls++; __bootNet.log.push(['fetch', u]);
         console.error('[boot-audit] unexpected fetch() call', args);
         return _fetch(...args);
       };
@@ -17086,6 +17103,186 @@ if (typeof Capacitor !== 'undefined' && Capacitor.isNativePlatform && Capacitor.
     if (ScreenOrientation.unlock) ScreenOrientation.unlock();
   } catch (e) {}
 }
+
+// ============ RECORDED MUSIC BEDS (build 73) ============
+// WHY. The synth music put ~45% of its spectral energy above 3kHz -- 34.8% in the
+// 3-8kHz band alone, which is where the ear is most sensitive -- and looped phrases
+// as short as one bar (1.85-2.70s on the invasion tracks). Through a phone speaker
+// that reads as a periodic spike, which is the fault this replaces. Measured on the
+// same analysis, these beds carry 3-26% above 3kHz and 49-92% below 800Hz, so they
+// sit UNDER the SFX bus instead of competing with it for the same band.
+//
+// PROVENANCE. Generated locally with ACE-Step 3.5B (Apache-2.0) through ComfyUI on
+// this machine -- no paid service, no per-track credit, and the output is ours to
+// ship. Prompts are keyed off THEMES[] so each bed matches its tank's actual palette
+// and scene. Each was rendered at 90s, loop-cut with a 2s equal-power crossfade at a
+// searched loop point, then two-pass loudness-normalised; the nine land within
+// 0.62 dB of each other so one make-up gain matches the whole set.
+//
+// DELIVERY. Separate .mp3 files fetched on demand -- deliberately NOT base64. Seven
+// tanks plus menu and map embedded as data URIs would add ~2.2 MB of base64 to an
+// 856 KB file; fetched, the HTML stays its build-72 size and each screen pulls ~180 KB
+// once, after which the browser cache serves it.
+//
+// ROUTING. The bed's AudioBufferSourceNode connects to Snd.musicDuck -- the same node
+// makeSession() feeds -- so it inherits the mute toggle (Music.setEnabled writes
+// Snd.musicBus.gain), the music volume slider, the SFX sidechain duck (Snd.duckMusic)
+// and the master tone-shelf/limiter, without any of them being touched.
+//
+// INVASION STAYS ON THE SYNTH, deliberately. enterInvasion() scales musical intensity
+// against the live alien count and updateInvasionIntensity() keeps it in step every
+// frame; a single static file cannot do that, and faking it with a gain ramp would
+// lose the layer tiering that makes the invasion read as escalating. The bed is
+// stopped for the duration and resumes when exitInvasion() crossfades the calm track
+// back. The invasion tracks are the remaining synth-quality item.
+//
+// FAILURE POLICY. A bed that 404s, fails to decode, or is blocked offline must never
+// mean silence: the id is marked dead for the session and the synth takes that track
+// back permanently. Bed playback is strictly an enhancement over a working game.
+const BED_DIR    = 'music/';
+const BED_IDS    = ['menu', 'map', 'tank1', 'tank2', 'tank3', 'tank4', 'tank5', 'tank6', 'tank7'];
+// Levels the beds against the live synth so switching paths is not a volume change.
+// Re-measure with scratchpad/music/match_beds.py if the beds are ever re-normalised.
+// Measured on this build with an analyser tapped off Snd.master: the beds ran
+// +10.94 dB hot against the live tank1 synth at intensity 0.5 (bed rms 0.044836 vs
+// synth 0.012728). The SFX mix was balanced against the SYNTH's level, so the beds
+// move to meet it rather than the reverse -- a bed that sits on top of the SFX is
+// the same mistake in the other direction. 1/10.94dB = 0.284.
+const BED_MAKEUP = 0.284;   // measured, not guessed -- see the comment above
+
+const Beds = {
+  on: true,
+  _buf: Object.create(null),      // id -> decoded AudioBuffer
+  _load: Object.create(null),     // id -> in-flight Promise (dedupes concurrent asks)
+  _dead: Object.create(null),     // id -> true once it has failed; never retried
+  _src: null, _gain: null,
+  _want: null,                    // the id we intend to be hearing, set synchronously
+
+  // A track is bed-backed only if the layer is on, the id ships a bed, and that bed
+  // has not already failed this session.
+  has(id) { return this.on && BED_IDS.indexOf(id) !== -1 && !this._dead[id]; },
+
+  _fetch(id) {
+    if (this._buf[id]) return Promise.resolve(this._buf[id]);
+    if (this._load[id]) return this._load[id];
+    const p = fetch(BED_DIR + id + '.mp3')
+      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+      .then(ab => Snd.ctx.decodeAudioData(ab))
+      .then(buf => { this._buf[id] = buf; delete this._load[id]; return buf; })
+      .catch(e => {
+        console.warn('[beds] ' + id + ' unavailable -> synth for the rest of the session:',
+                     e && e.message);
+        this._dead[id] = true; delete this._load[id];
+        throw e;
+      });
+    this._load[id] = p;
+    return p;
+  },
+
+  play(id, fadeMs) {
+    if (!Snd.ctx) Snd.init();
+    this._want = id;
+    // Before the first gesture the context is suspended; Music._flushPending re-drives
+    // us, exactly as it does the synth's own _pendingPlay.
+    if (!Snd.running()) return;
+    this._fetch(id).then(buf => {
+      if (this._want !== id) return;            // superseded while decoding
+      this._start(buf, id, fadeMs);
+    }).catch(() => {
+      if (this._want !== id) return;
+      this._want = null;
+      Music._playSynth(id, { crossfadeMs: fadeMs });   // permanent fallback for this id
+    });
+  },
+
+  _start(buf, id, fadeMs) {
+    this.stop(0.25);
+    const ctx = Snd.ctx, now = ctx.currentTime;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    // NOT musicGainTrim(id): that table (0.563 .. 2.428, a 4.3x spread) corrects the
+    // SYNTH renders track by track. The beds were already two-pass loudness-matched to
+    // within 0.62 dB of each other, so applying it would undo exactly that work.
+    g.gain.linearRampToValueAtTime(BED_MAKEUP,
+                                   now + Math.max(0.05, (fadeMs || 800) / 1000));
+    g.connect(Snd.musicDuck);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+    // mp3 carries encoder delay/padding that decodeAudioData does not reliably strip,
+    // so the loop is pulled in ~25ms at both ends. The loop was cut with a 2s
+    // crossfade, so trimming 25ms off it costs nothing audible and removes the seam.
+    src.loopStart = 0.025;
+    src.loopEnd = Math.max(0.05, buf.duration - 0.025);
+    src.connect(g);
+    src.start(now, 0);
+    this._src = src; this._gain = g;
+  },
+
+  stop(fade = 0.3) {
+    const src = this._src, g = this._gain;
+    this._src = null; this._gain = null;
+    if (!src || !Snd.ctx) return;
+    const now = Snd.ctx.currentTime;
+    try {
+      g.gain.cancelScheduledValues(now);
+      g.gain.setValueAtTime(g.gain.value, now);
+      g.gain.linearRampToValueAtTime(0.0001, now + fade);
+      src.stop(now + fade + 0.05);
+    } catch (e) { /* already stopped */ }
+  },
+
+  // Called from Music._flushPending once the first gesture unlocks the context.
+  flush() {
+    if (this._want && !this._src) this.play(this._want, 800);
+  },
+};
+
+// ---- graft the bed layer onto the music engine -------------------------------------
+// Music.play is the single entry point every screen uses, so intercepting it covers
+// menu, map and all seven tanks. _playSynth preserves the original for the fallback
+// path and for the tracks that have no bed (the invasion variants).
+Music._playSynth = Music.play.bind(Music);
+Music.play = function (trackId, opts = {}) {
+  if (Beds.has(trackId)) {
+    // _stopSynth, not Music.stop: the wrapped stop would also kill the outgoing bed and
+    // clear Beds._want. Beds._start already crossfades bed-to-bed on its own.
+    Music._stopSynth(Math.min(400, opts.crossfadeMs || 400));
+    Beds.play(trackId, opts.crossfadeMs || 800);
+    return;
+  }
+  Beds.stop(0.3);
+  return Music._playSynth(trackId, opts);
+};
+
+// enterInvasion builds its session directly via makeSession -- it does NOT route
+// through Music.play -- so it needs its own hook to clear the bed. exitInvasion does
+// call this.play(calmId, ...), so the bed comes back through the interceptor above.
+Music._enterInvasionSynth = Music.enterInvasion.bind(Music);
+Music.enterInvasion = function (tank, count) {
+  Beds._want = null;
+  Beds.stop(0.2);
+  return Music._enterInvasionSynth(tank, count);
+};
+
+// Music.stop() means "all music off" and must take the bed with it, otherwise pausing
+// or leaving a tank leaves the bed looping under the next screen.
+Music._stopSynth = Music.stop.bind(Music);
+Music.stop = function (fadeMs = 400) {
+  Beds._want = null;
+  Beds.stop(Math.max(0.05, fadeMs / 1000));
+  return Music._stopSynth(fadeMs);
+};
+
+// The context unlocks on the first gesture; the synth flushes its _pendingPlay here,
+// so the bed flushes its own intent on the same hook.
+Music._flushPendingSynth = Music._flushPending.bind(Music);
+Music._flushPending = function () {
+  const r = Music._flushPendingSynth();
+  Beds.flush();
+  return r;
+};
+
 
 // Pet-index + save-integrity audit. Runs on every route, before any screen is built, so
 // a bad index or a foreign save is reported once at boot rather than discovered by a
