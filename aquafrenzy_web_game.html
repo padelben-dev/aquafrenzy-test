@@ -863,7 +863,7 @@ const ALIENS_V2 = BUILD_FLAGS.dev && QS.get('aliens') === 'v2';
 // procedural set is approved. Art only -- no behaviour, economy, persistence, or any
 // change to which pet hatches where.
 const PETS_V2 = BUILD_FLAGS.dev && QS.get('pets') === 'v2';
-const GAME_BUILD = 75;
+const GAME_BUILD = 76;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -8890,7 +8890,11 @@ function hitAlien(a, dmg) {
   // dmg IS Game.laser here — see the hitAlien(target, Game.laser) call site. hp = fraction
   // left after this hit, so the thump falls as the alien nears death (Phase 7A).
   Sfx.play('laserHit', { level: dmg, hp: a.maxHp > 0 ? Math.max(0, a.hp) / a.maxHp : 1 });
+  // Build 76: the beam is voiced, the creature was not. A surviving alien answers the
+  // hit; a dying one gets its death cue instead, so the killing blow is never both at
+  // once — that overlap is what made the two indistinguishable in the first place.
   if (a.hp <= 0) killAlien(a);
+  else Sfx.play('alienHurt_' + a.kind);
 }
 
 function killAlien(a) {
@@ -8958,7 +8962,11 @@ function feedAlien(a, quality) {
   a.hp -= CFG.FOOD_GROWTH[quality];
   a.hurt = 0.09;
   puff(a.x, a.y, '#ffe6b0', 6, 60);
+  // Build 76: this path took HP and made no sound at all. It is the ONLY way Bloat can
+  // be damaged (laserProof returns out of hitAlien above its Sfx.play), so without this
+  // line one of the seven kinds could never be heard being hurt by any means.
   if (a.hp <= 0) killAlien(a);
+  else Sfx.play('alienHurt_' + a.kind);
   return true;
 }
 
@@ -13033,10 +13041,25 @@ const SFX_GAIN_TRIM = {
   petCinderCrackle:4, petSummon:2.853,
   petFennelSpit:3.4, petQuillJab:3.8, petMarigoldBirth:3.2, petLullChord:3.6, petVesperRevive:2.9,
   petWidgetDrop:3.2, petWidgetBoom:2.4, petGrimShield:3.0, petGrimBlock:2.6,
-  alienSpawn_mite:4, alienDeath_mite:4, alienSpawn_ravager:3.59, alienDeath_ravager:4,
-  alienSpawn_bloat:4, alienDeath_bloat:4, alienSpawn_lurker:4, alienDeath_lurker:4,
-  alienSpawn_streak:4, alienDeath_streak:4, alienSpawn_sentry:3.848, alienDeath_sentry:3.906,
-  alienSpawn_splitjaw:3.78, alienDeath_splitjaw:3.701, alienBite:2.696, splitjawSplit:4, laserHit:1.05,
+  // Build 76 re-measure. Only the ids whose build() changed are re-stated: the 7 new
+  // alienHurt_*, the 7 re-authored alienDeath_*, and alienSpawn_mite (retuned). Peaks are
+  // the MEDIAN of 7 renders -- sfxNoise/sfxNoiseSweep draw fresh noise every call, so one
+  // render's peak varies by up to ~1 dB and a trim solved from it is not reproducible.
+  // 14 of the 15 clear the clamp and land on the -6 dBFS target rather than wherever the
+  // 4x ceiling happened to leave them. alienSpawn_mite is the deliberate exception: it is
+  // set so its A-WEIGHTED level through the phone model matches what build 75 shipped.
+  // Peak-matching was not enough -- at equal peak a burst centred at 2kHz carries more
+  // energy than one centred at 5kHz, so the retuned cue measured 1.8 dB louder to the ear
+  // and this scales that back out. The arrival keeps exactly the loudness players know;
+  // the 61-point drop in its >3kHz share is what actually removes the spike.
+  alienSpawn_mite:2.452, alienDeath_mite:3.184, alienHurt_mite:2.294,
+  alienSpawn_ravager:3.59, alienDeath_ravager:2.317, alienHurt_ravager:2.424,
+  alienSpawn_bloat:4, alienDeath_bloat:1.933, alienHurt_bloat:2.166,
+  alienSpawn_lurker:4, alienDeath_lurker:3.283, alienHurt_lurker:3.014,
+  alienSpawn_streak:4, alienDeath_streak:1.889, alienHurt_streak:2.06,
+  alienSpawn_sentry:3.848, alienDeath_sentry:2.099, alienHurt_sentry:2.489,
+  alienSpawn_splitjaw:3.78, alienDeath_splitjaw:2.258, alienHurt_splitjaw:2.463,
+  alienBite:2.696, splitjawSplit:4, laserHit:1.05,
   laserFire:4, laserUpgrade:4, heartbeatThump:2.2, reliefSting:2.2,
   uiTap:4, uiBuy:2.38, uiDeny:3.409, uiEggPlaced:1.88, uiStar1:2.022, uiStar2:1.972, uiStar3:1.861,
   uiPediaNew:3.628, uiPetSelect:4, uiMapOpen:4, uiQuitConfirm:2.552,
@@ -13482,10 +13505,24 @@ Sfx.register('petSummon', { category: 'pets', maxVoices: 1, build(ctx, dest) {
 } });
 
 // ---- ENEMIES ---- one parameterised shape per kind: pitchMul=1/durMul=1 for the
-// spawn roar, pitchMul<1/durMul<1 for the death cue — "a shortened, pitched-down
-// inverse of its spawn" by construction rather than two hand-written synths per kind.
+// spawn roar. Death is NO LONGER derived from this by pitch-shifting — see ALIEN_DEATH.
+//
+// BUILD 76 — THE BAND. The note above this file's sfx helpers assigns aliens ~40-260Hz,
+// with "laser fire/hit sit above that, they're a weapon cue, not the alien itself". That
+// choice is why the alien layer is inaudible on a handset: a phone loudspeaker is a
+// ~10mm driver in a few cc of air, with essentially no output below ~400-500Hz. Measured
+// against a 2nd-order 500Hz high-pass model of that driver, the shipped death cues lost
+// 8.7 to 35.6 dB — bloat's landed 36.4 dB under the loudest alien cue — which is exactly
+// the reported "aliens are silent when hit and when killed". Everything added or retuned
+// in this pass therefore sits in roughly 500Hz-2.8kHz: above the driver's roll-off, and
+// below the >3kHz band the beds were cleaned to in builds 74/75 — which is also the band
+// that produced the arrival spike.
 const ALIEN_VOICE = {
-  mite:     (ctx, dest, pm = 1, dm = 1) => { for (let i = 0; i < 5; i++) sfxNoise(ctx, dest, { dur: 0.02 * dm, vel: 0.08, hp: 2000 * pm, lp: 7000 * pm, t: i * 0.045 * dm }); return 0.25 * dm; },
+  // THE ARRIVAL SPIKE. Measured at 77.4% of its energy above 3kHz, centroid 4972Hz, and
+  // the single loudest alien cue through the phone model — so the one alien sound that
+  // reached the player at full strength was the one sitting in the ear's sorest region.
+  // Same five-tick rhythm, which IS the mite's identity; moved down out of that region.
+  mite:     (ctx, dest, pm = 1, dm = 1) => { for (let i = 0; i < 5; i++) sfxNoise(ctx, dest, { dur: 0.022 * dm, vel: 0.20, hp: 600 * pm, lp: 2600 * pm, t: i * 0.045 * dm }); return 0.25 * dm; },
   ravager:  (ctx, dest, pm = 1, dm = 1) => sfxWhir(ctx, dest, { dur: 0.35 * dm, vel: 0.16, freq: 70 * pm, amRate: 9, amDepth: 0.7, type: 'sawtooth' }),
   bloat:    (ctx, dest, pm = 1, dm = 1) => { sfxNoiseSweep(ctx, dest, { dur: 0.4 * dm, vel: 0.1, f0: 250 * pm, f1: 90 * pm, type: 'lowpass', qv: 2 }); return sfxNotes(ctx, dest, [{ type: 'sine', freq: 110 * pm, freq2: 60 * pm, dur: 0.35 * dm, vel: 0.12 }]); },
   lurker:   (ctx, dest, pm = 1, dm = 1) => sfxNoiseSweep(ctx, dest, { dur: 0.4 * dm, vel: 0.12, f0: 1800 * pm, f1: 900 * pm, type: 'bandpass', qv: 4 }),
@@ -13496,10 +13533,113 @@ const ALIEN_VOICE = {
                { type: 'square', freq: 170 * pm, freq2: 55 * pm, dur: 0.09 * dm, vel: 0.15, t: 0.11 * dm },
              ]),
 };
+// ---- HIT VOICES (build 76) ---- the alien's own reaction to taking damage.
+// Before this, the only thing that sounded on a laser hit was `laserHit` -- which is the
+// WEAPON: one shared cue for all seven kinds, registered under the 'aliens' category but
+// describing the beam, not the creature. It also measures -21.7 dB through the phone
+// model, near the bottom of the whole alien layer. So "aliens are silent when hit" was
+// literally true: nothing in the game ever voiced the alien itself.
+// These are SHORT (0.05-0.13s) and flat-or-rising. Death cues are longer and all fall.
+// That difference in gesture is what keeps the two readable apart through a phone
+// speaker with an invasion bed underneath, where timbre alone would not survive.
+const ALIEN_HURT = {
+  // bitten insect: two hard ticks and a squeak, nothing under the driver's floor
+  mite: (ctx, dest) => {
+    sfxNoise(ctx, dest, { dur: 0.018, vel: 0.20, hp: 900, lp: 2600 });
+    return sfxNotes(ctx, dest, [{ type: 'triangle', freq: 1500, freq2: 950, dur: 0.05, vel: 0.20, attack: 0.002 }]);
+  },
+  // the big one grunts; it does not squeal
+  ravager: (ctx, dest) => {
+    sfxNoise(ctx, dest, { dur: 0.03, vel: 0.14, hp: 500, lp: 1900 });
+    return sfxNotes(ctx, dest, [{ type: 'sawtooth', freq: 540, freq2: 300, dur: 0.12, vel: 0.22, attack: 0.004 }]);
+  },
+  // wet: a squelch closing, not a crack. Bloat is laserProof, so this is reached from
+  // feedAlien -- force-feeding is its ONLY damage path, by design.
+  bloat: (ctx, dest) => {
+    sfxNoiseSweep(ctx, dest, { dur: 0.13, vel: 0.13, f0: 1500, f1: 620, type: 'bandpass', qv: 2.2 });
+    return sfxNotes(ctx, dest, [{ type: 'sine', freq: 760, freq2: 450, dur: 0.13, vel: 0.24, attack: 0.006 }]);
+  },
+  // the plated one scrapes: metal on stone
+  lurker: (ctx, dest) => sfxNoiseSweep(ctx, dest, { dur: 0.10, vel: 1.15, f0: 950, f1: 1900, type: 'bandpass', qv: 5 }),
+  // the only hit that RISES: the fast one is startled, not wounded
+  streak: (ctx, dest) => sfxNotes(ctx, dest, [
+    { type: 'triangle', freq: 880, freq2: 1500, dur: 0.07, vel: 0.26, attack: 0.002 },
+  ]),
+  // a damaged circuit rather than a creature. Triangle, not square: a square at this
+  // pitch throws harmonics straight back into the >3kHz band this pass is clearing.
+  sentry: (ctx, dest) => {
+    sfxNoise(ctx, dest, { dur: 0.02, vel: 0.16, hp: 900, lp: 2600 });
+    return sfxNotes(ctx, dest, [{ type: 'triangle', freq: 2000, freq2: 1150, dur: 0.055, vel: 0.20, attack: 0.002 }]);
+  },
+  // two jaws, two snaps -- the same doubling that makes its spawn recognisable
+  splitjaw: (ctx, dest) => sfxNotes(ctx, dest, [
+    { type: 'triangle', freq: 1250, freq2: 780, dur: 0.045, vel: 0.22, t: 0,     attack: 0.002 },
+    { type: 'triangle', freq: 1050, freq2: 660, dur: 0.045, vel: 0.20, t: 0.055, attack: 0.002 },
+  ]),
+};
+
+// ---- DEATH VOICES (build 76) ---- previously derived from the spawn roar at pitch
+// x0.55 / duration x0.6, which made a death a quieter copy of the arrival rather than
+// its own event -- and put six of the seven below the phone driver's roll-off.
+// Dedicated shapes now, and every one of them FALLS: longer than the hit, descending,
+// and floored around 300-400Hz so the whole gesture stays on a handset instead of only
+// its onset.
+const ALIEN_DEATH = {
+  // the chitter runs down and stops
+  mite: (ctx, dest) => {
+    for (let i = 0; i < 4; i++)
+      sfxNoise(ctx, dest, { dur: 0.03, vel: 0.14 - i * 0.02, hp: 1500 - i * 300, lp: 2600 - i * 400, t: i * 0.05 });
+    return sfxNotes(ctx, dest, [{ type: 'triangle', freq: 1150, freq2: 430, dur: 0.16, vel: 0.16, t: 0.16, attack: 0.004 }]);
+  },
+  // the bark comes apart: a roar bending down with a noise tail under it
+  ravager: (ctx, dest) => {
+    sfxNoiseSweep(ctx, dest, { dur: 0.30, vel: 0.10, f0: 1500, f1: 420, type: 'bandpass', qv: 1.6 });
+    return sfxNotes(ctx, dest, [
+      { type: 'sawtooth', freq: 620, freq2: 330, dur: 0.30, vel: 0.24, attack: 0.006 },
+      { type: 'triangle', freq: 930, freq2: 460, dur: 0.20, vel: 0.12, t: 0.05 },
+    ]);
+  },
+  // the one you kill by force-feeding should sound like it is emptying
+  bloat: (ctx, dest) => {
+    sfxNoiseSweep(ctx, dest, { dur: 0.42, vel: 0.15, f0: 1900, f1: 480, type: 'bandpass', qv: 1.4 });
+    return sfxNotes(ctx, dest, [{ type: 'sine', freq: 700, freq2: 330, dur: 0.40, vel: 0.26, attack: 0.010 }]);
+  },
+  // the scrape collapses
+  lurker: (ctx, dest) => {
+    sfxNoiseSweep(ctx, dest, { dur: 0.34, vel: 0.20, f0: 1800, f1: 470, type: 'bandpass', qv: 4 });
+    return sfxNotes(ctx, dest, [{ type: 'triangle', freq: 840, freq2: 400, dur: 0.26, vel: 0.15, t: 0.06 }]);
+  },
+  // the yelp that rose on a hit now falls away: same voice, opposite gesture
+  streak: (ctx, dest) => sfxNotes(ctx, dest, [
+    { type: 'triangle', freq: 1600, freq2: 560, dur: 0.26, vel: 0.28, attack: 0.003 },
+    { type: 'sine',     freq: 1100, freq2: 420, dur: 0.20, vel: 0.14, t: 0.07 },
+  ]),
+  // power-down: the tremolo keeps its identity while the pitch drops out from under it
+  sentry: (ctx, dest) => {
+    sfxWhir(ctx, dest, { dur: 0.30, vel: 0.16, freq: 760, amRate: 11, amDepth: 0.7, type: 'triangle' });
+    return sfxNotes(ctx, dest, [{ type: 'triangle', freq: 1700, freq2: 440, dur: 0.30, vel: 0.16, attack: 0.004 }]);
+  },
+  // three snaps, slowing and falling: the double jaw giving out
+  splitjaw: (ctx, dest) => sfxNotes(ctx, dest, [
+    { type: 'triangle', freq: 1150, freq2: 640, dur: 0.06, vel: 0.24, t: 0,     attack: 0.002 },
+    { type: 'triangle', freq: 900,  freq2: 500, dur: 0.07, vel: 0.21, t: 0.075, attack: 0.002 },
+    { type: 'triangle', freq: 700,  freq2: 380, dur: 0.11, vel: 0.18, t: 0.175, attack: 0.003 },
+  ]),
+};
+
+// Hit voices are the only alien cue that can arrive several times a second, so they get
+// their own anti-stack window instead of the engine default of 0.06s. 0.12s is twice the
+// default: a deliberate tapper tops out around 6-8 taps/s and hears every one of them,
+// while a burst faster than that collapses into a single read. Two mites hit inside the
+// same window share one voice on purpose -- the id is per KIND, so it reports "a mite
+// was hurt", not "this particular mite was hurt", which is the fact the player needs.
+const ALIEN_HURT_CD = 0.12;
+
 for (const kind in ALIEN_VOICE) {
-  const fn = ALIEN_VOICE[kind];
-  Sfx.register('alienSpawn_' + kind, { category: 'aliens', maxVoices: 3, build: (ctx, dest) => fn(ctx, dest, 1, 1) });
-  Sfx.register('alienDeath_' + kind, { category: 'aliens', maxVoices: 3, build: (ctx, dest) => fn(ctx, dest, 0.55, 0.6) });
+  const spawn = ALIEN_VOICE[kind];
+  Sfx.register('alienSpawn_' + kind, { category: 'aliens', maxVoices: 3, build: (ctx, dest) => spawn(ctx, dest, 1, 1) });
+  Sfx.register('alienHurt_'  + kind, { category: 'aliens', maxVoices: 2, minInterval: ALIEN_HURT_CD, build: ALIEN_HURT[kind] });
+  Sfx.register('alienDeath_' + kind, { category: 'aliens', maxVoices: 3, build: ALIEN_DEATH[kind] });
 }
 Sfx.register('alienBite', { category: 'aliens', maxVoices: 3, build(ctx, dest) {
   sfxNoise(ctx, dest, { dur: 0.08, vel: 0.16, hp: 100, lp: 2500 });
@@ -17155,6 +17295,16 @@ const BED_INV_IDS = ['tank1_inv', 'tank2_inv', 'tank3_inv', 'tank4_inv', 'tank5_
 // real instrument played harder -- the upper partials.
 const BED_INV_CUT = [700, 7000];    // Hz, at intensity 0 -> 1, interpolated in log space
 const BED_INV_GAIN = [0.85, 1.15];  // multiplies BED_MAKEUP
+// Build 76 transition times. The incoming bed's level fade (BED_INV_FADE, set at the
+// Beds.play call site) overlaps the outgoing calm bed's 0.25s stop, so the two cross
+// rather than leaving a hole; 0.35s is an order of magnitude longer than the ~20-40ms
+// the ear integrates as a transient, so no arrival can read as a click or a jump.
+// BED_INV_OPEN is deliberately longer again: the filter reaching its tier AFTER the
+// level has arrived is what makes the escalation read as leaning in. 0.45s is still
+// comfortably inside the beat an alien takes to cross into the tank, so build 75's
+// escalation survives intact -- verified by measuring the same 2s window before/after.
+const BED_INV_OPEN = 0.45;          // s, spawn -> seeded cutoff
+const BED_INV_FADE = 350;           // ms, invasion bed fade-in (was 200 and cancelled)
 // Levels the beds against the live synth so switching paths is not a volume change.
 // Re-measure with scratchpad/music/match_beds.py if the beds are ever re-normalised.
 // Measured on this build with an analyser tapped off Snd.master: the beds ran
@@ -17170,6 +17320,10 @@ const Beds = {
   _load: Object.create(null),     // id -> in-flight Promise (dedupes concurrent asks)
   _dead: Object.create(null),     // id -> true once it has failed; never retried
   _src: null, _gain: null, _filt: null,
+  // _liveId is the bed actually SOUNDING. Distinct from _want, which is the bed we
+  // intend to hear next and is already reassigned while the previous one fades out --
+  // tiering has to follow the live one or exitInvasion retiers the outgoing bed.
+  _liveId: null,
   _invLive: false, _intensity: 0.5,
   _want: null,                    // the id we intend to be hearing, set synchronously
 
@@ -17214,15 +17368,38 @@ const Beds = {
     });
   },
 
+  // Returns the gain and cutoff this bed should sit at for a given intensity. Pulled
+  // out of setIntensity so _start can ramp straight to the tiered target instead of
+  // ramping to BED_MAKEUP and then being corrected -- that correction is what broke the
+  // fade-in (see the note in _start).
+  _tier(id, t) {
+    if (!this.isInv(id)) return { gain: BED_MAKEUP, hz: 20000 };
+    const v = Math.max(0, Math.min(1, t));
+    return {
+      gain: BED_MAKEUP * (BED_INV_GAIN[0] + (BED_INV_GAIN[1] - BED_INV_GAIN[0]) * v),
+      hz: BED_INV_CUT[0] * Math.pow(BED_INV_CUT[1] / BED_INV_CUT[0], v),
+    };
+  },
+
   _start(buf, id, fadeMs) {
     this.stop(0.25);
     const ctx = Snd.ctx, now = ctx.currentTime;
+    const inv = this.isInv(id);
+    const tier = this._tier(id, this._intensity);
     const g = ctx.createGain();
     g.gain.setValueAtTime(0.0001, now);
     // NOT musicGainTrim(id): that table (0.563 .. 2.428, a 4.3x spread) corrects the
     // SYNTH renders track by track. The beds were already two-pass loudness-matched to
     // within 0.62 dB of each other, so applying it would undo exactly that work.
-    g.gain.linearRampToValueAtTime(BED_MAKEUP,
+    // Ramp to the TIERED target, not to BED_MAKEUP. Build 75 ramped to BED_MAKEUP and
+    // then called setIntensity() on the next line to apply the tier; setIntensity opens
+    // with cancelScheduledValues(now), which removed BOTH the 0.0001 start and this ramp
+    // because both were scheduled at/after `now`. With its whole schedule gone the param
+    // fell back to the GainNode default of 1.0 -- so every invasion bed ENTERED at 1.0
+    // and decayed to 0.377 over ~150ms. Measured: +8.7 dB of intended level at the
+    // moment an alien arrives, +14.4 dB broadband in the rendered output. Same family as
+    // the build-75 connect bug: an AudioParam reading its constructor default.
+    g.gain.linearRampToValueAtTime(tier.gain,
                                    now + Math.max(0.05, (fadeMs || 800) / 1000));
     g.connect(Snd.musicDuck);                 // <- the synth's own bus node. Dropped by
     // the build-75 filter edit, which silenced every bed: the chain ran src -> filt -> g
@@ -17236,10 +17413,14 @@ const Beds = {
     filt.Q.value = 0.7;                       // gentle -- a resonant peak here would be
                                               // a new spike, which is the whole fault
                                               // this pass exists to remove
-    filt.frequency.setValueAtTime(this.isInv(id) ? BED_INV_CUT[0] : 20000, now);
+    filt.frequency.setValueAtTime(inv ? BED_INV_CUT[0] : 20000, now);
+    // Open to the seeded tier over BED_INV_OPEN rather than snapping. Deliberately a
+    // little SLOWER than the gain fade: level arrives first, brightness follows, which
+    // is what reads as the music leaning in rather than being switched on.
+    if (inv) filt.frequency.linearRampToValueAtTime(tier.hz, now + BED_INV_OPEN);
     filt.connect(g);
     this._filt = filt;
-    this._invLive = this.isInv(id);
+    this._invLive = inv;
     const src = ctx.createBufferSource();
     src.buffer = buf;
     src.loop = true;
@@ -17254,8 +17435,9 @@ const Beds = {
     // Leaving loopStart/loopEnd unset loops the whole buffer, which is what we want.
     src.connect(filt);
     src.start(now, 0);
-    this._src = src; this._gain = g;
-    if (this._invLive) this.setIntensity(this._intensity, 0.05);
+    this._src = src; this._gain = g; this._liveId = id;
+    // NO setIntensity() here. _tier above already put both ramps on the right targets,
+    // and calling it would cancel them -- which is exactly the bug described above.
   },
 
   // Drives the invasion tiering. Called from Music.setIntensity, which the game already
@@ -17268,13 +17450,25 @@ const Beds = {
     // log interpolation: pitch/brightness is perceived logarithmically, so a linear
     // sweep from 700Hz would spend most of its travel in a range the ear barely
     // separates and then lurch at the top.
-    const hz = BED_INV_CUT[0] * Math.pow(BED_INV_CUT[1] / BED_INV_CUT[0], t);
-    const gn = BED_MAKEUP * (BED_INV_GAIN[0] + (BED_INV_GAIN[1] - BED_INV_GAIN[0]) * t);
+    const tier = this._tier(this._liveId, t);
+    const hz = tier.hz, gn = tier.gain;
+    // HOLD, then retarget. cancelScheduledValues() on its own does not freeze a ramp in
+    // flight: it deletes the future events and the param falls back to the value of the
+    // last event still standing. During an entry fade that is the 0.0001 start, so an
+    // alien count changing mid-fade would have dropped the bed to silence; with nothing
+    // standing at all it is the node's constructor default, which is how build 75
+    // entered at gain 1.0. Reading .value and pinning it at `now` first makes this safe
+    // to call at any moment, in either direction -- including kills closing the filter
+    // back down, which ramp on the same path with the default 0.35s time constant.
     try {
+      const hzNow = this._filt.frequency.value;
       this._filt.frequency.cancelScheduledValues(now);
+      this._filt.frequency.setValueAtTime(hzNow, now);
       this._filt.frequency.setTargetAtTime(hz, now, ramp);
       if (this._gain) {
+        const gNow = this._gain.gain.value;
         this._gain.gain.cancelScheduledValues(now);
+        this._gain.gain.setValueAtTime(gNow, now);
         this._gain.gain.setTargetAtTime(gn, now, ramp);
       }
     } catch (e) { /* node torn down mid-ramp */ }
@@ -17283,6 +17477,7 @@ const Beds = {
   stop(fade = 0.3) {
     const src = this._src, g = this._gain;
     this._src = null; this._gain = null; this._filt = null; this._invLive = false;
+    this._liveId = null;
     if (!src || !Snd.ctx) return;
     const now = Snd.ctx.currentTime;
     try {
@@ -17342,7 +17537,7 @@ Music.enterInvasion = function (tank, count) {
     Beds._intensity = Math.max(0, Math.min(1, want));
     Music._intensity = Beds._intensity;
     Music._invasionTank = tank;
-    Beds.play(invId, 200);
+    Beds.play(invId, BED_INV_FADE);
     return;
   }
   Beds._want = null;
