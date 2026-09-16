@@ -863,7 +863,7 @@ const ALIENS_V2 = BUILD_FLAGS.dev && QS.get('aliens') === 'v2';
 // procedural set is approved. Art only -- no behaviour, economy, persistence, or any
 // change to which pet hatches where.
 const PETS_V2 = BUILD_FLAGS.dev && QS.get('pets') === 'v2';
-const GAME_BUILD = 74;
+const GAME_BUILD = 75;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -17141,6 +17141,20 @@ if (typeof Capacitor !== 'undefined' && Capacitor.isNativePlatform && Capacitor.
 // back permanently. Bed playback is strictly an enhancement over a working game.
 const BED_DIR    = 'music/';
 const BED_IDS    = ['menu', 'map', 'tank1', 'tank2', 'tank3', 'tank4', 'tank5', 'tank6', 'tank7'];
+// BUILD 75 -- the invasion themes were the last synth material and the spikiest in the
+// game: measured 31.6-42.9% of energy above 3kHz (the calm synth was 44.8%), on loops
+// of ONE BAR, 1.85-2.70s, under the most stressful part of play. The beds replacing
+// them sit at 9.6-13.8%.
+const BED_INV_IDS = ['tank1_inv', 'tank2_inv', 'tank3_inv', 'tank4_inv', 'tank5_inv',
+                     'tank6_inv', 'tank7_inv'];
+// A single recorded file cannot tier the way a layered synth session does, and losing
+// the escalation was the stated reason build 73/74 left invasion on the synth. It is
+// recovered here WITHOUT extra files: a lowpass that opens and a gain that lifts as the
+// live alien count rises. Opening a filter is the oldest trick in game audio for this
+// and it reads as the music "leaning in", because it is exactly what gets louder in a
+// real instrument played harder -- the upper partials.
+const BED_INV_CUT = [700, 7000];    // Hz, at intensity 0 -> 1, interpolated in log space
+const BED_INV_GAIN = [0.85, 1.15];  // multiplies BED_MAKEUP
 // Levels the beds against the live synth so switching paths is not a volume change.
 // Re-measure with scratchpad/music/match_beds.py if the beds are ever re-normalised.
 // Measured on this build with an analyser tapped off Snd.master: the beds ran
@@ -17155,12 +17169,17 @@ const Beds = {
   _buf: Object.create(null),      // id -> decoded AudioBuffer
   _load: Object.create(null),     // id -> in-flight Promise (dedupes concurrent asks)
   _dead: Object.create(null),     // id -> true once it has failed; never retried
-  _src: null, _gain: null,
+  _src: null, _gain: null, _filt: null,
+  _invLive: false, _intensity: 0.5,
   _want: null,                    // the id we intend to be hearing, set synchronously
 
   // A track is bed-backed only if the layer is on, the id ships a bed, and that bed
   // has not already failed this session.
-  has(id) { return this.on && BED_IDS.indexOf(id) !== -1 && !this._dead[id]; },
+  has(id) {
+    if (!this.on || this._dead[id]) return false;
+    return BED_IDS.indexOf(id) !== -1 || BED_INV_IDS.indexOf(id) !== -1;
+  },
+  isInv(id) { return BED_INV_IDS.indexOf(id) !== -1; },
 
   _fetch(id) {
     if (this._buf[id]) return Promise.resolve(this._buf[id]);
@@ -17205,7 +17224,22 @@ const Beds = {
     // within 0.62 dB of each other, so applying it would undo exactly that work.
     g.gain.linearRampToValueAtTime(BED_MAKEUP,
                                    now + Math.max(0.05, (fadeMs || 800) / 1000));
-    g.connect(Snd.musicDuck);
+    g.connect(Snd.musicDuck);                 // <- the synth's own bus node. Dropped by
+    // the build-75 filter edit, which silenced every bed: the chain ran src -> filt -> g
+    // -> nothing. A disconnected node is also not processed by the rendering thread, so
+    // its AudioParams read back as defaults (350 Hz / 1.0) -- which is what made this
+    // look like an automation bug rather than a missing edge.
+    // The filter is always in the chain so calm and invasion share one code path; for
+    // a calm bed it is parked wide open at 20kHz and never touched again.
+    const filt = ctx.createBiquadFilter();
+    filt.type = 'lowpass';
+    filt.Q.value = 0.7;                       // gentle -- a resonant peak here would be
+                                              // a new spike, which is the whole fault
+                                              // this pass exists to remove
+    filt.frequency.setValueAtTime(this.isInv(id) ? BED_INV_CUT[0] : 20000, now);
+    filt.connect(g);
+    this._filt = filt;
+    this._invLive = this.isInv(id);
     const src = ctx.createBufferSource();
     src.buffer = buf;
     src.loop = true;
@@ -17218,14 +17252,37 @@ const Beds = {
     // strips the padding -- a 32.000s encode decodes to exactly 32.000000s / 1536000
     // frames with full energy at both ends -- so there is nothing to trim.
     // Leaving loopStart/loopEnd unset loops the whole buffer, which is what we want.
-    src.connect(g);
+    src.connect(filt);
     src.start(now, 0);
     this._src = src; this._gain = g;
+    if (this._invLive) this.setIntensity(this._intensity, 0.05);
+  },
+
+  // Drives the invasion tiering. Called from Music.setIntensity, which the game already
+  // keeps in step with the live alien count every frame via updateInvasionIntensity --
+  // so this inherits the existing escalation curve rather than inventing a second one.
+  setIntensity(v, ramp = 0.35) {
+    this._intensity = Math.max(0, Math.min(1, v));
+    if (!this._invLive || !this._filt || !Snd.ctx) return;
+    const t = this._intensity, now = Snd.ctx.currentTime;
+    // log interpolation: pitch/brightness is perceived logarithmically, so a linear
+    // sweep from 700Hz would spend most of its travel in a range the ear barely
+    // separates and then lurch at the top.
+    const hz = BED_INV_CUT[0] * Math.pow(BED_INV_CUT[1] / BED_INV_CUT[0], t);
+    const gn = BED_MAKEUP * (BED_INV_GAIN[0] + (BED_INV_GAIN[1] - BED_INV_GAIN[0]) * t);
+    try {
+      this._filt.frequency.cancelScheduledValues(now);
+      this._filt.frequency.setTargetAtTime(hz, now, ramp);
+      if (this._gain) {
+        this._gain.gain.cancelScheduledValues(now);
+        this._gain.gain.setTargetAtTime(gn, now, ramp);
+      }
+    } catch (e) { /* node torn down mid-ramp */ }
   },
 
   stop(fade = 0.3) {
     const src = this._src, g = this._gain;
-    this._src = null; this._gain = null;
+    this._src = null; this._gain = null; this._filt = null; this._invLive = false;
     if (!src || !Snd.ctx) return;
     const now = Snd.ctx.currentTime;
     try {
@@ -17260,13 +17317,60 @@ Music.play = function (trackId, opts = {}) {
 };
 
 // enterInvasion builds its session directly via makeSession -- it does NOT route
-// through Music.play -- so it needs its own hook to clear the bed. exitInvasion does
-// call this.play(calmId, ...), so the bed comes back through the interceptor above.
+// through Music.play -- so it needs its own hook. exitInvasion does call
+// this.play(calmId, ...), so the calm bed comes back through the interceptor above.
+//
+// BUILD 75: invasion now plays a BED too, where one exists. What is deliberately kept
+// on the synth even in bed mode:
+//   - the special ambience layers (bloat drone, sentry tick, blackout drone). Those are
+//     GAMEPLAY FEEDBACK keyed to which alien is on screen, not music, and baking them
+//     into a file would decouple them from the thing they report.
+//   - the kill stinger and wrongChord, for the same reason.
+//   - the resolution phrase on exitInvasion, which is played in the tank's own key.
+// The synth's invasion SESSION is what the bed replaces, and only that.
 Music._enterInvasionSynth = Music.enterInvasion.bind(Music);
 Music.enterInvasion = function (tank, count) {
+  const invId = (typeof deriveInvasionTrack === 'function')
+    ? deriveInvasionTrack(TANK_TRACK_ID[tank]) : null;
+  if (invId && Beds.has(invId)) {
+    Music._stopTension();
+    Music._stopSynth(0);              // hard cut, matching the synth path's own contract
+    // Seed the tier from the same curve the synth session would have used, so the
+    // opening intensity matches the alien count rather than starting from a default.
+    const want = Music._invasionIntensityFor
+      ? Music._invasionIntensityFor(count, Game.mods) : 0.6;
+    Beds._intensity = Math.max(0, Math.min(1, want));
+    Music._intensity = Beds._intensity;
+    Music._invasionTank = tank;
+    Beds.play(invId, 200);
+    return;
+  }
   Beds._want = null;
   Beds.stop(0.2);
   return Music._enterInvasionSynth(tank, count);
+};
+
+// updateInvasionIntensity early-returns unless a SYNTH session whose id ends in '_inv'
+// is live, so in bed mode it would never fire and the tiering would be dead. This hook
+// routes the same computed intensity into the bed's filter instead.
+Music._updateInvasionIntensitySynth = Music.updateInvasionIntensity.bind(Music);
+Music.updateInvasionIntensity = function (aliveAliens) {
+  if (Beds._invLive) {
+    if (!Music.on) return;
+    const want = Music._invasionIntensityFor
+      ? Music._invasionIntensityFor(aliveAliens.length, Game.mods) : Beds._intensity;
+    if (want !== Beds._intensity) { Music._intensity = want; Beds.setIntensity(want); }
+    return;
+  }
+  return Music._updateInvasionIntensitySynth(aliveAliens);
+};
+
+// setIntensity is also called directly (exitInvasion drops to 0.3, the ambient driver
+// moves it during calm play), so the bed follows it on the same hook.
+Music._setIntensitySynth = Music.setIntensity.bind(Music);
+Music.setIntensity = function (v) {
+  if (Beds._invLive) { Beds.setIntensity(v); Music._intensity = v; return; }
+  return Music._setIntensitySynth(v);
 };
 
 // Music.stop() means "all music off" and must take the bed with it, otherwise pausing
