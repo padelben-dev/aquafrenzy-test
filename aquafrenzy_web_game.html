@@ -863,7 +863,7 @@ const ALIENS_V2 = BUILD_FLAGS.dev && QS.get('aliens') === 'v2';
 // procedural set is approved. Art only -- no behaviour, economy, persistence, or any
 // change to which pet hatches where.
 const PETS_V2 = BUILD_FLAGS.dev && QS.get('pets') === 'v2';
-const GAME_BUILD = 73;
+const GAME_BUILD = 74;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -17148,7 +17148,7 @@ const BED_IDS    = ['menu', 'map', 'tank1', 'tank2', 'tank3', 'tank4', 'tank5', 
 // synth 0.012728). The SFX mix was balanced against the SYNTH's level, so the beds
 // move to meet it rather than the reverse -- a bed that sits on top of the SFX is
 // the same mistake in the other direction. 1/10.94dB = 0.284.
-const BED_MAKEUP = 0.284;   // measured, not guessed -- see the comment above
+const BED_MAKEUP = 0.366;   // measured, not guessed -- see the comment above
 
 const Beds = {
   on: true,
@@ -17209,11 +17209,15 @@ const Beds = {
     const src = ctx.createBufferSource();
     src.buffer = buf;
     src.loop = true;
-    // mp3 carries encoder delay/padding that decodeAudioData does not reliably strip,
-    // so the loop is pulled in ~25ms at both ends. The loop was cut with a 2s
-    // crossfade, so trimming 25ms off it costs nothing audible and removes the seam.
-    src.loopStart = 0.025;
-    src.loopEnd = Math.max(0.05, buf.duration - 0.025);
+    // EXACT wrap, deliberately. An earlier build trimmed 25ms off each end to hide mp3
+    // encoder padding -- copied from the spike, where the bed was NOT crossfade-cut.
+    // That is wrong here and was audible as a cut once per loop: these beds are built
+    // with an equal-power crossfade whose whole point is that out[L-1] -> out[0] is
+    // continuous, so removing 50ms straddling that exact join breaks the one thing the
+    // crossfade guarantees. Measured on this build, Chrome's decodeAudioData already
+    // strips the padding -- a 32.000s encode decodes to exactly 32.000000s / 1536000
+    // frames with full energy at both ends -- so there is nothing to trim.
+    // Leaving loopStart/loopEnd unset loops the whole buffer, which is what we want.
     src.connect(g);
     src.start(now, 0);
     this._src = src; this._gain = g;
