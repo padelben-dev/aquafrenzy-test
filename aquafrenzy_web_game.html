@@ -863,7 +863,7 @@ const ALIENS_V2 = BUILD_FLAGS.dev && QS.get('aliens') === 'v2';
 // procedural set is approved. Art only -- no behaviour, economy, persistence, or any
 // change to which pet hatches where.
 const PETS_V2 = BUILD_FLAGS.dev && QS.get('pets') === 'v2';
-const GAME_BUILD = 68;
+const GAME_BUILD = 72;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -2569,15 +2569,15 @@ const PETS = [
   { id:'tuck',    name:'Tuck the Snail',           desc:'Crawls the tank floor and collects any coins you miss. Hides while aliens are in the tank.' },
   { id:'barnaby', name:'Barnaby the Oyster',       desc:'Shuts his shell over any baby sunfin beside him when aliens arrive \u2014 two at a time, and you cannot feed them in there.' },
   { id:'quill',   name:'Quill the Needlefish',     desc:'Attacks any alien in the tank. Each jab does exactly the damage of a level 1 laser.' },
-  { id:'marigold',name:'Marigold the Nursefish',   desc:'Gives birth to a baby sunfin every 26 seconds. She will not breed during an alien attack.' },
+  { id:'marigold',name:'Marigold the Nursefish',   desc:'Gives birth to a baby sunfin every 26 seconds, but never lets her own brood outgrow the school she is tending — and she brings a bigger brood to the deeper tanks. She will not breed during an alien attack.' },
   { id:'fennel',  name:'Fennel the Seahorse',      desc:'Spits a level 2 pellet at nearby hungry fish every 3 seconds — and it never counts against your food limit.' },
   { id:'dollop',  name:'Dollop the Jellyfish',     desc:'Swims the whole tank \u2014 floor to surface \u2014 collecting coins, and never hides when aliens arrive.' },
-  { id:'rattle',  name:'Rattle the Skeleton',      desc:'Drops a $35 gold coin every 6 seconds. He is already dead, so he never needs feeding.' },
+  { id:'rattle',  name:'Rattle the Skeleton',      desc:'Drops a $35 gold coin every 6 seconds until the gold he carried up runs out — about half an egg piece’s worth per tank. He is already dead, so he never needs feeding.' },
   { id:'clatter', name:'Clatter the Fiddler Crab', desc:'Hits aliens hard, but only ones that come near the bottom of the tank.' },
-  { id:'lull',    name:'Lull the Siren',           desc:'Sings, and every grown sunfin drops three coins at once.' },
+  { id:'lull',    name:'Lull the Siren',           desc:'Sings in bursts — a five-second song, then a long breath. While her song is up, every grown sunfin drops three coins at once.' },
   { id:'gunther', name:'Gunther the Whale',        desc:'Hides all of your baby and medium sunfins in his mouth during an alien attack. You cannot feed them in there.' },
   { id:'plod',    name:'Plod the Turtle',          desc:'Everything that falls in your tank falls at half speed.' },
-  { id:'widget',  name:'Widget the Automaton',     desc:'Drops a bomb every 18 seconds. Worth $150 if you tap it — and it kills any fish it touches.' },
+  { id:'widget',  name:'Widget the Automaton',     desc:'Drops a bomb every 18 seconds until his scrap runs out — not quite half an egg piece, and never more scrap than the tank he is working in is worth. Worth $150 if you tap it — and it kills any fish it touches.' },
   { id:'beacon',  name:'Beacon the Angler',        desc:'Lures every sunfin to him during an attack \u2014 they will leave their food to come \u2014 and hides in the corner furthest from the aliens.' },
   { id:'echo',    name:'Echo the Porpoise',        desc:'Opens the laser and egg slots without making you buy a special fish first, and flags any fish that is about to starve.' },
   { id:'nettle',  name:'Nettle the Hermit Crab',   desc:'Snaps at any fish near the floor, pushing them back up where the coins fall slower.' },
@@ -6054,6 +6054,7 @@ function spawnSunfin(x, y, stage, banked = 0) {
   // Phase 7D visual-only state channels. None of these touch hunger, thresholds or any
   // CFG number -- they exist purely so fishTint has one unambiguous input per state.
   f.fedT = 0; f.eatFlash = 0; f.buffRim = null; f.shield = false;
+  f.nurse = null;   // Phase 9B-7: whose nursery this baby is. Pooled body -- must reset.
   return f;
 }
 
@@ -6079,6 +6080,7 @@ function spawnSpecial(kind, x, y) {
   // Phase 7D visual-only state channels. None of these touch hunger, thresholds or any
   // CFG number -- they exist purely so fishTint has one unambiguous input per state.
   f.fedT = 0; f.eatFlash = 0; f.buffRim = null; f.shield = false;
+  f.nurse = null;   // Phase 9B-7: whose nursery this baby is. Pooled body -- must reset.
   return f;
 }
 
@@ -6193,9 +6195,11 @@ const PET_BEHAVIOR = {
                                              speed: 88, zone: 'any' } },
   // producer — "a baby sunfin every 26 seconds, will not breed during an alien attack".
   marigold: { bucket: 'producer',  params: { interval: 26, what: 'sunfin', cap: 60,
+                                             broodPerEgg: 300, broodShare: 1, broodFree: 2,
                                              pauseInInvasion: true } },
   // amplifier — "every grown sunfin drops three coins at once".
   lull:     { bucket: 'amplifier', params: { stat: 'sunfinCoins', mult: 3,
+                                             song: 5, songRest: 36,
                                              ring: 2.4, ringSfx: 'petLullChord' } },
   // utility — "swims to dead fish and revives them; cannot bring back anything eaten".
   // The cooldown is the weakness: she cannot paper over a player who stops feeding.
@@ -6250,7 +6254,8 @@ const PET_BEHAVIOR = {
                                               move: 'floorPatrol', moveSpeed: 8, floorGap: 8 } },
   // producer — "Drops a $35 gold coin every 6 seconds. He is already dead, so he never
   // needs feeding." FLAT: $35 is still $35 in tank 7, so he fades on his own.
-  rattle:   { bucket: 'producer',   params: { interval: 6, what: 'coin', coinType: 'gold' } },
+  rattle:   { bucket: 'producer',   params: { interval: 6, what: 'coin', coinType: 'gold',
+                                              purseEggs: 0.6 } },
   // defender — "Hits aliens hard, but only ones that come near the bottom of the tank."
   // The zone IS the weakness: anything that stays high is still the player's problem.
   // FLAT damage, like Quill — an early-game hitter by design.
@@ -6329,15 +6334,19 @@ const PET_BEHAVIOR = {
   echo:     { bucket: 'controller', params: { effect: 'unlock', grants: 'specialGate',
                                               flagStarve: true, move: 'drift' } },
 
-  // WIDGET - income, AND THE ONE EXPECTED TO FAIL THE GUARD. "Drops a bomb every 18
-  // seconds. Worth $150 if you tap it -- and it kills any fish it touches." As a plain
-  // faucet that is $150/18s = $500/min against tank 3's measured $1,221/min = 41%, which
-  // is bigger than Rattle and Rattle already breaches. Shipped at FULL STRENGTH with the
-  // downside made real instead of the number cut: an untapped bomb kills a GROWN sunfin,
-  // which is $35/5.5s = $382/min of destroyed engine. That turns a flat faucet into an
-  // attention check with a genuine loss, and it is the version the guard should judge.
+  // WIDGET - income. "Drops a bomb every 18 seconds. Worth $150 if you tap it -- and it
+  // kills any fish it touches." As a plain faucet that is $150/18s = $500/min against
+  // tank 3's measured $1,221/min = 41%, which is bigger than Rattle and Rattle already
+  // breaches. He was shipped at full strength on the theory that the downside paid for
+  // it: an untapped bomb kills a GROWN sunfin, $35/5.5s = $382/min of destroyed engine.
+  // MEASURED, THAT DOWNSIDE NEVER FIRES -- 0 detonations in ~400 scripted runs across 11
+  // stages, because a $150 bomb is the most valuable object on the board and so is always
+  // the next thing collected, and because detonateBomb only takes stage-3 sunfins while a
+  // played-out school sits at stage 2. So he is a pure faucet and the purse is the whole
+  // of his balance. Two keys, not one -- see the producer bucket for why the stage's egg
+  // alone hands a tank-1 engine a tank-5 purse.
   widget:   { bucket: 'producer',   params: { interval: 18, what: 'bomb', fuse: 5,
-                                              value: 150 } },
+                                              value: 150, purseEggs: 0.45, purseTank: 5 } },
 
   // GRIM - defence, BANKED. "His mouth is bigger than he is. Once per attack he swallows
   // an alien bite meant for your fish." Sleet's card cashes out as the same thing -- one
@@ -6784,20 +6793,85 @@ const PET_BUCKETS = {
   // Spawns something on a timer. pauseInInvasion holds the timer where it is rather than
   // resetting it, so an attack delays the birth instead of cancelling it.
   producer: {
-    init(p, q) { p.t = q.interval; },
+    // Phase 9B-6: a producer may carry a PER-STAGE BUDGET, and the budget is denominated in
+    // the stage's own egg price because that is the only quantity that meaningfully changes
+    // across the campaign -- every stage opens with the same two sunfins and 140-320 of
+    // float, while the egg runs 150 to 55,000. Measured, Rattle and Widget each pay out
+    // 1.8-3.7 egg pieces on tanks 1-3 and only 0.2-0.3 on tank 7, so a one-egg purse bites
+    // exactly where they dominate and is never reached where they already fade.
+    //   purseEggs   - total COIN VALUE this pet may drop, as a multiple of Game.eggPrice
+    //   broodPerEgg - births allowed = max(2, floor(Game.eggPrice / broodPerEgg))
+    init(p, q) { p.t = q.interval; p.spent = 0; p.born = 0; },
     update(p, q, dt) {
       p.x = clamp(p.x + Math.cos(Game.time * 0.6) * 20 * S * dt, 30, W - 30);
       p.y = clamp(p.y + Math.sin(Game.time * 0.9) * 14 * S * dt, TANK_TOP + 40 * S, SAND_TOP - 30 * S);
       p.dir = Math.cos(Game.time * 0.6) > 0 ? 1 : -1;
       if (q.pauseInInvasion && Game.invasion) return;
+      // An empty purse stops the timer too, so a spent pet idles instead of banking ticks
+      // it could spend the instant something refilled it.
+      //
+      // Phase 9B-8: `purseTank` is the SECOND key, and it exists because the first one
+      // runs away. Egg price is the only quantity in the game that scales across the
+      // campaign -- coin values [0,15,35,200], SUNFIN_COST, the food prices and Widget's
+      // own 18s interval are all flat -- so an egg-denominated purse is the only kind
+      // that can grow. But the egg does not only grow BETWEEN tanks, it explodes WITHIN
+      // one: tank 1 runs 150 -> 5,000 (33x) on a single engine, and measured across
+      // 1-1..1-5 that handed Widget 1, 2, 8, 12 and 20 bombs for the same four-fish
+      // school and left holes at -18.0 (1-3) and -20.5 (1-4), both worse than anything
+      // on the sampled spine. The tank's OPENING egg is the ladder that does step with
+      // the engine and never jumps mid-tank -- 150 / 750 / 1000 / 3000 / 5000 / 10000 /
+      // 15000 -- so it is the scale his scrap is sized to. The stage's own egg still
+      // governs at the bottom of a tank (1-1 is a 124s stage and must stay at one bomb);
+      // the tank cap only catches the stages where the price tag has outrun the water.
+      //   purseEggs - total COIN VALUE allowed, as a multiple of THIS stage's egg
+      //   purseTank - ... but never more than this many of the TANK's opening egg
+      if (q.purseEggs) {
+        let purse = q.purseEggs * Game.eggPrice;
+        if (q.purseTank) purse = Math.min(purse, q.purseTank * LEVELS[Game.tank][0].egg);
+        if (p.spent >= purse) return;
+      }
+      // Phase 9B-7: a NURSERY, not a quota. `broodPerEgg` keyed the cap to egg price, and
+      // egg price is highest on exactly the Broodmother tanks (4, 6, 7) where Marigold is
+      // already redundant -- so it capped tanks 1-3 hard, missed 5-1 by a single birth, and
+      // did nothing from 6-1 on. Measured across the spine it left a 12pp hole at 5-1.
+      //
+      // She can only tend so many babies at once and will not breed again until one of hers
+      // has grown up, so her rate is set by how fast HER OWN brood matures -- which is the
+      // player's food, one cheap pellet at a time early and nine good ones late. That binds
+      // on the tank's real progress instead of its price tag. Counting only her own brood is
+      // deliberate: a Broodmother tank fills the water with babies that are not hers, and
+      // those must not throttle her further on the tanks where she is already weakest.
+      // A brood sized to the tank, and never bigger than the school she is tending.
+      //   broodPerEgg - lifetime births <= max(2, floor(eggPrice / broodPerEgg))
+      //   broodShare  - her LIVING brood <= (other living sunfins) * share ...
+      //   broodFree   - ... but she always gets to tend this many regardless
+      // The egg budget alone was keyed to the wrong axis: egg price is highest on exactly
+      // the Broodmother tanks (4, 6, 7) where she is already redundant, so it capped tanks
+      // 1-3 hard, missed 5-1 by a single birth and did nothing after. broodShare is what
+      // separates them -- on a brood tank the Broodmother floods the water with sunfins
+      // that are not hers, so `others` is large and she runs free; on a sunfin tank the
+      // school is only what the player bought, so she cannot out-breed it. broodFree keeps
+      // the opening honest on every tank, since `others` starts at just the two the stage
+      // hands you.
+      if (q.broodPerEgg && p.born >= Math.max(2, Math.floor(Game.eggPrice / q.broodPerEgg))) return;
+      if (q.broodShare) {
+        let hers = 0, others = 0;
+        for (const f of Fishes.live) {
+          if (!f.alive || f.dying > 0 || f.kind !== 'sunfin') continue;
+          if (f.nurse === p) hers++; else others++;
+        }
+        if (hers > Math.max(q.broodFree || 0, others * q.broodShare)) return;
+      }
       p.t -= dt;
       if (p.t > 0) return;
       p.t = q.interval;
       if (q.what === 'sunfin') {
         if (Fishes.count() >= (q.cap || 60)) return;
+        p.born++;
         // Deliberately NOT routed through luckBless(): shimmer is bought or bred, and
         // widening it to pet births would change CFG.LUCK's reach, which is out of scope.
-        spawnSunfin(p.x, p.y + 12 * S, 0);
+        const baby = spawnSunfin(p.x, p.y + 12 * S, 0);
+        baby.nurse = p;   // always tag: the brood gates below all read it
         puff(p.x, p.y + 8 * S, '#ffd0e8', 10, 70);
         p.birth = 0.5;
         Sfx.play('petMarigoldBirth');
@@ -6807,10 +6881,12 @@ const PET_BUCKETS = {
         const b = spawnCoin(p.x, p.y + 6, 'bomb');
         b.value = Math.round((q.value || 150) * CFG.PETS.globalRate);
         b.fuse = q.fuse || 5;
+        p.spent += b.value;
         if (Tel.on) b.telPet = true;
         Sfx.play('petWidgetDrop');
       } else if (q.what === 'coin') {
-        spawnCoin(p.x, p.y + 6, q.coinType || 'gold');
+        const c = spawnCoin(p.x, p.y + 6, q.coinType || 'gold');
+        p.spent += (c && c.value) || 0;
         Sfx.play('petMarigoldBirth');
       } else if (q.what === 'food') {
         spawnFood(p.x, p.y, true, q.tier || 0);
@@ -6822,16 +6898,33 @@ const PET_BUCKETS = {
   // at all — the host system reads Pet.amp(stat) at its own call site — so this update
   // is only the swim, and adding another amplifier means another row, never another hook.
   amplifier: {
-    init(p, q) { if (q.move === 'floorPatrol') p.y = SAND_TOP - (q.floorGap || 12) * S; },
+    // A duty-cycled amplifier starts SINGING, so equipping her does something immediately
+    // rather than opening with a silence the player cannot explain. A row with no `sing`
+    // is permanently on, which is every amplifier that is not Lull.
+    init(p, q) { if (q.move === 'floorPatrol') p.y = SAND_TOP - (q.floorGap || 12) * S;
+                 p.singing = true; p.cycleT = q.song || 0; },
     update(p, q, dt) {
       petMove(p, q, dt);
+      // Phase 9B-6: the song is a window, not a state of being. Six seconds up, twenty-four
+      // down. Pet.amp() reads p.singing, so the multiplier is either fully on or fully off
+      // and the player can see which from the ring. (`q.song` is the row's duration;
+      // `p.sing` below is the unrelated per-flash ring timer that predates this.)
+      if (q.song) {
+        p.cycleT -= dt;
+        if (p.cycleT <= 0) {
+          p.singing = !p.singing;
+          p.cycleT = p.singing ? q.song : (q.songRest || q.song);
+          if (p.singing && q.ringSfx) Sfx.play(q.ringSfx);
+        }
+      }
       // An optional visible pulse, so a multiplier reads as a cause rather than a
       // coincidence. Plod has none — his effect is felt in how the water falls.
-      if (q.ring) {
+      // On a duty-cycled row the pulse runs only during the song: that is the tell.
+      if (q.ring && (!q.song || p.singing)) {
         p.ringT = (p.ringT || 0) - dt;
         if (p.ringT <= 0) { p.ringT = q.ring; p.sing = 0.7; if (q.ringSfx) Sfx.play(q.ringSfx); }
         if (p.sing > 0) p.sing -= dt;
-      }
+      } else if (p.sing > 0) p.sing -= dt;
     },
   },
 
@@ -7714,11 +7807,19 @@ const Pet = {
   // Passive multiplier read by whichever system an amplifier targets. Returns 1 with no
   // pet, no amplifier, or amplifiers aimed at other stats — so a call site costs nothing
   // and needs no null checks. Two amplifiers on ONE stat multiply.
+  //
+  // Phase 9B-6: an amplifier row carrying `sing`/`rest` is DUTY-CYCLED — it only counts
+  // while its song is up, and p.singing is driven by the amplifier bucket. A row without
+  // those params (plod's fallSpeed, nyx's alienDrop) has no gate and is permanent, exactly
+  // as before. The multiplier itself is never scaled: Lull is ×3 or she is nothing, which
+  // is what makes the window readable instead of a number quietly sliding around.
   amp(stat) {
     let m = 1;
     for (const p of this.live) {
       const row = PET_BEHAVIOR[p.id];
-      if (row.bucket === 'amplifier' && row.params.stat === stat) m *= row.params.mult;
+      if (row.bucket !== 'amplifier' || row.params.stat !== stat) continue;
+      if (row.params.song && !p.singing) continue;
+      m *= row.params.mult;
     }
     return m;
   },
@@ -9830,6 +9931,32 @@ Tel.sim = function (stage, opts) {
   const dt = 1 / 60;
   const maxT = opts.maxT || 900;
   const minFeedMs = opts.feedEveryMs != null ? opts.feedEveryMs : 250;
+  // ---- the scripted finger (9B-5) -------------------------------------------------
+  // Until build 69 the player collected EVERY live coin on EVERY frame. That is not a
+  // thing a finger can do, and it deleted the whole coin-in-flight layer -- fall, dwell,
+  // age, land, rest -- from every run the harness has ever produced. Six of the fourteen
+  // income pets read exactly that layer and so measured as a flat zero: Tuck (restOnly),
+  // Dollop (ageGate), Kite (the coinLand hook), Shiver and Sol (coinField). The seventh
+  // symptom was Echo, whose open gate changed no decision because simBuy buys specialA
+  // regardless. Tel.guard is the shipped pet gate (CFG.PETS.clearTimeBudget), so the gate
+  // was blind to six pets it is supposed to police.
+  //
+  // The finger is modelled with the two constraints a real thumb has: a tap cadence and a
+  // POSITION it has to travel from. Both are properties of the player, not balance values
+  // -- no CFG number is involved, and the tap itself uses the real Input.tryCollect at the
+  // real coinTapR radius, so a tap takes whatever else is under it exactly as a live tap
+  // does. Travel is what produces a miss rate: while the thumb crosses the tank for the
+  // big coin, the small ones it left behind keep sinking, and in a busy tank some reach
+  // the sand. That miss rate is what the collector pets are designed around -- tuck's row
+  // says so outright ("only what the player already missed").
+  //
+  // 200ms is a sustained human tap cadence (~5 taps/sec). 900px/s at reference scale is a
+  // fast but human thumb: about one tank-width per second.
+  const minTapMs = opts.tapEveryMs != null ? opts.tapEveryMs : 200;
+  const fingerSpeed = opts.fingerSpeed != null ? opts.fingerSpeed : 900;
+  // Escape hatch for reproducing pre-69 measurements. Every clear time quoted in a doc
+  // written before build 69 was taken with `vacuum: true` behaviour.
+  const vacuum = opts.vacuum === true;
   const m = /^(\d+)-(\d+)$/.exec(stage);
   const tank = m ? (+m[1] - 1) : 0, level = m ? (+m[2] - 1) : 0;
 
@@ -9869,7 +9996,8 @@ Tel.sim = function (stage, opts) {
         && Game.money >= d.cost + 40 + (extra || 0) ? i : -1;
   };
 
-  let feedT = 1e9, t = 0, guard = 0;
+  let feedT = 1e9, tapT = 1e9, t = 0, guard = 0;
+  let fx = W / 2, fy = TANK_TOP + TANK_H / 2, fTarget = null;
   while (Game.state === 'play' && t < maxT && guard++ < 300000) {
     Game.time += dt; t += dt;
     stepSim(dt);
@@ -9882,7 +10010,31 @@ Tel.sim = function (stage, opts) {
     if (feedT >= minFeedMs && Foods.count() < Game.foodMax && Game.money >= CFG.FOOD_COST) {
       feedT = 0; spawnFood(rand(W * 0.25, W * 0.75), TANK_TOP + 20 * S);
     }
-    for (const c of Coins.live) if (c.alive) collectCoin(c);
+    // One tap on the most valuable coin on the board, at a human cadence. Everything the
+    // finger does not reach keeps falling, dwells, ages and lands -- which is the layer
+    // Tuck, Dollop, Kite, Shiver and Sol read. Ties break on pool order, which is stable
+    // for a given seed, so a cell stays exactly reproducible.
+    if (vacuum) { for (const c of Coins.live) if (c.alive) collectCoin(c); }
+    else {
+      // Re-target when the current mark is gone. Most valuable first: a player goes for
+      // the pearl, not the silver beside it. Ties break on pool order, which is stable for
+      // a given seed, so a cell stays exactly reproducible.
+      if (!fTarget || !fTarget.alive) {
+        fTarget = null;
+        let bv = -Infinity;
+        for (const c of Coins.live) if (c.alive && c.value > bv) { bv = c.value; fTarget = c; }
+      }
+      tapT += dt * 1000;
+      if (fTarget) {
+        const dx = fTarget.x - fx, dy = fTarget.y - fy, d = Math.hypot(dx, dy) || 1;
+        const step = fingerSpeed * S * dt;
+        if (d <= step) { fx = fTarget.x; fy = fTarget.y; }
+        else { fx += dx / d * step; fy += dy / d * step; }
+        if (tapT >= minTapMs && Math.hypot(fTarget.x - fx, fTarget.y - fy) <= coinTapR()) {
+          tapT = 0; Input.tryCollect(fx, fy); fTarget = null;
+        }
+      }
+    }
     Tel.simBuy(afford);
   }
   // Three endings. Game.lose() sets state 'over' with fewer than 3 eggs (the school
