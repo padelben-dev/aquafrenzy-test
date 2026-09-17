@@ -863,7 +863,7 @@ const ALIENS_V2 = BUILD_FLAGS.dev && QS.get('aliens') === 'v2';
 // procedural set is approved. Art only -- no behaviour, economy, persistence, or any
 // change to which pet hatches where.
 const PETS_V2 = BUILD_FLAGS.dev && QS.get('pets') === 'v2';
-const GAME_BUILD = 76;
+const GAME_BUILD = 77;
 
 // ============ BOOT AUDIT — network guard (native-1) ============
 // This file is zero-external-asset by project convention (no <script src>, no img/
@@ -13052,18 +13052,24 @@ const SFX_GAIN_TRIM = {
   // energy than one centred at 5kHz, so the retuned cue measured 1.8 dB louder to the ear
   // and this scales that back out. The arrival keeps exactly the loudness players know;
   // the 61-point drop in its >3kHz share is what actually removes the spike.
-  alienSpawn_mite:2.452, alienDeath_mite:3.184, alienHurt_mite:2.294,
-  alienSpawn_ravager:3.59, alienDeath_ravager:2.317, alienHurt_ravager:2.424,
-  alienSpawn_bloat:4, alienDeath_bloat:1.933, alienHurt_bloat:2.166,
-  alienSpawn_lurker:4, alienDeath_lurker:3.283, alienHurt_lurker:3.014,
-  alienSpawn_streak:4, alienDeath_streak:1.889, alienHurt_streak:2.06,
-  alienSpawn_sentry:3.848, alienDeath_sentry:2.099, alienHurt_sentry:2.489,
-  alienSpawn_splitjaw:3.78, alienDeath_splitjaw:2.258, alienHurt_splitjaw:2.463,
+  alienSpawn_mite:2.452, alienDeath_mite:0.666, alienHurt_mite:2.659,
+  alienSpawn_ravager:3.59, alienDeath_ravager:0.775, alienHurt_ravager:3.909,
+  alienSpawn_bloat:4, alienDeath_bloat:0.669, alienHurt_bloat:1.902,
+  alienSpawn_lurker:4, alienDeath_lurker:0.673, alienHurt_lurker:2.476,
+  alienSpawn_streak:4, alienDeath_streak:0.508, alienHurt_streak:2.11,
+  alienSpawn_sentry:3.848, alienDeath_sentry:1.042, alienHurt_sentry:2.449,
+  alienSpawn_splitjaw:3.78, alienDeath_splitjaw:0.86, alienHurt_splitjaw:0.631,
   alienBite:2.696, splitjawSplit:4, laserHit:1.05,
   laserFire:4, laserUpgrade:4, heartbeatThump:2.2, reliefSting:2.2,
   uiTap:4, uiBuy:2.38, uiDeny:3.409, uiEggPlaced:1.88, uiStar1:2.022, uiStar2:1.972, uiStar3:1.861,
   uiPediaNew:3.628, uiPetSelect:4, uiMapOpen:4, uiQuitConfirm:2.552,
 };
+// Build 77: the 14 alienHurt_/alienDeath_ rows above are solved against A-WEIGHTED
+// LOUDNESS through a handset-speaker model, NOT to the -6 dBFS peak the rest of the table
+// uses. Peak is not loudness -- a 50ms tick and a 300ms growl at the same peak differ by
+// 20+ dB to the ear -- and peak-solving had spread these 14 across 24 dB, leaving Mite
+// and Sentry hit voices UNDER the two laser cues that fire in the same instant. Targets
+// are weapon+6 dB for a hit and weapon+12 dB for a death. Re-solve them the same way.
 function sfxGainTrim(id) { return SFX_GAIN_TRIM[id] ?? 1; }
 
 const Sfx = {
@@ -13545,8 +13551,15 @@ const ALIEN_VOICE = {
 const ALIEN_HURT = {
   // bitten insect: two hard ticks and a squeak, nothing under the driver's floor
   mite: (ctx, dest) => {
-    sfxNoise(ctx, dest, { dur: 0.018, vel: 0.20, hp: 900, lp: 2600 });
-    return sfxNotes(ctx, dest, [{ type: 'triangle', freq: 1500, freq2: 950, dur: 0.05, vel: 0.20, attack: 0.002 }]);
+    sfxNoise(ctx, dest, { dur: 0.028, vel: 0.20, hp: 900, lp: 2600 });
+    // Build 77: was 0.05s at one partial. A cue that short is all peak and no energy --
+    // it normalised to -6 dBFS and still sat 9 dB UNDER the laser cues firing in the same
+    // instant. The second partial is offset so the two never crest together: RMS rises,
+    // peak does not, and the tick stays a tick.
+    return sfxNotes(ctx, dest, [
+      { type: 'triangle', freq: 1500, freq2: 950, dur: 0.085, vel: 0.20, attack: 0.002 },
+      { type: 'triangle', freq: 1080, freq2: 700, dur: 0.060, vel: 0.13, t: 0.016, attack: 0.003 },
+    ]);
   },
   // the big one grunts; it does not squeal
   ravager: (ctx, dest) => {
@@ -13563,13 +13576,22 @@ const ALIEN_HURT = {
   lurker: (ctx, dest) => sfxNoiseSweep(ctx, dest, { dur: 0.10, vel: 1.15, f0: 950, f1: 1900, type: 'bandpass', qv: 5 }),
   // the only hit that RISES: the fast one is startled, not wounded
   streak: (ctx, dest) => sfxNotes(ctx, dest, [
-    { type: 'triangle', freq: 880, freq2: 1500, dur: 0.07, vel: 0.26, attack: 0.002 },
+    { type: 'triangle', freq: 880, freq2: 1500, dur: 0.10, vel: 0.26, attack: 0.002 },
+    // Build 77: offset lower partial for energy. It rises too, so the startled gesture
+    // that distinguishes Streak from every other hit survives.
+    { type: 'triangle', freq: 620, freq2: 1050, dur: 0.075, vel: 0.15, t: 0.018, attack: 0.003 },
   ]),
   // a damaged circuit rather than a creature. Triangle, not square: a square at this
   // pitch throws harmonics straight back into the >3kHz band this pass is clearing.
   sentry: (ctx, dest) => {
-    sfxNoise(ctx, dest, { dur: 0.02, vel: 0.16, hp: 900, lp: 2600 });
-    return sfxNotes(ctx, dest, [{ type: 'triangle', freq: 2000, freq2: 1150, dur: 0.055, vel: 0.20, attack: 0.002 }]);
+    sfxNoise(ctx, dest, { dur: 0.032, vel: 0.16, hp: 900, lp: 2600 });
+    // Build 77: lengthened and doubled for the same reason as mite/streak. The lower
+    // partial also drags the pair toward 2kHz, where A-weighting is most sensitive and
+    // the handset driver is past its roll-off.
+    return sfxNotes(ctx, dest, [
+      { type: 'triangle', freq: 2000, freq2: 1150, dur: 0.090, vel: 0.20, attack: 0.002 },
+      { type: 'triangle', freq: 1400, freq2: 820,  dur: 0.065, vel: 0.12, t: 0.015, attack: 0.003 },
+    ]);
   },
   // two jaws, two snaps -- the same doubling that makes its spawn recognisable
   splitjaw: (ctx, dest) => sfxNotes(ctx, dest, [
