@@ -13169,7 +13169,12 @@ const Samples = {
   prefetch() {
     if (!this.on) return;
     for (const id of SFX_SAMPLE_IDS) {
-      if (this._ab[id] || this._load[id] || this._dead[id]) continue;
+      // _buf is checked too, not just _ab/_load. decodeAll() deletes _ab[id] BEFORE
+      // decodeAudioData resolves, so between those two moments a cue is in none of the
+      // other three maps and a second prefetch() re-downloads it -- 28 requests instead
+      // of 14. Nothing in the shipped boot path calls prefetch twice, but the guard was
+      // wrong rather than unnecessary.
+      if (this._buf[id] || this._ab[id] || this._load[id] || this._dead[id]) continue;
       this._load[id] = fetch(SFX_SAMPLE_DIR + id + '.mp3')
         .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
         .then(ab => { this._ab[id] = ab; delete this._load[id]; })
